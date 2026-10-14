@@ -3034,6 +3034,16 @@ export struct SysChatBlockRow {
     think-elapsed: string,
 }
 
+// v11（卡 `abb-v11-panels-align`）：历史会话 / 模型列表面板的一行。
+// `tag` = 右侧文字（当前/时间/provider）；`tick` = 当前项右侧画 ✓（模型面板用）。
+// **一个结构体装两栏**（而不是两个平行数组）：配对关系由类型保证，不会因一处只更新
+// 一个数组而错位。
+export struct SysChatMenuRow {
+    text: string,
+    tag: string,
+    tick: bool,
+}
+
 // 待发附件 chip（D 批 3+N）：`index` 是它在**完整待发列表**里的下标——✕ 按它精确移除。
 // Rust 侧已按折叠态裁好可见行，这里只负责画（图片缩略图 / 文件 chip）。
 export struct PendingAttachRow {
@@ -3197,17 +3207,21 @@ component TitlebarIconButton inherits Rectangle {
 //
 // 为什么不用 PixelMenu：它把 `button-text` 画在 `x: 10px; width: parent.width - 36px` 的文本格
 // 里、右侧再留 26px 固定箭头格，26px 宽的图标钮根本放不下文案；稿也明确要求这一格「只要图标」。
-// 弹窗列表自己画：`PopupWindow`（相对父元素定位，见 slint-core `window.rs` 的注释）+ 每行一个
-// `TouchArea`，当前会话用 accent 高亮（同稿 `.menu .item.on`）。
+//
+// v11（卡 `abb-v11-panels-align`）：列表**不再是 `PopupWindow`**，而是窗内自绘的
+// `MenuPanel`（标题 + 每项右侧 tag + footer，稿 `.menu`）。两个理由：
+// ① `PopupWindow` 的 `close-policy: close-on-click-outside` 在**按下**就关，而按钮的
+//    `clicked` 在**松开**才到 ⇒「再点按钮」只会重开、收不起来（卡 d9 已实测，同一结论）；
+// ② 面板需要标题/footer/右侧 tag 这套结构，`PixelMenu` 撑不起。
 component SessionIconButton inherits Rectangle {
-    in property <[string]> items: [];
-    in-out property <int> index: -1;
     in property <bool> enabled: true;
-    callback selected(int);
+    // 面板开着时钮保持按下观感（面板本体在 `SystemChatWindow` 末尾自绘）。
+    in property <bool> open: false;
+    callback clicked();
     width: 26px;
     height: 26px;
     opacity: root.enabled ? 1.0 : 0.5;
-    background: popup.is-open ? PixelTheme.hover : (hit.has-hover ? PixelTheme.hover : PixelTheme.panel);
+    background: root.open || hit.has-hover ? PixelTheme.hover : PixelTheme.panel;
     border-width: 2px;
     border-color: PixelTheme.edge;
     border-radius: 6px;
@@ -3225,57 +3239,172 @@ component SessionIconButton inherits Rectangle {
     hit := TouchArea {
         enabled: root.enabled;
         mouse-cursor: pointer;
-        clicked => { popup.show(); }
+        clicked => { root.clicked(); }
     }
-    popup := PopupWindow {
-        // 右对齐到按钮右缘（25px 宽的钮在标题栏右侧，弹窗往左展开才不会出窗）。
-        x: root.width - 236px;
-        y: root.height + 4px;
-        width: 236px;
-        height: root.items.length * 26px + 34px;
-        close-policy: close-on-click-outside;
+}
+
+// v11（稿 `.menu .item`）：面板里的一行 = 标题 + 右侧 tag/✓（当前项 accent 底）。
+// 点击整行触发 `clicked()`（行内没有其它可点元素，不需要抽回调）。
+component MenuChoiceRow inherits Rectangle {
+    in property <string> text: "";
+    // 右侧 tag（`当前` / 时间 / provider）；空 = 不画。
+    in property <string> tag: "";
+    // 当前项：右侧画 ✓（模型面板）且整行 accent 底（`.item.on`）。
+    in property <bool> on: false;
+    in property <bool> tick: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 30px;
+    opacity: root.enabled ? 1.0 : 0.5;
+    background: root.on ? PixelTheme.accent : (hit.has-hover ? PixelTheme.hover : transparent);
+    Text {
+        x: 10px;
+        // 右侧留出 tag/✓ 的位置（tag 是 auto 宽，从右往左算）。
+        width: parent.width - 20px - right-item.width;
+        height: 100%;
+        text: root.text;
+        font-size: 12px;
+        color: root.on ? PixelTheme.on-accent : PixelTheme.text;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    // 右侧 tag / ✓ 是**同一个**文本格：只有一份，避免两个 auto 宽元素互相推。
+    right-item := Text {
+        x: parent.width - 10px - self.width;
+        height: 100%;
+        text: root.tick ? "✓" : root.tag;
+        font-size: root.tick ? 13px : 10px;
+        font-weight: root.tick ? 800 : 400;
+        color: root.on ? PixelTheme.on-accent : PixelTheme.dim;
+        vertical-alignment: center;
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// v11（稿 `.menu`）：自绘面板 —— 标题（`h6`）+ 若干行 + 可选「🗄 归档…」行 + footer（`.foot`）。
+// 宽 250px、2px 描边、8px 圆角、面板底/描边同主题；**高度由内容自然决定**（不写死，
+// 否则行数变了会多出空白）。定位由调用方给（`x`/`y`，由 Rust 按 `menu_anchor` 算）。
+component MenuPanel inherits Rectangle {
+    in property <string> heading: "";
+    in property <string> foot: "";
+    in property <[SysChatMenuRow]> rows: [];
+    in property <int> current: -1;
+    // 额外一行（历史会话面板的「🗄 归档…」）；text 为空 = 不画。
+    in property <string> extra-text: "";
+    in property <string> extra-tag: "";
+    in property <bool> enabled: true;
+    callback picked(int);
+    callback extra-clicked();
+    width: 250px;
+    // 高度按内容自然高（`Window` 的直属子元素不写 height 会铺满整窗——实测 820 高）。
+    height: self.preferred-height;
+    background: PixelTheme.panel;
+    border-width: 2px;
+    border-color: PixelTheme.edge;
+    border-radius: 8px;
+    // 吃掉面板空白处的点击，别让它穿到后面的整窗 backdrop 上把面板关了。
+    TouchArea { width: 100%; height: 100%; }
+    VerticalLayout {
+        // 2px = 面板自己的 border：Slint 的 `border-width` **不会**给子元素留内容盒，
+        // 不写这个 padding 行背景会盖住面板描边（实测 accent 行会盖掉左右描边）。
+        padding: 2px;
+        spacing: 0px;
+        // 标题（稿 `.menu h6{padding:8px 10px;font-size:10px;border-bottom:2px}`）
         Rectangle {
-            width: 100%;
-            height: 100%;
-            background: PixelTheme.panel;
-            border-width: 2px;
-            border-color: PixelTheme.edge;
-            border-radius: 8px;
-            VerticalBox {
-                padding: 6px;
-                spacing: 0px;
-                Text {
-                    height: 20px;
-                    text: "会话（历史保留，可随时切回）";
-                    font-size: 10px;
-                    color: PixelTheme.dim;
-                    vertical-alignment: center;
-                }
-                for it[i] in root.items: Rectangle {
-                    height: 26px;
-                    background: i == root.index ? PixelTheme.accent : (row-ta.has-hover ? PixelTheme.hover : transparent);
-                    border-radius: 4px;
-                    Text {
-                        x: 8px;
-                        width: parent.width - 16px;
-                        height: 100%;
-                        text: it;
-                        font-size: 12px;
-                        color: i == root.index ? PixelTheme.on-accent : PixelTheme.text;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
-                    row-ta := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => {
-                            root.index = i;
-                            root.selected(i);
-                            popup.close();
-                        }
-                    }
-                }
+            height: 28px;
+            background: PixelTheme.bg;
+            Text {
+                x: 10px;
+                width: parent.width - 20px;
+                height: 100%;
+                text: root.heading;
+                font-size: 10px;
+                color: PixelTheme.dim;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Rectangle { y: parent.height - 2px; width: 100%; height: 2px; background: PixelTheme.edge; }
+        }
+        for r[i] in root.rows: MenuChoiceRow {
+            text: r.text;
+            tag: r.tag;
+            tick: r.tick;
+            on: i == root.current;
+            enabled: root.enabled;
+            clicked => { root.picked(i); }
+        }
+        if root.extra-text != "": MenuChoiceRow {
+            text: root.extra-text;
+            tag: root.extra-tag;
+            enabled: root.enabled;
+            clicked => { root.extra-clicked(); }
+        }
+        // footer（稿 `.foot{padding:6px 10px;font-size:10px;border-top:2px}`）
+        if root.foot != "": Rectangle {
+            // 高度 = 文案**换行后**的真实高 + 上下各 6px。必须显式撑高：绝对定位的 Text 不参与
+            // 父 Rectangle 的 preferred-height（实测：只写 `min-height` 时两行 footer 会被面板
+            // 底边切掉一行）。
+            height: foot-text.height + 12px;
+            background: PixelTheme.bg;
+            Rectangle { y: 0px; width: 100%; height: 2px; background: PixelTheme.edge; }
+            foot-text := Text {
+                x: 10px;
+                y: 6px;
+                width: parent.width - 22px;
+                text: root.foot;
+                font-size: 10px;
+                color: PixelTheme.dim;
+                wrap: word-wrap;
             }
         }
+    }
+}
+
+// v11（稿 `.chipbtn.accent`）：模型 chip —— 只画 chip；列表由 `MenuPanel` 自绘
+//（`PixelMenu` 没有 accent 面，也撑不起「标题 + footer + 当前项 ✓ / 其它项 provider」）。
+component ModelChip inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> open: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 26px;
+    opacity: root.enabled ? 1.0 : 0.5;
+    // 稿 `.chipbtn.accent{background:var(--accent)}`；开着时给 hover 底色作按下反馈。
+    background: hit.has-hover ? PixelTheme.hover : PixelTheme.accent;
+    border-width: 2px;
+    border-color: PixelTheme.edge;
+    border-radius: 6px;
+    Text {
+        x: 8px;
+        width: parent.width - 26px;
+        height: 100%;
+        text: root.text;
+        font-size: 12px;
+        font-weight: 700;
+        color: PixelTheme.on-accent;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    // 稿的 `.caret`（▾）。
+    Text {
+        x: parent.width - 16px;
+        width: 12px;
+        height: 100%;
+        text: "▾";
+        font-size: 9px;
+        color: PixelTheme.on-accent;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+    Tooltip { text: @markdown("选择模型（本会话生效）"); }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
     }
 }
 
@@ -3413,6 +3542,28 @@ export component SystemChatWindow inherits Window {
     // 「模型选择」按**会话**生效，候选只来自「设置 → 供应商」。
     in property <[string]> session-labels: [];
     in property <[string]> model-labels: [];
+    // v11（卡 `abb-v11-panels-align`）：两个自绘面板的数据/开关/锚点。
+    // 行内容用 `SysChatMenuRow`（标题 + 右侧 tag/✓），Rust 侧与 labels 同一次刷新写入。
+    in property <[SysChatMenuRow]> session-rows: [];
+    in property <[SysChatMenuRow]> model-rows: [];
+    // 面板开关：由 Rust 接线驱动（点按钮切换、点外部/选中项收起）。
+    in-out property <bool> session-menu-open: false;
+    in-out property <bool> model-menu-open: false;
+    // 面板落位（窗口坐标）：由 Rust 按 `syschat::menu_anchor` 算（纯函数带单测）。
+    in property <length> session-menu-x: 0px;
+    in property <length> session-menu-y: 0px;
+    in property <length> model-menu-x: 0px;
+    in property <length> model-menu-y: 0px;
+    // v11：状态栏右侧的上下文用量（稿 `.tok` + `.meter`）。
+    // `usage-text` 由 Rust 格式化（K/M + 百分比）；`usage-meter-fill` 是进度条内条宽；
+    // `usage-level` = 档位 0 正常 / 1 ≥70% 橙 / 2 ≥90% 红。
+    // **数据来源待 E3**（卡 `abb-syschat-e3-tokens-20261013`）：当前如实传空档文案。
+    in property <string> usage-text: "";
+    in property <string> usage-tip: "";
+    in property <length> usage-meter-fill: 0px;
+    in property <int> usage-level: 0;
+    // 「🗄 归档…」：归档功能本体是另一张卡（`abb-v11-session-archive`），本卡只要面板有此项且可点。
+    callback session-archive();
     in-out property <int> session-index: -1;
     in-out property <int> model-index: -1;
 
@@ -3527,6 +3678,21 @@ export component SystemChatWindow inherits Window {
     out property <length> dbg-send-y: send-btn.y;
     out property <length> dbg-send-w: send-btn.width;
     out property <length> dbg-send-h: send-btn.height;
+    // v11（卡 `abb-v11-panels-align`）：面板与用量条的几何观测面（无头出图台对稿用；
+    // 同 dbg-* 口径：只读、无副作用）。面板的 `x/width` 在**未展开**时取不到（元素不存在），
+    // 所以这里报的是**算好的锚点值与常量宽**（面板宽 250 在 Rust 侧也有一份）。
+    out property <length> dbg-session-menu-x: root.session-menu-x;
+    out property <length> dbg-session-menu-y: root.session-menu-y;
+    out property <length> dbg-model-menu-x: root.model-menu-x;
+    out property <length> dbg-model-menu-y: root.model-menu-y;
+    // 展开时的真实几何（未展开时为 0）——面板“高度由内容决定”这类事只能展开后量。
+    out property <length> dbg-session-menu-w: root.session-menu-open && session-panel.width > 0px ? session-panel.width : 0px;
+    out property <length> dbg-session-menu-h: root.session-menu-open && session-panel.height > 0px ? session-panel.height : 0px;
+    out property <length> dbg-usage-meter-w: usage-meter.width;
+    out property <length> dbg-usage-meter-h: usage-meter.height;
+    out property <length> dbg-usage-fill-w: usage-fill.width;
+    // 第二行「模型 · 状态」是否在画（稿 `.status .st2 .l2`）——无头断言用。
+    out property <bool> dbg-status-second-line: root.model-index >= 0 && root.model-index < root.model-labels.length;
     callback open-media(string);   // 音视频媒体卡：「用系统播放器打开」
     callback open-link(string);    // 图片 http 失败/普通链接：用浏览器打开
     // slint-pixel 标题栏契约（impl_title_bar_ui! 要求这四个回调存在）
@@ -3636,6 +3802,33 @@ export component SystemChatWindow inherits Window {
                             font-size: 10px;
                             color: PixelTheme.dim;
                             overflow: elide;
+                        }
+                    }
+                    // v11（卡 `abb-v11-panels-align`）：右侧上下文用量（稿 `.tok` + `.meter`）。
+                    // 数据源：`syschat::context_usage()`（**待 E3 卡**，当前如实为空档）；
+                    // 文案/百分比/档位都在 Rust 纯函数里算好（带单测），这里只负责画。
+                    Text {
+                        text: root.usage-text;
+                        font-size: 11px;
+                        color: PixelTheme.dim;
+                        vertical-alignment: center;
+                        Tooltip { text: @markdown("\{root.usage-tip}"); }
+                    }
+                    usage-meter := Rectangle {
+                        width: 56px;
+                        height: 9px;
+                        background: PixelTheme.panel;
+                        border-width: 2px;
+                        border-color: PixelTheme.edge;
+                        border-radius: 3px;
+                        // 内条贴内容盒（同稿 `.meter i{display:block;height:100%}`）并裁圆角。
+                        clip: true;
+                        usage-fill := Rectangle {
+                            x: 2px;
+                            y: 2px;
+                            width: min(root.usage-meter-fill, 52px);
+                            height: parent.height - 4px;
+                            background: root.usage-level == 2 ? UiTokens.error : (root.usage-level == 1 ? UiTokens.warn : PixelTheme.accent);
                         }
                     }
                     // D2 回退位（窄窗才出现）：标题栏控件条放不下的项落在这里——
@@ -4339,25 +4532,31 @@ export component SystemChatWindow inherits Window {
                 clicked => { root.new-session(); }
             }
             // ②历史会话（稿 v10：只有 🗂 图标；点开列历史会话、可切回继续聊）。
-            // 不再用带文案的 PixelMenu（那是 v9 前的做法；稿要求「两个都只要图标」）。
-            if root.titlebar-session-w > 0px: SessionIconButton {
+            // v11：点开的是窗内自绘 `MenuPanel`（`session-menu-open`），不再是 `PopupWindow`。
+            if root.titlebar-session-w > 0px: session-btn := SessionIconButton {
                 width: root.titlebar-session-w;
-                items: root.session-labels;
-                index <=> root.session-index;
+                open: root.session-menu-open;
                 enabled: !root.busy;
-                selected(i) => { root.session-pick(i); }
+                clicked => {
+                    root.model-menu-open = false;
+                    root.emoji-open = false;
+                    root.more-open = false;
+                    root.session-menu-open = !root.session-menu-open;
+                }
             }
-            // ③模型 chip（稿 `.chipbtn.accent`，仍带文案；PixelMenu 无 accent 面，配色偏离已记卡）。
-            // 用 PixelMenu 而不是 std ComboBox：std ComboBox 的 `min-width: max(160px, …)`
-            // 硬下限吃不下这条空档，且它的 `model` 同时驱动 chip 文案（无法单独截断，长标题会画出框外）。
-            if root.titlebar-model-w > 0px: PixelMenu {
+            // ③模型 chip（稿 `.chipbtn.accent`）：v11 换成自绘 `ModelChip` + `MenuPanel`
+            //（`PixelMenu` 没有 accent 面，也撑不起「标题 + footer + 当前项 ✓ / 其它项 provider」）。
+            if root.titlebar-model-w > 0px: model-btn := ModelChip {
                 width: root.titlebar-model-w;
-                height: 26px;
-                items: root.model-labels;
-                index <=> root.model-index;
-                button-text: root.titlebar-model-text;
+                text: root.titlebar-model-text;
+                open: root.model-menu-open;
                 enabled: !root.busy;
-                selected(i) => { root.model-pick(i); }
+                clicked => {
+                    root.session-menu-open = false;
+                    root.emoji-open = false;
+                    root.more-open = false;
+                    root.model-menu-open = !root.model-menu-open;
+                }
             }
             // ④⚙设置（稿 `.tb-btn[data-m="4"]`）——唤起既有设置窗（需求 #3）
             if root.titlebar-settings-w > 0px: TitlebarIconButton {
@@ -4393,17 +4592,58 @@ export component SystemChatWindow inherits Window {
         //
         // 位置锚在输入框（`composer`）的**绝对坐标**上（随窗口缩放跟随）：面板底边贴在
         // 输入框顶边之上 6px，右缘与输入框右缘齐平（`max(6px, …)` 防窄窗跑出左边界）。
-        if root.emoji-open || root.more-open: Rectangle {
+        if root.emoji-open || root.more-open || root.session-menu-open || root.model-menu-open: Rectangle {
             x: 0px;
             y: 0px;
             width: 100%;
             height: 100%;
             background: transparent;
+            // 点面板外（含按钮本身）收起：四个面板互斥，一次全关。
+            // 面板开着时点**另一个** chip/图标钮：那一下被本 backdrop 吃掉 ⇒ 先收起（等于
+            // 「点外部收起」，与 d9 的表情/更多同一口径）；再点一次才展开另一个。
             TouchArea {
                 width: 100%;
                 height: 100%;
-                clicked => { root.emoji-open = false; root.more-open = false; }
+                clicked => {
+                    root.emoji-open = false;
+                    root.more-open = false;
+                    root.session-menu-open = false;
+                    root.model-menu-open = false;
+                }
             }
+        }
+
+        // ── v11（卡 `abb-v11-panels-align`）：历史会话 / 模型列表两个自绘面板 ────────
+        // 位置由 Rust 按 `syschat::menu_anchor` 算后写进 `*-menu-x/y`（右缘跟按钮右缘对齐、
+        // 顶边在按钮下缘 6px、靠窗边整体内移）。声明在这里（backdrop 之后）= 画在 backdrop 上层。
+        // 稿 `.menu` 的标题/footer/右侧 tag 都在这两个面板里；`PixelMenu` 撑不起这套结构。
+        session-panel := MenuPanel {
+            // 用 `visible` 而不是 `if`：`if` 分支里的 id 不能在组件外读（Slint 编译期报
+            // 「Cannot access id」），而 `dbg-session-menu-*` 需要量它的真实宽高。
+            // 绝对定位的子元素不参与兄弟布局，隐藏时也不收事件 ⇒ 两种写法等价。
+            visible: root.session-menu-open;
+            x: root.session-menu-x;
+            y: root.session-menu-y;
+            heading: "会话（历史保留，可随时切回）";
+            foot: "点一条即切回该会话继续聊；归档后从列表隐藏、可在「已归档」里找回";
+            rows: root.session-rows;
+            current: root.session-index;
+            extra-text: "🗄 归档…";
+            extra-tag: "当前会话";
+            enabled: !root.busy;
+            picked(i) => { root.session-menu-open = false; root.session-pick(i); }
+            extra-clicked => { root.session-menu-open = false; root.session-archive(); }
+        }
+        model-panel := MenuPanel {
+            visible: root.model-menu-open;
+            x: root.model-menu-x;
+            y: root.model-menu-y;
+            heading: "选择模型（本会话生效）";
+            foot: "仅列出「设置 → 供应商」里已配置的模型";
+            rows: root.model-rows;
+            current: root.model-index;
+            enabled: !root.busy;
+            picked(i) => { root.model-menu-open = false; root.model-pick(i); }
         }
 
         if root.emoji-open: Rectangle {

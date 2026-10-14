@@ -717,6 +717,44 @@ fn apply_syschat_layout(win: &SystemChatWindow, window_w: f32) {
         win.get_model_index(),
         row_model_w,
     ));
+    // v11（卡 `abb-v11-panels-align`）：两个面板的锚点（右缘跟钮右缘对齐、顶边在钮下缘 6px、
+    // 靠窗边整体内移）。算术在 `syschat::menu_anchor`（纯函数带单测）；这里只把结果写进窗口。
+    // **未画的项**（换档换掉了）不写——面板也只能从 banner 里点开，本就不会用到。
+    let btn_bottom = (crate::syschat::TB_BTN_Y + crate::syschat::TB_BTN_H) as i32;
+    let panel_w = crate::syschat::MENU_PANEL_W as i32;
+    if let Some((bx, bw)) = crate::syschat::titlebar_session_btn(&plan) {
+        let (mx, my) = crate::syschat::menu_anchor(bx as i32, bw as i32, btn_bottom, panel_w, w as i32);
+        win.set_session_menu_x(mx as f32);
+        win.set_session_menu_y(my as f32);
+    }
+    if let Some((bx, bw)) = crate::syschat::titlebar_model_btn(&plan) {
+        let (mx, my) = crate::syschat::menu_anchor(bx as i32, bw as i32, btn_bottom, panel_w, w as i32);
+        win.set_model_menu_x(mx as f32);
+        win.set_model_menu_y(my as f32);
+    }
+}
+
+/// v11（卡 `abb-v11-panels-align`）：状态栏右侧的上下文用量。
+///
+/// 数据源接缝在 [`crate::syschat::context_usage`]（**E3 卡**）：当前如实为空 ⇒
+/// 文案 `上下文 —/— · —`、进度条 0 宽；百分比/档位/文案格式化全在纯函数里（带单测），
+/// E3 落地时只改那一个函数（本函数是**唯一**消费点）。
+fn refresh_syschat_usage(win: &SystemChatWindow) {
+    let (used, limit) = crate::syschat::context_usage();
+    win.set_usage_text(crate::syschat::context_usage_text(used, limit).into());
+    win.set_usage_tip("本会话上下文占用（数据来源待 E3 卡：上游不上报 usage，不显示估算值）".into());
+    let (fill, level) = match (used, limit) {
+        (Some(u), Some(l)) if l > 0 => {
+            let pct = crate::syschat::usage_percent(u, l);
+            (
+                crate::syschat::USAGE_METER_INNER_W * pct / 100.0,
+                crate::syschat::usage_level(pct),
+            )
+        }
+        _ => (0.0, 0),
+    };
+    win.set_usage_meter_fill(fill);
+    win.set_usage_level(level);
 }
 
 /// D4：读某窗口的**逻辑**外框 `(x, y, w, h)`。
@@ -2607,7 +2645,9 @@ pub fn run_gui() -> Result<()> {
         models: &Rc<RefCell<Vec<(String, String)>>>,
     ) {
         let cfg = Config::load().unwrap_or_default();
-        let ms: Vec<(String, String)> = cfg
+        // v11：模型行要同时拿到 label 与 **provider kind**（稿：非当前项右侧写 anthropic/openai），
+        // 故在这里一次性算出「名字 / label / kind」三元组，而不是事后拼平行数组。
+        let ms: Vec<(String, String, String)> = cfg
             .providers
             .iter()
             .map(|p| {
@@ -2616,7 +2656,7 @@ pub fn run_gui() -> Result<()> {
                 } else {
                     p.model.clone()
                 };
-                (p.name.clone(), label)
+                (p.name.clone(), label, p.kind.clone())
             })
             .collect();
         let (list, current) = crate::syschat::session_list();
@@ -2640,20 +2680,49 @@ pub fn run_gui() -> Result<()> {
         };
         let midx = ms
             .iter()
-            .position(|(n, _)| *n == effective)
+            .position(|(n, _, _)| *n == effective)
             .map(|i| i as i32);
         win.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(labels))));
-        let mlabels: Vec<slint::SharedString> = ms.iter().map(|(_, l)| l.clone().into()).collect();
+        let mlabels: Vec<slint::SharedString> = ms.iter().map(|(_, l, _)| l.clone().into()).collect();
         win.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(
             mlabels,
         ))));
         win.set_session_index(sidx);
         win.set_model_index(midx.unwrap_or(-1));
+        // v11（卡 `abb-v11-panels-align`）：两个面板的行数据（标题 + 右侧 tag/✓）。
+        // 与 labels 同一次刷新写入 ⇒ 面板与 chip 不会看到一个新列表一个旧列表。
+        let now = crate::chrono_lite::unix_secs();
+        let srows: Vec<SysChatMenuRow> = list
+            .iter()
+            .map(|s| SysChatMenuRow {
+                text: s.title.clone().into(),
+                tag: crate::syschat::session_tag(s.updated_at, now, s.id == current).into(),
+                tick: false,
+            })
+            .collect();
+        win.set_session_rows(slint::ModelRc::from(Rc::new(slint::VecModel::from(srows))));
+        let mrows: Vec<SysChatMenuRow> = ms
+            .iter()
+            .enumerate()
+            .map(|(i, (_, label, kind))| SysChatMenuRow {
+                text: label.clone().into(),
+                // 当前项右侧画 ✓（tag 置空）；其它项右侧写 provider kind（稿 anthropic/openai）。
+                tag: if Some(i as i32) == midx {
+                    slint::SharedString::default()
+                } else {
+                    kind.clone().into()
+                },
+                tick: Some(i as i32) == midx,
+            })
+            .collect();
+        win.set_model_rows(slint::ModelRc::from(Rc::new(slint::VecModel::from(mrows))));
+        refresh_syschat_usage(win);
         *sessions.borrow_mut() = list;
-        *models.borrow_mut() = ms;
+        *models.borrow_mut() = ms.iter().map(|(n, l, _)| (n.clone(), l.clone())).collect();
         // D2：会话/模型 chip 的显示文案随列表与选中项变（按当前窗口宽重新截断）。
         apply_syschat_layout(win, syschat_logical_width(win));
     }
+
     refresh_syschat_sel(&syschat_win, &sc_sessions, &sc_models);
 
     // ── C1 批：待发附件（📎 多选 / ⌘V 粘贴）──────────────────────────────────
@@ -6756,6 +6825,18 @@ pub fn run_gui() -> Result<()> {
             if let Some(w) = cw.upgrade() {
                 w.set_status_is_error(false);
                 w.set_status_line(format!("「{name}」尚未实现（占位按钮）。").into());
+            }
+        });
+    }
+    // v11（卡 `abb-v11-panels-align`）：会话面板里的「🗄 归档…」。本卡只要求**面板里有这一项
+    // 且可点**；归档本体是另一张卡（`abb-v11-session-archive`）——这里如实回一句状态，
+    // 不做假动作（不假装已归档、也不删任何文件）。
+    {
+        let cw = syschat_win.as_weak();
+        syschat_win.on_session_archive(move || {
+            if let Some(w) = cw.upgrade() {
+                w.set_status_is_error(false);
+                w.set_status_line("「归档」尚未实现（归档本体见卡 abb-v11-session-archive）。".into());
             }
         });
     }

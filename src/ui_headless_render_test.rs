@@ -1295,3 +1295,261 @@ fn blur_hides_dialog_window_end_to_end() {
     );
     let _ = win;
 }
+
+// ─────────────────── v11（卡 `abb-v11-panels-align`）：两面板 + 用量条的对稿守卫 ───────────────────
+
+/// 出图目录（同 D2/D3 口径；**不写工作区**）。
+const SHOTS: &str = "/Volumes/DataExt/tmp/syschat-shots";
+
+/// 三个会话（含 tag）+ 两个模型（当前项 ✓ / 其它项 provider），灌进窗口。
+/// 与生产 `ui::refresh_syschat_sel` 同口径的数据形状（tag 由 `syschat::session_tag` 生成）。
+fn seed_panels(ui: &SystemChatWindow) {
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+        slint::SharedString::from("把架构图做成网页"),
+        slint::SharedString::from("排查 deepseek 端点"),
+    ]))));
+    ui.set_session_rows(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        SysChatMenuRow {
+            text: "新会话".into(),
+            tag: "昨天 23:12".into(),
+            tick: false,
+        },
+        SysChatMenuRow {
+            text: "把架构图做成网页".into(),
+            tag: "当前".into(),
+            tick: false,
+        },
+        SysChatMenuRow {
+            text: "排查 deepseek 端点".into(),
+            tag: "今天 00:40".into(),
+            tick: false,
+        },
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("deepseek-chat"),
+        slint::SharedString::from("claude-sonnet-4.6"),
+        slint::SharedString::from("gpt-5.1"),
+    ]))));
+    ui.set_model_rows(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        SysChatMenuRow {
+            text: "deepseek-chat".into(),
+            tag: "".into(),
+            tick: true,
+        },
+        SysChatMenuRow {
+            text: "claude-sonnet-4.6".into(),
+            tag: "anthropic".into(),
+            tick: false,
+        },
+        SysChatMenuRow {
+            text: "gpt-5.1".into(),
+            tag: "openai".into(),
+            tick: false,
+        },
+    ]))));
+    ui.set_session_index(1);
+    ui.set_model_index(0);
+}
+
+/// v11 验收：两面板的**锚点/尺寸/结构**与用量条的**结构**都可以机读断言（不靠肉眼）。
+///
+/// 判据来源：
+/// - 锚点：`syschat::menu_anchor`（右缘跟钮右缘对齐、顶边在钮下缘 6px、靠窗边内移）；
+/// - 面板高度：稿 `.menu` = 标题(28) + 每行 30 + 归档行 30 + footer；实现按内容自然高
+///   （这里用**像素上的 accent 行**与 footer 墨迹交叉校验，不信自报值）；
+/// - 用量条：稿 `.meter{width:56px;height:9px}`，内条 = 内容盒 52px。
+#[test]
+fn v11_panels_anchor_and_usage_meter_match_design() {
+    const H: u32 = 820;
+    const W520: u32 = 520;
+    let (ui, win, _m) = setup(vec![row("p", "占位")], H);
+    seed_panels(&ui);
+    super::refresh_syschat_usage(&ui);
+    ui.window().set_size(slint::PhysicalSize::new(W520, H));
+    apply_syschat_layout(&ui, W520 as f32);
+
+    // ① 锚点：与钮的矩形对齐（钮矩形由同一套 `titlebar_plan` 算术给出）。
+    let plan = crate::syschat::titlebar_plan(W520 as f32, true);
+    let (bx, bw) = crate::syschat::titlebar_session_btn(&plan).expect("520 宽下会话钮应画");
+    let (mbx, mbw) = crate::syschat::titlebar_model_btn(&plan).expect("520 宽下模型 chip 应画");
+    let sx = ui.get_session_menu_x();
+    let sy = ui.get_session_menu_y();
+    let mxx = ui.get_model_menu_x();
+    let myy = ui.get_model_menu_y();
+    // 会话钮在 520 宽下已靠窗右侧（右缘 252）⇒ 右对齐会把面板推出窗（x=2 < 6），
+    // 于是被夹到 6px 起（稿 `.menu` 的「靠边内移」；纯函数用例覆盖未夹取的右对齐）。
+    assert_eq!(sx, (bx + bw - 250.0).max(6.0), "会话面板应右对齐（靠窗边则夹到 6px）");
+    assert_eq!(mxx + 250.0, mbx + mbw, "模型面板右缘应与模型 chip 右缘对齐");
+    assert_eq!(sy, 38.0, "面板顶边 = 钮下缘(6+26) + 6");
+    assert_eq!(myy, 38.0, "两个面板同一行锚定");
+    assert!(sx >= 6.0 && sx + 250.0 <= W520 as f32 - 6.0, "面板不许出窗：x={sx}");
+
+    // ② 会话面板：展开后量真实几何（自报值 + 像素上的 accent 行交叉校验）。
+    ui.set_session_menu_open(true);
+    let f = settle_w(&win, W520, H);
+    assert_eq!(ui.get_dbg_session_menu_w(), 250.0, "面板宽 = 稿的 250px");
+    let h = ui.get_dbg_session_menu_h();
+    assert!((150.0..400.0).contains(&h), "面板高度不合理：{h}");
+    // 当前行（index=1）在像素上是 accent 底：面板内容盒宽 250−4=246、行高 30、
+    // 位置 = 锚点 y + padding 2 + 标题 28 + 第 1 行 30。
+    let acc = bbox(&f, 0, 40, 300, 300, is_accent).expect("当前会话项没有 accent 底（稿 .item.on）");
+    assert_eq!(acc.0, sx as u32 + 2, "accent 行左缘应贴内容盒（面板描边内侧 2px）");
+    assert_eq!(acc.2 - acc.0 + 1, 246, "accent 行宽 = 面板宽 − 左右描边");
+    assert_eq!(acc.1, sy as u32 + 60, "accent 行 y = 锚点 + padding2 + 标题28 + 1 行30");
+    assert_eq!(acc.3 - acc.1 + 1, 30, "行高 30px");
+    // footer 文案（第 3 行 + 归档行之后再有一段墨迹）——防止「面板把 footer 切掉」。
+    assert!(
+        bbox(&f, sx as u32, sy as u32 + 150, sx as u32 + 250, sy as u32 + h.ceil() as u32, is_dark)
+            .is_some(),
+        "面板下半部没有 footer 墨迹（footer 缺失或被切）"
+    );
+    // 行数变少 ⇒ 面板变矮（高度真的跟内容走，不是写死的）。
+    ui.set_session_rows(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        SysChatMenuRow {
+            text: "只有一条".into(),
+            tag: "当前".into(),
+            tick: false,
+        },
+    ]))));
+    let _ = settle_w(&win, W520, H);
+    assert!(
+        ui.get_dbg_session_menu_h() < h,
+        "行数减少后面板没变矮（高度没跟内容走）"
+    );
+    seed_panels(&ui);
+    let _ = settle_w(&win, W520, H);
+
+    // ③ 模型面板：当前项 ✓ + 其它项 provider（结构用 accent 行 + footer 断言）。
+    ui.set_session_menu_open(false);
+    ui.set_model_menu_open(true);
+    let f2 = settle_w(&win, W520, H);
+    let macc = bbox(&f2, 0, 40, 520, 300, is_accent).expect("当前模型项没有 accent 底");
+    assert_eq!(macc.0, mxx as u32 + 2, "模型面板 accent 行左缘");
+    assert_eq!(macc.2 - macc.0 + 1, 246, "模型面板 accent 行宽");
+    assert_eq!(macc.1, myy as u32 + 30, "模型面板 accent 行 = 锚点 + padding2 + 标题28（第 1 行）");
+    // 当前模型行**不再有右侧 provider**（右侧留给 ✓）——✓ 是墨色，故该行右侧应有墨迹。
+    assert!(
+        bbox(&f2, mxx as u32 + 200, myy as u32 + 30, mxx as u32 + 248, myy as u32 + 60, is_dark)
+            .is_some(),
+        "当前项右侧没有 ✓（或右侧 tag 未清空）"
+    );
+
+    // ④ 用量条结构（稿 `.tok` + `.meter`）：56×9；E3 之前无数据源 ⇒ 内条 0 宽。
+    ui.set_model_menu_open(false);
+    let _ = settle_w(&win, W520, H);
+    assert_eq!(ui.get_dbg_usage_meter_w(), 56.0, "进度条宽 = 稿的 56px");
+    assert_eq!(ui.get_dbg_usage_meter_h(), 9.0, "进度条高 = 稿的 9px");
+    assert_eq!(ui.get_dbg_usage_fill_w(), 0.0, "无数据源时内条为 0（不伪造）");
+    assert_eq!(ui.get_usage_text(), "上下文 —/— · —");
+    assert_eq!(ui.get_usage_level(), 0);
+    // 第二行「模型 · 状态」仍在（稿 `.status .st2 .l2`）。
+    assert!(ui.get_dbg_status_second_line(), "状态行第二行丢了");
+}
+
+/// v11 行为：两面板的**开合**——点钮展开、点面板外收起、**再点钮也收起**
+/// （稿 v11 第 1 条；`PopupWindow` 的 close-on-click-outside 做不到「再点收起」，见组件注释）。
+#[test]
+fn v11_menu_panels_open_and_close_on_outside_or_second_click() {
+    const W520: u32 = 520;
+    let (ui, win, _m) = setup(vec![row("p", "占位")], SHORT_H);
+    seed_panels(&ui);
+    ui.window().set_size(slint::PhysicalSize::new(W520, SHORT_H));
+    apply_syschat_layout(&ui, W520 as f32);
+    let _ = settle_w(&win, W520, SHORT_H);
+    let plan = crate::syschat::titlebar_plan(W520 as f32, true);
+    let (bx, bw) = crate::syschat::titlebar_session_btn(&plan).expect("会话钮");
+    let (sx, sy) = (bx + bw / 2.0, crate::syschat::TB_BTN_Y + crate::syschat::TB_BTN_H / 2.0);
+    let (mbx, mbw) = crate::syschat::titlebar_model_btn(&plan).expect("模型 chip");
+    let (mx, my) = (mbx + mbw / 2.0, sy);
+
+    // 会话面板：开 → 再点收起 → 再开 → 点面板外收起。
+    press_release(&win, sx, sy);
+    assert!(ui.get_session_menu_open(), "点 🗂 应展开会话面板");
+    press_release(&win, sx, sy);
+    assert!(!ui.get_session_menu_open(), "再点 🗂 应收起面板（不是只重开）");
+    press_release(&win, sx, sy);
+    assert!(ui.get_session_menu_open(), "第三次点应再次展开");
+    press_release(&win, 300.0, 400.0);
+    assert!(!ui.get_session_menu_open(), "点面板外应收起");
+
+    // 模型面板：同理；另外两者互斥（开会话面板后点模型 chip 应只剩模型面板）。
+    press_release(&win, mx, my);
+    assert!(ui.get_model_menu_open(), "点模型 chip 应展开模型面板");
+    press_release(&win, mx, my);
+    assert!(!ui.get_model_menu_open(), "再点模型 chip 应收起");
+    // 互斥口径（与 d9 的表情/更多一致）：面板开着时点**另一个**chip，那一下被 backdrop 吃掉
+    // ⇒ 只收起（等于「点外部收起」）；再点一次才展开另一个。这不是 bug，是同一套 backdrop 口径。
+    press_release(&win, sx, sy);
+    assert!(ui.get_session_menu_open(), "展开会话面板");
+    press_release(&win, mx, my);
+    assert!(
+        !ui.get_session_menu_open() && !ui.get_model_menu_open(),
+        "面板开着时点另一个 chip 应先收起（backdrop 吃掉那一下）"
+    );
+    press_release(&win, mx, my);
+    assert!(ui.get_model_menu_open(), "再点模型 chip 才展开模型面板");
+}
+
+/// v11 出图：会话面板 / 模型面板 / 状态区（对稿判读用；默认不跑）。
+#[test]
+#[ignore = "出图用；默认不跑"]
+fn dump_v11_panels_for_review() {
+    const H: u32 = 820;
+    const W520: u32 = 520;
+    let dir = std::path::Path::new(SHOTS);
+    std::fs::create_dir_all(dir).expect("建出图目录失败");
+    let (ui, win, _m) = setup(fixture(), H);
+    seed_panels(&ui);
+    super::refresh_syschat_usage(&ui);
+    ui.set_draft("就按这三份素材做，说明放第二节…".into());
+    ui.window().set_size(slint::PhysicalSize::new(W520, H));
+    apply_syschat_layout(&ui, W520 as f32);
+
+    ui.set_session_menu_open(true);
+    let f = settle_w(&win, W520, H);
+    let f_dbg = (
+        ui.get_session_menu_x(),
+        ui.get_session_menu_y(),
+        ui.get_dbg_session_menu_w(),
+        ui.get_dbg_session_menu_h(),
+    );
+    write_png(&f, &dir.join("v11-session-menu.png"));
+    let session_accent = bbox(&f, 0, 40, 300, 300, is_accent);
+    println!("session panel frame: dbg={f_dbg:?} accent(panel)={session_accent:?}");
+    ui.set_session_menu_open(false);
+    ui.set_model_menu_open(true);
+    let f2 = settle_w(&win, W520, H);
+    write_png(&f2, &dir.join("v11-model-menu.png"));
+    println!(
+        "model panel frame: h={} accent(panel)={:?}",
+        ui.get_dbg_session_menu_h(),
+        bbox(&f2, 0, 40, 520, 300, is_accent)
+    );
+    // 无面板帧（状态区）：用量条 + 两行状态。
+    ui.set_model_menu_open(false);
+    let f = settle_w(&win, W520, H);
+    write_png(&f, &dir.join("v11-status.png"));
+    // 只切状态行+面板区（放大看用量条与面板描边）。
+    let top = crop(&f, 0, 0, W520, 260);
+    write_png(&top, &dir.join("v11-titlebar-status.png"));
+    println!(
+        "v11 出图完成：v11-session-menu.png / v11-model-menu.png / v11-status.png / \
+         v11-titlebar-status.png（session_menu=({},{}), model_menu=({},{})）",
+        ui.get_session_menu_x(),
+        ui.get_session_menu_y(),
+        ui.get_model_menu_x(),
+        ui.get_model_menu_y()
+    );
+}
+
+/// 从一帧里裁一块（x,y 为左上角；供对稿放大用）。
+fn crop(f: &Frame, x: u32, y: u32, w: u32, h: u32) -> Frame {
+    let mut buf = vec![PremultipliedRgbaColor::default(); (w * h) as usize];
+    for row in 0..h {
+        for col in 0..w {
+            buf[(row * w + col) as usize] = f.px(x + col, y + row);
+        }
+    }
+    Frame { buf, w, h }
+}

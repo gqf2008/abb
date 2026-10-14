@@ -1087,6 +1087,151 @@ fn is_wide_char(c: char) -> bool {
         | 0x20000..=0x3FFFD) // CJK 扩展 B+
 }
 
+/// token 进度条**内条**可用宽（稿 `.meter{width:56px;border:2px}` ⇒ 内容盒 52px）。
+/// 内条填宽 = 这个值 × 百分比；`ui/app.slint` 的 `usage-fill` 宽也按这个上限夹取。
+pub const USAGE_METER_INNER_W: f32 = 52.0;
+
+/// 自绘面板（`.menu`）宽（稿 `width:250px`）。Rust 算锚点与 `ui/app.slint` 的 `MenuPanel`
+/// 必须同值：面板靠右对齐、靠边内移都靠它。
+pub const MENU_PANEL_W: f32 = 250.0;
+/// 标题栏控件条里那颗钮的绝对 y（`ui/app.slint` 的 `titlebar-strip-x` 那条布局：`y: 6px`）。
+/// **改 .slint 那行时这里要同步**（面板锚点算的是「钮下缘 + 6px」）。
+pub const TB_BTN_Y: f32 = 6.0;
+/// 标题栏钮高（稿 `.tb-btn{height:26px}`）。同上：与 .slint 同步。
+pub const TB_BTN_H: f32 = 26.0;
+
+/// 标题栏「历史会话」钮在窗口坐标里的矩形 `(x, w)`；没画（窄窗换档换掉了）返回 None。
+///
+/// 算术与 `titlebar_plan` 同源：控件条从 `plan.x` 起按 `[新建][会话][模型][⚙]` 排、
+/// 间距 `TB_ITEM_GAP`。
+pub fn titlebar_session_btn(plan: &TitlebarPlan) -> Option<(f32, f32)> {
+    (plan.x >= 0.0 && plan.session_w > 0.0)
+        .then_some((plan.x + plan.new_w + TB_ITEM_GAP, plan.session_w))
+}
+
+/// 标题栏「模型」chip 在窗口坐标里的矩形 `(x, w)`；没画返回 None（同 [`titlebar_session_btn`]）。
+pub fn titlebar_model_btn(plan: &TitlebarPlan) -> Option<(f32, f32)> {
+    (plan.x >= 0.0 && plan.model_w > 0.0).then_some((
+        plan.x + plan.new_w + TB_ITEM_GAP + plan.session_w + TB_ITEM_GAP,
+        plan.model_w,
+    ))
+}
+
+// ─────────────────── v11：面板与上下文用量（卡 `abb-v11-panels-align`）───────────────────
+
+/// 历史会话面板每项右侧的 tag（稿 `.menu .item .tag`）：当前会话写「当前」，
+/// 其余写相对时间（今天/昨天 `HH:MM`，更早写 `M月D日`）。
+///
+/// `now` 与 `updated_at` 都是 **UNIX 秒**；日历换算走 `chrono_lite` 的本地
+/// （UTC+8）口径——与 `chrono_lite::now()` / #74 历史页同一套，不引依赖。
+/// `updated_at <= 0`（旧数据缺字段）→ 空 tag，不编造时间。
+pub fn session_tag(updated_at: i64, now: u64, is_current: bool) -> String {
+    if is_current {
+        return "当前".to_string();
+    }
+    if updated_at <= 0 {
+        return String::new();
+    }
+    const TZ: i64 = 8 * 3600;
+    let local = updated_at.saturating_add(TZ).max(0) as u64;
+    let today = (now as i64).saturating_add(TZ).max(0) as u64 / 86400;
+    let day = local / 86400;
+    let (_, mo, d, h, mi, _) = crate::chrono_lite::epoch_to_ymd(local);
+    if day == today {
+        format!("今天 {h:02}:{mi:02}")
+    } else if day + 1 == today {
+        format!("昨天 {h:02}:{mi:02}")
+    } else {
+        format!("{mo}月{d}日")
+    }
+}
+
+/// token 数的紧凑写法（稿：`12.4K/128K`）：<1000 原样，K/M 各保留一位小数、
+/// 整数时去掉 `.0`（`128000` → `128K`，不是 `128.0K`）。
+pub fn token_short(n: u64) -> String {
+    let trim = |v: f64| -> String {
+        let s = format!("{v:.1}");
+        if let Some(stripped) = s.strip_suffix(".0") {
+            stripped.to_string()
+        } else {
+            s
+        }
+    };
+    if n < 1000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{}K", trim(n as f64 / 1000.0))
+    } else {
+        format!("{}M", trim(n as f64 / 1_000_000.0))
+    }
+}
+
+/// 上下文占用百分比（0..=100；`limit == 0` 或已超上限时按口径夹取）。
+pub fn usage_percent(used: u64, limit: u64) -> f32 {
+    if limit == 0 {
+        return 0.0;
+    }
+    ((used as f64 / limit as f64) * 100.0).clamp(0.0, 100.0) as f32
+}
+
+/// 进度条档位（稿 v11 `.meter.warn/.hot`）：0 正常（accent）/ 1 ≥70% 橙 / 2 ≥90% 红。
+///
+/// 阈值写在这里（而不是 .slint）是为了让它可被单测钉住（颜色本身无法断言，档位可以）。
+pub fn usage_level(pct: f32) -> i32 {
+    if pct >= 90.0 {
+        2
+    } else if pct >= 70.0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// 状态栏右侧的上下文用量文案（稿 v11：`上下文 12.4K/128K · 9.7%`）。
+///
+/// `None` = **数据源未就绪**（E3 卡之前没有 usage 上报，见 `abb-syschat-e3-tokens-20261013`
+/// 的实核结论）：显示 `—/— · —` 的空档结构，**不伪造精确值也不冒充估算值**。
+pub fn context_usage_text(used: Option<u64>, limit: Option<u64>) -> String {
+    match (used, limit) {
+        (Some(u), Some(l)) if l > 0 => format!(
+            "上下文 {}/{} · {:.1}%",
+            token_short(u),
+            token_short(l),
+            usage_percent(u, l)
+        ),
+        _ => "上下文 —/— · —".to_string(),
+    }
+}
+
+/// 本会话上下文用量的**唯一数据源接缝**（E3 卡落地时只改这里）。
+///
+/// 实核结论（E3 卡）：`src/runtime/acp.rs` 里**没有任何 usage 来源**（全仓只有一句注释
+/// 说明 goose 不上报 usage）⇒ 当前如实返回 `None`；UI 因此显示空档结构而不是数字。
+/// 悬停提示附上口径说明（「数据来源待 E3」），不让人误以为这是精确值。
+pub fn context_usage() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
+/// 面板（自绘 `.menu`）的**锚点**（纯函数，单测钉住）：
+/// - 横向：面板**右缘与按钮右缘对齐**（同 `SessionIconButton` 之前的 `x: root.width - w`），
+///   靠窗边时整体内移（先压上界再压下界，同 [`clamp_bubble_pos`] 的取向）；
+/// - 纵向：面板顶边在按钮**下缘下方** `gap`（稿 `.menu{top:30px}`：按钮高 26 + 4px；
+///   本仓取 6px，与 `abb-v11-popup-anchor` 的 6–8px 口径一致）。
+///
+/// 注：标题栏按钮在**窗口顶部**，面板只能向下展开（向上会跑出窗）；
+/// 「贴按钮上方」那条口径只适用于输入框上方的 `.pop`（另一张卡）。
+pub fn menu_anchor(btn_x: i32, btn_w: i32, btn_bottom: i32, panel_w: i32, win_w: i32) -> (i32, i32) {
+    let max_x = win_w - panel_w - 6;
+    let mut x = btn_x + btn_w - panel_w;
+    if x > max_x {
+        x = max_x;
+    }
+    if x < 6 {
+        x = 6;
+    }
+    (x, btn_bottom + 6)
+}
+
 // ─────────────────── D 批：对话框锚定气泡的几何（纯函数）───────────────────
 
 /// 气泡与对话框之间的间距（逻辑像素，稿 `.gap` = 10px）。
@@ -4036,6 +4181,77 @@ mod tests {
         // ASCII："deepseek-chat"（13 半宽 = 91px）在 112px chip（可用 74px）里被截断。
         let m = fit_chip_label("deepseek-chat", 112.0);
         assert!(m.ends_with('…') && m.len() < "deepseek-chat".len(), "{m}");
+    }
+
+    /// v11（卡 `abb-v11-panels-align`）：会话面板右 tag 的相对时间口径。
+    ///
+    /// 判别力：把「昨天」分支的 `day + 1 == today` 改成 `day == today`（退化成都写「今天」）
+    /// ⇒ 本用例红；把当前会话分支去掉（不再写「当前」）⇒ 也红。
+    #[test]
+    fn session_tag_writes_current_today_yesterday_and_old_date() {
+        // 2026-10-18 12:00 本地（UTC+8）（= 2026-10-18 04:00 UTC）
+        let now = 1_792_296_000u64;
+        assert_eq!(session_tag(now as i64, now, true), "当前", "当前会话不写时间");
+        // 本地 09:10 → 今天 09:10
+        assert_eq!(session_tag(1_792_285_800, now, false), "今天 09:10");
+        // 本地前一天 23:12 → 昨天 23:12
+        assert_eq!(session_tag(1_792_249_920, now, false), "昨天 23:12");
+        // 更早：固定 `M月D日`（不写「今天/昨天」）
+        let old = session_tag(1_791_864_000, now, false);
+        assert_eq!(old, "10月13日");
+        // 旧数据缺字段（<=0）：空 tag，不编造时间
+        assert_eq!(session_tag(0, now, false), "");
+    }
+
+    /// v11：token 紧凑写法 / 百分比 / 档位 / 文案（含**无数据源**的空档）。
+    ///
+    /// 判别力：把 [`usage_level`] 的 90 改回 70（两档合并）⇒ 本用例红；
+    /// 把 [`context_usage_text`] 的 `_ =>` 分支改成“估算数字” ⇒ `..._placeholder` 红。
+    #[test]
+    fn usage_text_percent_and_level_follow_design() {
+        assert_eq!(token_short(0), "0");
+        assert_eq!(token_short(999), "999");
+        assert_eq!(token_short(12_432), "12.4K");
+        assert_eq!(token_short(128_000), "128K"); // 整数不带 .0
+        assert_eq!(token_short(1_500_000), "1.5M");
+        assert_eq!(usage_percent(12_432, 128_000).round(), 10.0);
+        assert_eq!(usage_percent(1, 0), 0.0, "无上限时不产生 NaN/inf");
+        assert_eq!(usage_percent(999, 100), 100.0, "越限被夹到 100");
+        // 阈值：≥70 橙 / ≥90 红（69.9 / 89.9 仍是下一档）
+        assert_eq!(usage_level(0.0), 0);
+        assert_eq!(usage_level(69.9), 0);
+        assert_eq!(usage_level(70.0), 1);
+        assert_eq!(usage_level(89.9), 1);
+        assert_eq!(usage_level(90.0), 2);
+        assert_eq!(usage_level(100.0), 2);
+        assert_eq!(
+            context_usage_text(Some(12_432), Some(128_000)),
+            "上下文 12.4K/128K · 9.7%"
+        );
+        // E3 之前没有数据源：空档结构，不伪造数字
+        assert_eq!(context_usage_text(None, None), "上下文 —/— · —");
+        assert_eq!(context_usage_text(Some(1), Some(0)), "上下文 —/— · —");
+        assert_eq!(context_usage(), (None, None), "E3 卡之前如实无数据源");
+    }
+
+    /// v11：面板锚点 —— 右缘跟按钮右缘对齐、顶边在按钮下缘 6px、靠边整体内移（不出窗）。
+    ///
+    /// 判别力：把横向夹取去掉（不压 `max_x`）⇒ 靠右按钮的面板会伸出窗 ⇒ 本用例红。
+    #[test]
+    fn menu_anchor_right_aligns_and_keeps_panel_inside_window() {
+        // 按钮在窗右侧（右缘 400），面板 250 ⇒ 面板 x = 150，y = 32 + 6。
+        assert_eq!(menu_anchor(374, 26, 32, 250, 520), (150, 38));
+        // 窄窗（340）：右缘对齐会越界 ⇒ 内移到 6px 起（右缘仍在窗内）。
+        let (x, y) = menu_anchor(180, 26, 32, 250, 340);
+        assert_eq!(x, 6);
+        assert_eq!(y, 38);
+        assert!(x + 250 <= 340 - 6, "面板不许出窗");
+        // 钮贴到窗右缘（右缘超出可用区）：必须被**右上界**夹回来（只有左边夹取挡不住这条）。
+        let (x2, _) = menu_anchor(500, 26, 32, 250, 400);
+        assert_eq!(x2, 400 - 250 - 6, "钮贴右缘时应被右上界夹回");
+        assert!(x2 + 250 <= 400 - 6, "面板不许出窗（右边界）");
+        // 窗比面板还窄：依然落在 6px 起点（不许变负）。
+        assert_eq!(menu_anchor(0, 26, 32, 250, 200).0, 6);
     }
 
     /// 宽字符判据的边界：CJK/全角算宽，ASCII/拉丁/希腊算窄（用于估宽方向正确性）。
