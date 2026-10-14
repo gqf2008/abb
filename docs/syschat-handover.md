@@ -35,7 +35,7 @@ grep -a '\[verify\]\|\[selfresize\]' /tmp/verify.log       # 窗口底层事实�
 swift /tmp/winid.swift | awk -F'\t' '$2=="ABB"'            # 列出 ABB 窗口（拿 window id）
 screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不需要辅助功能权限）
 ```
-**当前 head 的实测读数**（06:47，debug，**锁屏下也能跑**；留档 `/private/tmp/verify-head-0646.log` 6 行）：
+**当前 head 的实测读数**（06:47，debug，**锁屏下也能跑**；留档 `/private/tmp/verify-head-0646.log` 7 行＝1 条 `[single-instance] 拿到 gui 锁` + 6 条 `[verify]`）：
 `pre-show` 与 `t=400ms` 都是 `winit=None`（后者已 `slint_size=520×560` ⇒ Slint 侧建好了、原生窗还没 realize）⇒
 `t=800ms…2000ms` 稳定为 `winit=Some is_resizable=true is_decorated=false inner=1040×1120 hit_areas=true self_managed=true`；
 同期 `CGWindowListCopyWindowInfo` 报 `(475,124,520,560)`（逻辑点 = inner 的一半，2× 缩放）
@@ -240,7 +240,7 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
   ⑤四类边界都有单测（空 delta 丢弃 / 只有思考 `finish("")` 后仍在 / 只有正文 / 多段思考）；⑥四道门禁全绿。
   ◐：**②块序列不保留交替**——累积模型里交替是被保住的（单测断言 `[Thought,Text,Thought,Text]` 与逐段文本），但渲染层把同类思考段汇成**一个**思考块置于正文之前
   ⇒「思考→正文→思考」显示成 思考(A+C) + 正文(B)。**原因是历史模型 `Turn.thought` 是单字段**（逐段交替不可持久化 ⇒ 实时与重开视图会不一致），要真做需给 `Turn` 加 segments（schema + 迁移）；
-  **③视觉细节与稿不同**：稿 `details.think` 是 2px 实线 + `body{border-top:2px dashed}`，**Slint 没有 dashed 边框** ⇒ 实现用 1px 实线 + radius 6、无分隔虚线；标题文案「思考过程 · 3.2s」（进行中「思考中」）vs 稿「思考 · 用时 X.Xs」（**待 owner 拍**）。
+  **③视觉细节与稿不同**：稿 `details.think` 是 2px 实线 + `body{border-top:2px dashed}`，**Slint 没有 dashed 边框**（实核：`i-slint-compiler-1.18.0` 与 vendored `third_party/i-slint-core` 里 `dashed|border-style|BorderStyle` **零命中**，`Rectangle` 只文档化 `border-width`/`border-color`）⇒ 实现用 1px 实线 + radius 6、无分隔虚线；标题文案「思考过程 · 3.2s」（进行中「思考中」）vs 稿「思考 · 用时 X.Xs」（**待 owner 拍**）。
   变异 2 处红后还原：`text_of` 去掉 kind 过滤 ⇒ 分段用例红（`src/syschat.rs:3774`）；执行层把 `agent_thought_chunk` 投成 `agent_message_chunk` ⇒ 投影用例红（`crates/abb-agent/src/acp.rs:1300`）。
 - **`tools/gates.sh` 的 UTF-8 locale 坑是「已修」不是「待修」**（卡 `abb-gates-sh-locale-unbound-var-20261012`，closed）：修法在 `f88a606`（`${CARGO_TARGET_DIR}` 把变量名封住）。
   判据可原样复跑：`rg -n '\$[A-Za-z_][A-Za-z0-9_]*[）、，。；：？！「」【】（）]' tools/gates.sh` ⇒ 0 命中；`LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash tools/gates.sh --print-env` ⇒ exit 0。
