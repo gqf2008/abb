@@ -4220,9 +4220,11 @@ export component SystemChatWindow inherits Window {
                                     height: 18px;
                                     background: transparent;
                                     Text {
+                                        // 文案按设计稿（唯一视觉事实源）：`思考 · 用时 3.2s`；
+                                        // 思考进行中写 `思考中`（不带用时，避免跳动）。
                                         text: (b.think-expanded ? "▾ " : "▸ ")
-                                            + (b.think-live ? "思考中" : "思考过程")
-                                            + (b.think-elapsed == "" ? "" : " · " + b.think-elapsed);
+                                            + (b.think-live ? "思考中" : "思考")
+                                            + (b.think-elapsed == "" ? "" : " · 用时 " + b.think-elapsed);
                                         font-size: 11.5px;
                                         font-weight: 600;
                                         color: UiTokens.text-dim;

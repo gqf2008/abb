@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABB 系统对话 · 设计稿 v11.1</title>
+<title>ABB 系统对话 · 设计稿 v12</title>
 <style>
   :root{
     --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
@@ -64,7 +64,7 @@
      拖动改内容区/输入区高度比例（不是窗口缩放，也不是输入框内部）。 */
   .split{height:10px;background:var(--panel);border-top:2px solid var(--edge);cursor:ns-resize;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
   .split:hover{background:var(--hover)}
-  .split i{width:38px;height:2px;background:var(--edge);border-radius:2px;display:block}
+  /* v12：**只留一条线**（去掉中间抓手）——owner 口径「现在看上去有三条线」 */
   .win{width:478px;background:var(--edge);border-radius:10px;padding:2px;box-shadow:0 10px 30px rgba(28,26,23,.25)}
   .win-body{background:var(--panel);border-radius:8px;overflow:hidden;display:flex;flex-direction:column;height:640px}
   .titlebar{height:38px;background:var(--bg);border-bottom:2px solid var(--edge);display:flex;align-items:center;gap:6px;padding:0 10px;flex:0 0 auto}
@@ -292,7 +292,7 @@
 
     <!-- v11：**内容区 ↔ 输入区**之间的分割把手（不是窗口底边，也不是输入框内部）。
          拖动改两区高度比例；上下各 2px 描边 + 中间一小段抓手。 -->
-    <div class="split" title="拖动调整内容区与输入区的高度"><i></i></div>
+    <div class="split" title="拖动调整内容区与输入区的高度"></div>
 
     <div class="composer-zone">
       <div class="composer">
@@ -329,7 +329,7 @@
 <!-- /左列 -->
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v11.1</h1>
+  <h1>ABB 系统对话 · 设计稿 v12</h1>
   <div class="sub">本轮：交互细化（面板位置 / 截屏 / 上下文用量条 / 可拉升 / 消息动作 / 归档 / 新建去重）</div>
   <div class="sub" style="color:var(--info)"><b>v11 新增的交互要求</b>（本稿先画示意，walgit 已登记待逐步实现）</div>
   <ol>
@@ -352,7 +352,15 @@
     <li><b>附件移进输入框内</b>：输入区**不再有框外图标列**；框内底部一行（靠右）＝ <code>[😊 表情] [📎 附件] [✂ 截图] [⋯ 更多(定时)]</code> + <code>发送</code> + <code>🗑 清空</code>，全部**同一水平线**。</li>
     <li><b>输入区边距一致</b>：去掉框外图标列后，输入框左右各留 10px（原来右侧偏大）。</li>
   </ol>
-  <div class="sub" style="color:var(--info)"><b>v8 相对 v7 的改动</b>（实现以本稿为准）</div>
+  <div class="sub" style="color:var(--info)"><b>v12 相对 v11 的改动</b>（实现以本稿为准）</div>
+  <ol>
+    <li><b>气泡与对话框互斥</b>：<b>开窗时藏起气泡，窗口失焦/关闭后气泡回来</b>（v8 的「气泡常驻置顶」作废）。</li>
+    <li><b>取消「气泡跟随窗口」</b>：拖窗/缩放时气泡不再吸附跟动（那套已删除）。</li>
+    <li><b>分割条只留一条线</b>：内容区 ↔ 输入区之间那条不再画中间抓手（原来视觉上像三条线）。</li>
+    <li><b>窗口尺寸可放大</b>：修掉「布局推出的 max 把窗口夹在 preferred」的缺陷（⤢ 与向外拖边角现已可用）。</li>
+    <li><b>思考块标题文案</b>：<code>▸ 思考 · 用时 3.2s</code>（进行中显示 <code>思考中</code>）。</li>
+  </ol>
+  <div class="sub" style="color:var(--info)"><b>v8 相对 v7 的改动</b>（历史）</div>
   <ol>
     <li><b>气泡常驻置顶</b>：点气泡开窗后<b>气泡不再消失</b>（v7/老需求 #13「气泡随窗隐藏」<b>作废</b>）；气泡永久置顶，窗口始终锚在气泡旁。</li>
     <li><b>标题栏图标化</b>：<code>＋</code> 新建会话（图标）在<b>历史会话 <code>🗂</code>（图标）左边</b>——两个都只要图标、不要文字；模型仍是带文案的 chip。</li>
