@@ -163,6 +163,19 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 - **中间构建（不可按当前 head 复算）**：`verify-a1.log`/`verify-a2.log`（各 8 行，01:07 的 A/B：含「试验：set_resizable(false)」探针 ⇒ 其后 `is_resizable=false`；当前 head **没有**这条探针）；`verify-0120.log`（334 行：`t=400…2000` + **323 条** `[selfresize] cursor_moved (…)`）；`verify-0245.log`（**11 行**：`t=400…2000` + **恰好一条** `[selfresize] begin dir=north-east at (508,11)`，**无** `cursor_moved`、**无** `ret=`）。⚠️ 上一版把 `verify-0245.log` 描述成「`begin dir=east` + `ret=true` + 其后数百次 `cursor_moved`」——**逐项与文件不符**，且 `ret=` / `cursor_moved` 这两个日志点在当前 head 上**不存在**（当前 head 唯一相关日志点是 `[selfresize] begin dir={dir} at ({x},{y})`，写在 `src/ui.rs` 自管缩放的按键分支里；**别按行号找**——本节原写 `:8126`，到 `2dfef7a` 已是 `:8134`、到 `ea0429a` 是 `:8139`，行号每两次提交就漂）⇒ 它们只能证明「当时（中间构建、00:10/00:31）合成拖拽确实能让自管会话开起来」，**不能**作为当前 head 的复现。
 - `syschat-shots/verify-isresizable.png`：**在盘上**——`/Volumes/DataExt/tmp/syschat-shots/verify-isresizable.png`（107 KB，00:02 产出），画面就是当时代码画出来的对话窗（无边框、标题栏三钮、状态行、空态文案、输入区）。
   ⚠️ **纠偏（2026-10-15 实核）**：上一版写「该目录在盘上已不存在（`ls /private/tmp/syschat-shots` 空）⇒ 证据已失效」——**查错了路径**：出图目录恒在**数据卷**（`src/ui_headless_render_test.rs::SHOTS = /Volumes/DataExt/tmp/syschat-shots`，§1 同）；`/private/tmp` 只是**探针日志**（`verify-*.log`）的落点。⇒ 这张图**没失效**，但它的证据范围要收窄：它产自 **00:02 的中间构建**，只能证明「那天窗真开出来了」，**不能**证明当前 head 的缩放/最大化可用；要当前 head 的等价画面，按 §1 跑无头出图（同目录 `short.png` 等，同输入同像素）。
+**⚠️ 2026-10-15 14:44 接手复测（协调者，探针口径）：⤢ 仍不生效——「已做」是乐观结论。**
+证据（`ABB_VERIFY_OPEN=1 ABB_VERIFY_KEEP_VISIBLE=1 ABB_VERIFY_TOGGLE_MAX=1`，隔离 HOME，debug 构建）：
+```
+[verify] t=800ms…2000ms: winit=Some is_resizable=true is_decorated=false inner=1040×1120 hit_areas=true self_managed=true
+[verify-toggle-max] before  = x475 y124 w520 h560
+[verify-toggle-max] called toggle_syschat_maximize
+[verify-toggle-max] after#1 = x0   y231 w520 h560     ← 位置动了、**尺寸没动**
+[verify-toggle-max] after#2 = x0   y231 w520 h560
+```
+⇒ **窗口只被移到别处，尺寸纹丝不动**（就是 owner 说的「⤢ 无效」）。而且**接上原子 `setFrame` 之后仍是这个结果**（`e066740` 已把 `platform::set_window_frame` 接进 `SelfResize::apply` 与 `toggle_syschat_maximize`），所以问题**不在「两个请求打架」**，而更可能在**算出来的目标矩形本身**（`next` 的 w/h 就等于当前尺寸 520×560，且落点 `y=231` 可疑）。
+**下一步（不用任何人工点击，闭环已通）**：把探针扩成打印 `work`（`platform::visible_work_area`）与 `next`（`MaximizeState::toggle` 的输出）+ `apply_window_rect_atomic` 的返回值，再跑 `ABB_VERIFY_TOGGLE_MAX=1` 读三行即可定位（怀疑点：`visible_work_area` 的坐标翻转/`primary_h` 取值、或 `MaximizeState` 把「已在最大化」判成了「还原」而回了一个陈旧矩形）。
+**另两条环境结论（纠正上一版的「锁屏」归因）**：① 屏幕**没锁**（`CGSessionCopyCurrentDictionary`：`kCGSSessionOnConsoleKey=1`、无 `CGSSessionScreenIsLocked` 键）；真正的拦路虎是**本进程没有「辅助功能」授权** ⇒ `CGEventPost` 合成点击被丢弃（`osascript click at` 报 `-25211` 同一件事）——所以「锁屏」**不是**根因。② 隔离运行时对话窗**不在 on-screen 窗口列表里**（只列出 44×44 的气泡），尽管日志显示它有 `inner=1040×1120` ⇒ 「自己开窗量图」这条路还差一步（`ABB_VERIFY_KEEP_VISIBLE` 也没让它留下），要么让它真正显示、要么只靠探针读数。
+
 **未验证（owner 项）**：真机手拖边角「窗口真的变大变小 + 手感/发不发飘」，以及自管缩放与最大化（`toggle_syschat_maximize`）的互动。合成点击**必须先解锁屏**。
 
 ### 5.2 其余未做
