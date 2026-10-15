@@ -1596,12 +1596,21 @@ fn toggle_syschat_maximize(win: &SystemChatWindow, state: &RefCell<crate::syscha
         return;
     };
     let next = state.borrow_mut().toggle(cur, work);
+    // 探针扩展（2026-10-15 接手复测用）：打印工作区/当前/目标三个矩形——⤢ 实测「只移位置、
+    // 尺寸不变」，需要分清是**目标矩形算错**还是**写回被拒**。仅在探针里打，生产不输出。
+    if std::env::var("ABB_VERIFY_TOGGLE_MAX").is_ok() {
+        crate::log!("[verify-toggle-max] cur={cur:?} work={work:?} next={next:?}");
+    }
     // ⚠️ 顺序（2026-10-15 实测纠偏）：**先位置后尺寸**。反过来（先 set_size）时，目标尺寸在
     // 当前位置放不下（例如从 (475,124) 直接铺 1470×923）⇒ macOS 会拒绝这次 resize 并只做
     // 夹取移动——窗口尺寸纹丝不动，正是「⤢ 无效」的根因。先把原点挪到工作区左上，再放大，
     // 目标矩形就放得下；两个请求都生效。
     // 首选**原子落地**（macOS 一次 `setFrame:`）：位置与尺寸一起落，不会被拒、也不会被夹取。
-    if apply_window_rect_atomic(&w, &next) {
+    let atomic_ok = apply_window_rect_atomic(&w, &next);
+    if std::env::var("ABB_VERIFY_TOGGLE_MAX").is_ok() {
+        crate::log!("[verify-toggle-max] atomic_setFrame_ok={atomic_ok}");
+    }
+    if atomic_ok {
         return;
     }
     w.set_position(slint::LogicalPosition::new(next.x, next.y));

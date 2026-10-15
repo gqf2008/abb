@@ -174,6 +174,21 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 ```
 ⇒ **窗口只被移到别处，尺寸纹丝不动**（就是 owner 说的「⤢ 无效」）。而且**接上原子 `setFrame` 之后仍是这个结果**（`e066740` 已把 `platform::set_window_frame` 接进 `SelfResize::apply` 与 `toggle_syschat_maximize`），所以问题**不在「两个请求打架」**，而更可能在**算出来的目标矩形本身**（`next` 的 w/h 就等于当前尺寸 520×560，且落点 `y=231` 可疑）。
 **下一步（不用任何人工点击，闭环已通）**：把探针扩成打印 `work`（`platform::visible_work_area`）与 `next`（`MaximizeState::toggle` 的输出）+ `apply_window_rect_atomic` 的返回值，再跑 `ABB_VERIFY_TOGGLE_MAX=1` 读三行即可定位（怀疑点：`visible_work_area` 的坐标翻转/`primary_h` 取值、或 `MaximizeState` 把「已在最大化」判成了「还原」而回了一个陈旧矩形）。
+**✅ 2026-10-15 15:15 进一步定位（探针扩印三个矩形 + 返回值，已提交）**：
+```
+cur  = x0   y231  w520  h560
+work = x0   y33   w1470 h923      ← 工作区算对了（扣掉菜单栏 y=33）
+next = x0   y33   w1470 h923      ← 目标矩形也算对了
+atomic_setFrame_ok = true         ← 原生 setFrame 自称成功
+之后 cur 仍是 x0 y231 520×560      ← 窗口没变
+```
+⇒ **不是「目标矩形算错」**，而是**原生写框被 Slint 覆盖**：Slint 的 winit 适配层自己记着窗口尺寸
+（`slint_size` 与 winit 一致），原生 `setFrame:` 之后它在下一拍又按自己的模型写回 520×560。
+**建议的修法（下一步就试这个）**：原生 `setFrame` 成功后**同时把 Slint 自己的尺寸/位置也同步**
+（`window.set_size` + `window.set_position`），让两层模型一致；或干脆放弃原生路径，回到
+「位置与尺寸分两拍写」（上一轮实测过两种顺序同拍都失败，但**分拍**是当时能生效的形态）。
+验证闭环仍是 `ABB_VERIFY_TOGGLE_MAX=1`（每次 12 秒读 3 行，**不需要人工点击**）。
+
 **另两条环境结论（纠正上一版的「锁屏」归因）**：① 屏幕**没锁**（`CGSessionCopyCurrentDictionary`：`kCGSSessionOnConsoleKey=1`、无 `CGSSessionScreenIsLocked` 键）；真正的拦路虎是**本进程没有「辅助功能」授权** ⇒ `CGEventPost` 合成点击被丢弃（`osascript click at` 报 `-25211` 同一件事）——所以「锁屏」**不是**根因。② 隔离运行时对话窗**不在 on-screen 窗口列表里**（只列出 44×44 的气泡），尽管日志显示它有 `inner=1040×1120` ⇒ 「自己开窗量图」这条路还差一步（`ABB_VERIFY_KEEP_VISIBLE` 也没让它留下），要么让它真正显示、要么只靠探针读数。
 
 **未验证（owner 项）**：真机手拖边角「窗口真的变大变小 + 手感/发不发飘」，以及自管缩放与最大化（`toggle_syschat_maximize`）的互动。合成点击**必须先解锁屏**。
