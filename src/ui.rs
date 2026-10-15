@@ -3344,7 +3344,16 @@ pub fn run_gui() -> Result<()> {
                             "[verify-set-size] before={before:?} physical={:?}",
                             w.window().size()
                         );
-                        let (tw, th) = vis.map(|(_, _, w, h)| (w, h)).unwrap_or((700.0, 700.0));
+                        // `ABB_VERIFY_SIZE=WxH` 可覆盖（用来分辨「一律 no-op」与「被最大尺寸夹住」）。
+                        let (tw, th) = std::env::var("ABB_VERIFY_SIZE")
+                            .ok()
+                            .and_then(|v| {
+                                let (a, b) = v.split_once('x')?;
+                                Some((a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?))
+                            })
+                            .unwrap_or_else(|| {
+                                vis.map(|(_, _, w, h)| (w, h)).unwrap_or((700.0, 700.0))
+                            });
                         w.window().set_size(slint::LogicalSize::new(tw, th));
                         crate::log!("[verify-set-size] requested logical {tw}x{th}");
                     } else if k == 6 || k == 7 {

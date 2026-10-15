@@ -149,6 +149,28 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 
 ## 5. 卡住的 / 未完成的（含硬证据）
 
+### 5.1 ✅ 已修（2026-10-15 17:27）——根因：**布局把窗口最大尺寸钉成了 520×560**
+
+**一句话**：`SystemChatWindow` 的子树里有一批**固定 px 宽**的元素（`convo-text-width` 一系、分割条、
+功能区…），Slint 由它们推出根布局的最大尺寸 ≈ `preferred`（520×560）⇒ 窗口的 `contentMaxSize`
+被钉在 520×560：**只能缩小、不能放大**。于是任何放大请求（⤢ 到工作区 1470×923、向外拖边角、
+`set_size(700×700)`）都被 AppKit 夹回原尺寸——表现为「⤢ 无效」「向外拖不动」，而**缩小是好的**。
+
+**决定性实验（两次，都不需要人工点击）**：
+```
+ABB_VERIFY_SET_SIZE=1 ABB_VERIFY_SIZE=400x400   → after = 400×400    ✅ 落地（比 520×560 小）
+ABB_VERIFY_SET_SIZE=1 ABB_VERIFY_SIZE=1470x923  → after = 520×560    ❌ 被夹（比它大）
+# 加 max-width/max-height: 100000px 之后：
+ABB_VERIFY_SET_SIZE=1 ABB_VERIFY_SIZE=1470x923  → after = 1470×923   ✅ 落地
+ABB_VERIFY_TOGGLE_MAX=1                         → before 475,124 520×560 → after 0,33 1470×923 ✅
+```
+**修法**：组件级加 `max-width: 100000px; max-height: 100000px;`（比任何屏幕都大 ⇒ 等价于「无上界」）。
+
+**⚠️ 本节以下的历史内容全部作废**（保留作踩坑记录）：`is_resizable=false`、透明窗拿不到系统缩放、
+`setFrame` 被 Slint 覆盖、坐标口径不一致、气泡跟随/失焦隐藏是元凶……**这些结论都是错的**，
+真因只有上面那一条。**方法教训**：写窗口几何之前，先问「**这个值是不是被约束夹住了**」
+（用「一个更小的值能否落地」一刀就能分辨 no-op 与 clamp）——比读 macOS/winit/Slint 源码快得多。
+
 ### 5.1 对话窗不能缩放（**已修**：卡 `abb-syschat-resize-macos-20261015`，剩 owner 真机复验）
 **根因（2026-10-15 实测更正——上一版的「`winit is_resizable=false`」结论作废）**：决定项是**透明度**，不是 `is_resizable`。
 1. 那个 `false` 是**误读**：来自 `with_winit_window(..).unwrap_or((false, false))` 在窗口**未 realize** 时顶的默认值。`show()` **不同步建原生窗**（`set_visible` 只把 `visible` 存进 attributes、把窗口登记为 inactive window）。**可复算证据**（当前 head 的 debug 构建，2026-10-15 06:26 与 06:27 各跑一次）：`pre-show` 恒 `winit=None`；`t=400ms` 一档**不稳定**（一次 `None`、一次已 `Some`——上一版把它写成定论，属**过度具体**，别再照抄）；`t=800ms` 起恒 `Some is_resizable=true is_decorated=false inner=1040×1120 hit_areas=true self_managed=true`。⇒ **`is_resizable` 既不是假、也不是「能不能拖边角」的判据**（它恒为真）。

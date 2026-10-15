@@ -3699,6 +3699,14 @@ export component SystemChatWindow inherits Window {
     preferred-height: 560px;
     min-width: 340px;
     min-height: 380px;
+    // **必须有显式的 max-\***（2026-10-15 实测定性）：本窗的子树里有一批**固定 px 宽**的元素
+    // （消息块的 `convo-text-width` 一系、分割条/功能区等），Slint 由它们推出根布局的最大尺寸
+    // ≈ preferred（520×560）⇒ 窗口的 `contentMaxSize` 就被钉在 520×560：
+    // **只能缩小、不能放大**（请求 400×400 落地；请求 1470×923 / 700×700 全被夹回 —— 这就是
+    // 「⤢ 无效／向外拖不动」的真正根因，跟 macOS/无边框/透明/跟随都无关）。设置窗的子树没有
+    // 这种固定 px 组合，所以它一直正常。给一个远大于任何屏幕的上界即可解除夹取。
+    max-width: 100000px;
+    max-height: 100000px;
     // 圆角靠根 Rectangle 的两层填充画（外层黑 + 内层面板）；窗口本身透明，否则四角会露白。
     background: transparent;
 
