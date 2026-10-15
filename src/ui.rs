@@ -714,7 +714,12 @@ fn handle_syschat_focus_event(
         Duration::from_millis(BLUR_HIDE_DELAY_MS),
         move || {
             let Some(w) = cwp.upgrade() else { return };
-            if should_hide_on_blur(w.window().is_visible(), platform::app_is_active()) {
+            // `ABB_VERIFY_KEEP_VISIBLE=1`（**仅自查探针用**，生产永不设）：跳过失焦隐藏，
+            // 让 §1 的 debug 探针窗在别的 app 抢焦点时仍留在屏上，供人工/合成拖拽取证。
+            // 判据函数本身不动（D5 的口径与单测照旧），这里只是在外面加一道开关。
+            if std::env::var("ABB_VERIFY_KEEP_VISIBLE").is_err()
+                && should_hide_on_blur(w.window().is_visible(), platform::app_is_active())
+            {
                 hide_syschat(&w, &bwp, &swp, &spp);
             }
         },
@@ -9685,6 +9690,22 @@ mod tests {
         assert!(
             prod.contains("follow_pump_ev.tick(&follow_bubble, &cw2)"),
             "恢复跟随的那一拍要补一次跟随（拖动期间窗框一直在变）"
+        );
+    }
+
+    /// 自查开关接线守卫：`ABB_VERIFY_KEEP_VISIBLE` 必须真的挡住失焦隐藏（否则探针窗在
+    /// ToDesk/别的 app 抢焦点时 120ms 就被藏掉，§1 的拖拽取证无从做起）。
+    /// 判别力：删掉那行 env 判断 ⇒ 本测红。
+    #[test]
+    fn verify_keep_visible_gates_blur_hide() {
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        assert!(
+            src.contains("\"ABB_VERIFY_KEEP_VISIBLE\""),
+            "自查开关的变量名必须在源里"
+        );
+        assert!(
+            src.contains("if std::env::var(\"ABB_VERIFY_KEEP_VISIBLE\").is_err()"),
+            "失焦隐藏前必须先看自查开关（否则探针窗留不住）"
         );
     }
 
