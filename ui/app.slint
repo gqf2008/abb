@@ -3124,6 +3124,10 @@ export struct ConvoFlowPiece {
 export struct TableRow {
     cells: [string],
     header: bool,
+    // 每格的混排片段（Rust 侧 `inlineflow::layout_cell` 排好）与它的高：
+    // 嵌套模型（`[[ConvoFlowPiece]]`）—— 一格里既有文字又有公式时必须能分别定位。
+    flows: [[ConvoFlowPiece]],
+    flow-hs: [length],
 }
 
 export struct SysChatBlockRow {
@@ -3142,7 +3146,7 @@ export struct SysChatBlockRow {
     cells: [string],     // 表格行单元格（旧字段，保留给旧用例/兼容；渲染已改用 table-rows）
     header: bool,
     // 表格（`kind == "table"`，**整表一个块**）：`table-rows` = 全部行（含表头行）；
-    // `col-ws` = Rust 侧按字符类别估的每列宽（px）——列对齐与「行高取该行最高格」都靠它。
+    // `col-ws` = Rust 侧按字符类别估的每列宽（px）——「行高取该行最高格」靠它。
     table-rows: [TableRow],
     col-ws: [length],
     src: string,         // 图片/媒体地址（本地路径或 http(s)）
@@ -4423,18 +4427,31 @@ export component SystemChatWindow inherits Window {
                                         width: b.col-ws[ci];
                                         // 撑到该行最高格（否则短格边框短一截，格子看起来错位）。
                                         vertical-stretch: 1;
-                                        height: cell-txt.preferred-height + 8px;
+                                        // 行高由 Rust 排好的内容报来（`flow-hs`；含公式的格子也是它）——
+                                        // 再用 `+8px` 给上下留白。
+                                        height: trow.flow-hs[ci] + 8px;
                                         background: trow.header ? PixelTheme.bg : transparent;
                                         border-width: 1px;
                                         border-color: PixelTheme.edge;
-                                        // 单元格按纯文本渲染（行内样式在表内不保证，见 mdblocks 注释）
-                                        cell-txt := Text {
-                                            x: 5px;
-                                            width: b.col-ws[ci] - 10px;
-                                            text: cell;
-                                            font-size: 12px;
-                                            color: PixelTheme.text;
-                                            wrap: word-wrap;
+                                        // 单元格内容 = Rust 侧 `inlineflow` 排好的片段（文本 + 公式图）：
+                                        // 绝对定位。列对齐已在 Rust 侧排进 x（parley 的 `align`）⇒ 这里不判。
+                                        for p in trow.flows[ci]: Rectangle {
+                                            x: 5px + p.x;
+                                            y: 4px + p.y;
+                                            width: p.w;
+                                            height: p.h;
+                                            if !p.is-math: Text {
+                                                text: p.text;
+                                                font-size: 12px;
+                                                color: PixelTheme.text;
+                                                wrap: no-wrap;
+                                            }
+                                            if p.is-math: Image {
+                                                source: p.img;
+                                                width: 100%;
+                                                height: 100%;
+                                                image-fit: contain;
+                                            }
                                         }
                                     }
                                 }

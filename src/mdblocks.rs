@@ -55,6 +55,12 @@ pub struct MdBlock {
     pub cells: Vec<String>,
     /// 表格该行是否表头。
     pub header: bool,
+    /// 表格**每列对齐**（pulldown 的 `Tag::Table` 给的；`0` = 默认/左、`1` = 居中、`2` = 右）。
+    /// 非表格块为空。渲染时给单元格的 `horizontal-alignment`（否则 `:---:`/`---:` 全被当左对齐）。
+    pub aligns: Vec<u8>,
+    /// 表格**每个单元格**里的行内公式 `(字节偏移, TeX)`，偏移相对 [`Self::cells`] 对应项。
+    /// 与 `cells` 等长；某一格没有公式就是空 vec。单元格靠它走与段落同一套混排。
+    pub cell_math: Vec<Vec<(usize, String)>>,
     /// **无标记的显示文本**（不走行内 markdown 重建、也不转义）：仅当 [`Self::math`] 非空时被
     /// 消费（含行内公式的段落整段交给 `inlineflow` 混排，需要纯净字符流 + 字节偏移）。
     pub plain: String,
@@ -77,6 +83,8 @@ impl MdBlock {
             lang: String::new(),
             cells: Vec::new(),
             header: false,
+            aligns: Vec::new(),
+            cell_math: Vec::new(),
             plain: String::new(),
             math: Vec::new(),
             src: String::new(),
@@ -442,8 +450,13 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
     // 表格
     let mut cell = String::new();
     let mut cells: Vec<String> = Vec::new();
+    // 当前单元格里的行内公式（与 `cell` 同步累积，`TagEnd::TableCell` 时收进 `cell_maths`）。
+    let mut cell_math: Vec<(usize, String)> = Vec::new();
+    let mut cell_maths: Vec<Vec<(usize, String)>> = Vec::new();
     let mut in_table = false;
     let mut head_row = false;
+    // 表格每列对齐（`Tag::Table` 给）；跟着每个 table 行块走。
+    let mut table_aligns: Vec<u8> = Vec::new();
 
     // 确保 cur 存在（按当前上下文类型建块）：取**最内层的非 p 容器**（引用/列表项里的
     // 段落应保留 quote/list 类型，否则 `> 引用` 会被当成普通段落）。
@@ -495,7 +508,18 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                     ctx.push("list");
                     pending_task = None;
                 }
-                Tag::Table(_) => in_table = true,
+                Tag::Table(aligns) => {
+                    in_table = true;
+                    // 每列对齐（`|:---|:--:|--:|`）——不记下来就只能全左对齐。
+                    table_aligns = aligns
+                        .iter()
+                        .map(|a| match a {
+                            pulldown_cmark::Alignment::Center => 1u8,
+                            pulldown_cmark::Alignment::Right => 2u8,
+                            _ => 0u8,
+                        })
+                        .collect();
+                }
                 Tag::TableHead => {
                     head_row = true;
                     cells.clear();
@@ -504,7 +528,10 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                     head_row = false;
                     cells.clear();
                 }
-                Tag::TableCell => cell.clear(),
+                Tag::TableCell => {
+                    cell.clear();
+                    cell_math.clear();
+                }
                 Tag::Emphasis if !in_table => {
                     ensure_cur!();
                     cur.as_mut().unwrap().text.push('*');
@@ -527,6 +554,17 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                 }
                 // 表格内的图片：降级为单元格里的 alt 文字（否则会打断表格，评审 N2）
                 Tag::Image { dest_url, .. } if !in_table => {
+                    // `[![alt](src)](url)`（徽标/点击跳转）不能把链接的 `[` 与 `](url)` 漏成正文：
+                    // 链接**紧贴着**图片时，撤回刚推进 `text` 的 `[` 与闭合串，让图片单独成块。
+                    // 判据：`[` 只由 `Tag::Link` 推（字面量 `[` 会被转义成 `\[`），且闭合串以 `](` 开头。
+                    if let Some(b) = cur.as_mut() {
+                        if b.text.ends_with('[')
+                            && closes.last().is_some_and(|c| c.starts_with("]("))
+                        {
+                            b.text.pop();
+                            closes.pop();
+                        }
+                    }
                     flush_cur(&mut blocks, &mut cur);
                     image = Some((dest_url.to_string(), String::new()));
                 }
@@ -582,13 +620,33 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                     head_row = false;
                 }
                 TagEnd::TableHead => {
-                    push_table_row(&mut blocks, &mut cells, true);
+                    push_table_row(
+                        &mut blocks,
+                        &mut cells,
+                        &mut cell_maths,
+                        true,
+                        &table_aligns,
+                    );
                     head_row = false;
                 }
-                TagEnd::TableRow => push_table_row(&mut blocks, &mut cells, head_row),
+                TagEnd::TableRow => push_table_row(
+                    &mut blocks,
+                    &mut cells,
+                    &mut cell_maths,
+                    head_row,
+                    &table_aligns,
+                ),
                 TagEnd::TableCell => {
+                    // 单元格会被 trim（前后空白）⇒ 公式偏移也必须跟着裁（同 `flush_cur`）。
+                    let lead = cell.len() - cell.trim_start().len();
+                    let math = std::mem::take(&mut cell_math);
                     cells.push(cell.trim().to_string());
                     cell.clear();
+                    cell_maths.push(
+                        math.into_iter()
+                            .map(|(o, t)| (o.saturating_sub(lead), t))
+                            .collect(),
+                    );
                 }
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link
                     if !in_table =>
@@ -715,6 +773,9 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
             // - 表内：不加行内码标记，直接取原文（与表内其它文本同口径：不转义、不成块）。
             Event::InlineMath(m) => {
                 if in_table {
+                    // 单元格里同一套「无标记纯文本 + 偏移」口径（见 `MdBlock::cell_math`）：
+                    // 渲染时让单元格也走 `inlineflow` 混排，而不是把 TeX 源码画出来。
+                    cell_math.push((cell.len(), m.to_string()));
                     cell.push_str(&m);
                 } else {
                     ensure_cur!();
@@ -744,7 +805,13 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
 
     flush_cur(&mut blocks, &mut cur);
     if !cells.is_empty() {
-        push_table_row(&mut blocks, &mut cells, head_row);
+        push_table_row(
+            &mut blocks,
+            &mut cells,
+            &mut cell_maths,
+            head_row,
+            &table_aligns,
+        );
     }
     blocks
 }
@@ -755,13 +822,21 @@ fn push_escaped_block(t: &str, b: &mut MdBlock) {
 }
 
 /// 表格行落盘。
-fn push_table_row(blocks: &mut Vec<MdBlock>, cells: &mut Vec<String>, header: bool) {
+fn push_table_row(
+    blocks: &mut Vec<MdBlock>,
+    cells: &mut Vec<String>,
+    cell_maths: &mut Vec<Vec<(usize, String)>>,
+    header: bool,
+    aligns: &[u8],
+) {
     if cells.is_empty() {
         return;
     }
     let mut b = MdBlock::new("table");
     b.cells = std::mem::take(cells);
+    b.cell_math = std::mem::take(cell_maths);
     b.header = header;
+    b.aligns = aligns.to_vec();
     blocks.push(b);
 }
 
@@ -1344,6 +1419,28 @@ mod tests {
         assert!(
             bs[0].text.contains("$5") && bs[0].text.contains("$10"),
             "孤立 `$` 必须保持字面：{:?}",
+            bs[0].text
+        );
+    }
+    /// `[![alt](src)](url)`（带链接的图片 / 徽标）：只出一个 image 块，
+    /// **不得**把链接的 `[` 与 `](url)` 漏成正文（旧版会得到三个块）。
+    #[test]
+    fn linked_image_is_one_image_block_not_stray_link_text() {
+        let bs = parse("[![点我](a.png)](https://example.com \"标题\")");
+        let kinds: Vec<&str> = bs.iter().map(|b| b.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["image"],
+            "链接包图片只该出一个图片块：{kinds:?}"
+        );
+        assert_eq!(bs[0].src, "a.png");
+        assert_eq!(bs[0].alt, "点我");
+        // 反例控制：普通文字链接仍按行内 markdown 渲染（闭合串还在）
+        let bs = parse("看 [示例](https://example.com) 吧");
+        assert_eq!(bs.len(), 1);
+        assert!(
+            bs[0].text.contains("](https://example.com"),
+            "普通链接不得被这条修法误伤：{:?}",
             bs[0].text
         );
     }

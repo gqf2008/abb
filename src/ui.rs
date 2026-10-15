@@ -3028,16 +3028,75 @@ fn load_block_image(src: &str) -> (slint::Image, bool, f32) {
     let Some(path) = path else {
         return (slint::Image::default(), false, 0.0);
     };
-    // 只读头部拿尺寸（不解码整图）；SVG 等拿不到时回落 0 ⇒ `.slint` 用 200px 兜底高度。
+    // 只读头部拿尺寸（不解码整图）；SVG 走 `svg_aspect`（`image` crate 读不了 SVG）。
     let aspect = image::image_dimensions(&path)
         .ok()
         .and_then(|(w, h)| (w > 0 && h > 0).then(|| h as f32 / w as f32))
+        .or_else(|| svg_aspect(&path))
         .unwrap_or(0.0);
     match slint::Image::load_from_path(&path) {
         Ok(img) => (img, true, aspect),
         Err(_) => (slint::Image::default(), false, 0.0),
     }
 }
+/// SVG 的**源宽高比**（高/宽）。
+///
+/// 为什么要单独一条：`image::image_dimensions` 只认位图（PNG/JPEG…），SVG 会失败 ⇒
+/// `img-aspect` 成 0 ⇒ 图片块只能拿 120px 兜底高度（无论源多大都一个样）。这里从 `<svg>`
+/// 根标签的 `viewBox`（优先）或 `width`/`height` 取比值：只读文件头 8KB 做属性扫描，
+/// 不引入 XML 解析器（`<svg …>` 一定在文件开头）。
+fn svg_aspect(path: &std::path::Path) -> Option<f32> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 8192];
+    let n = f.read(&mut buf).ok()?;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    if !head.contains("<svg") {
+        return None;
+    }
+    let (w, h) = if let Some(vb) = svg_attr(&head, "viewBox") {
+        let nums: Vec<f32> = vb
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter_map(|t| t.trim().parse::<f32>().ok())
+            .collect();
+        if nums.len() >= 4 {
+            (nums[2], nums[3])
+        } else {
+            (0.0, 0.0)
+        }
+    } else {
+        (
+            svg_len(&head, "width").unwrap_or(0.0),
+            svg_len(&head, "height").unwrap_or(0.0),
+        )
+    };
+    (w > 0.0 && h > 0.0).then(|| h / w)
+}
+
+/// 取 SVG 根标签某个属性的字符串值（`name="…"` 或 `name='…'`）。
+fn svg_attr(s: &str, name: &str) -> Option<String> {
+    let i = s.find(name)?;
+    let rest = s[i + name.len()..].trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let rest = &rest[1..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
+/// SVG 长度属性 → 数值（剥掉 `px`/`pt` 等单位后缀；`%` 之类无法解析的返回 None）。
+fn svg_len(s: &str, name: &str) -> Option<f32> {
+    let v = svg_attr(s, name)?;
+    let num: String = v
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+        .collect();
+    num.parse::<f32>().ok()
+}
+
 /// 加载待发附件缩略图（本地文件）。失败回落 `thumb-ok=false`（UI 显示字形，不空白）。
 fn load_thumb(path: &std::path::Path) -> (slint::Image, bool) {
     match slint::Image::load_from_path(path) {
@@ -3224,22 +3283,51 @@ fn table_row(rows: &[crate::mdblocks::MdBlock]) -> SysChatBlockRow {
     let cells: Vec<Vec<String>> = rows.iter().map(|b| b.cells.clone()).collect();
     let ws = table_col_widths(&cells);
     let n = ws.len();
-    let trs: Vec<TableRow> = rows
-        .iter()
-        .map(|b| {
-            let mut cs: Vec<slint::SharedString> = b
-                .cells
-                .iter()
-                .map(|c| slint::SharedString::from(c.as_str()))
-                .collect();
-            // 行短了补齐：`.slint` 侧按 `col-ws[ci]` 取宽，缺列会越界。
-            cs.resize(n, slint::SharedString::default());
-            TableRow {
-                cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(cs))),
-                header: b.header,
-            }
-        })
-        .collect();
+    let cache = crate::mathrender::cache_dir();
+    // 列对齐（0 左/1 中/2 右）：各行列的 `aligns` 相同，取首行。
+    let aligns: Vec<u8> = rows.first().map(|b| b.aligns.clone()).unwrap_or_default();
+    let trs: Vec<TableRow> =
+        rows.iter()
+            .map(|b| {
+                let mut cs: Vec<slint::SharedString> = b
+                    .cells
+                    .iter()
+                    .map(|c| slint::SharedString::from(c.as_str()))
+                    .collect();
+                // 行短了补齐：`.slint` 侧按 `col-ws[ci]` 取宽，缺列会越界。
+                cs.resize(n, slint::SharedString::default());
+                // 每格内容走 `inlineflow`（**含公式与不含公式都走**）：含公式的真排版（KaTeX 移植），
+                // 不含公式的也顺便拿到与列宽一致的换行高 + 列对齐（否则行高只能估）。
+                let mut flows: Vec<slint::ModelRc<ConvoFlowPiece>> = Vec::with_capacity(n);
+                let mut flow_hs: Vec<f32> = Vec::with_capacity(n);
+                for (ci, &col_w) in ws.iter().enumerate() {
+                    let cell = b.cells.get(ci).map(String::as_str).unwrap_or("");
+                    let math = b.cell_math.get(ci).cloned().unwrap_or_default();
+                    let cw = (col_w - 10.0).max(8.0);
+                    let align = aligns.get(ci).copied().unwrap_or(0);
+                    match crate::inlineflow::layout_cell(cell, &math, cw, 12.0, &cache, align) {
+                        Some(l) => {
+                            let (m, h) = flow_model(&l);
+                            flows.push(m);
+                            flow_hs.push(h);
+                        }
+                        None => {
+                            // 空格子：给一行高（不然整行会被压成 0 高）
+                            flows.push(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+                                Vec::<ConvoFlowPiece>::new(),
+                            ))));
+                            flow_hs.push(16.0);
+                        }
+                    }
+                }
+                TableRow {
+                    cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(cs))),
+                    header: b.header,
+                    flows: slint::ModelRc::from(Rc::new(slint::VecModel::from(flows))),
+                    flow_hs: slint::ModelRc::from(Rc::new(slint::VecModel::from(flow_hs))),
+                }
+            })
+            .collect();
     let mut r = blank_row("table");
     r.table_rows = slint::ModelRc::from(Rc::new(slint::VecModel::from(trs)));
     r.col_ws = slint::ModelRc::from(Rc::new(slint::VecModel::from(ws)));

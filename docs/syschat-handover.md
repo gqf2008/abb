@@ -402,6 +402,13 @@ after#2 = 0,231 520×560
 - **空会话不归档**：GUI「🗄 归档…」改走 `syschat::archive_current()`——`is_empty_session` 为真就直接回「无需归档」，**不落盘、不新建**。为什么必须挡：归档空会话后 `ensure_current` 发现「没有未归档会话」会**立刻再造一条空会话** ⇒「归档空会话 → 新建空会话」能无限刷（owner 盘上实测 25 条会话里 20 条是这么来的空壳）。判据在 `syschat` 单测里做了正反两面（空 ⇒ 不归档且索引一字未动；有内容 ⇒ 必须能归档）。
 - **「清空」必须把索引也复位**（`clear_session`）：`sessions.json` 的 `title` = 「首条用户消息」，以前只删 `sessions/<id>.jsonl`、**不动索引** ⇒ 列表里留下「有旧标题、没内容」的**幽灵会话**（`is_empty_session` 判空、列表却还写着旧标题）。owner 盘上实测两条：`hi`、`😀`（创建后有轮次 ⇒ 标题已落；后来在对话窗点「清空」⇒ 文件没了、索引没动；再被归档就成了那个样子）。现在清空同时把该条目复位成空会话形态（`title` → 「新会话」、`context_tokens` → 0；`id`/`created_at`/`provider` 不动——换 id 会把 `current` 弄丢）。判据 `clear_session_resets_title_so_no_titled_ghost_remains`（清后必须被判空会话、幂等）。
 
+**对照 owner 的「markdown 全能示例」再修一轮（2026-10-15 深夜，见 §7.2 的装机记录）**
+- **链接包图片 `[![alt](src)](url)`**：旧解析把链接的 `[` 与 `](url)` 漏成两个段落（图片夹在中间）。修法：`Tag::Image` 紧跟链接时撤回刚推进去的 `[` 与闭合串（判据：`[` 只由 `Tag::Link` 推、闭合串以 `](` 开头——字面量 `[` 早被转义成 `\[`）。
+- **SVG 图片的宽高比**：`image::image_dimensions` 只认位图 ⇒ SVG 的 `img-aspect` 恒 0 ⇒ 图片块只能拿 120px 兜底高。现在 `svg_aspect` 从 `<svg>` 根的 `viewBox`（优先）/`width`·`height` 读（只看文件头 8KB，不引 XML 解析器）。
+- **相对路径基准**：agent 常把文档写在**子目录**、图片按「文档所在目录」写（消息里 `assets/demo.svg`，文件在 `md-demo/assets/demo.svg`）。`resolve_media_path` 先按工作区直解，找不到再在**工作区子树**里按路径后缀找**唯一**匹配（有预算/深度上限；多个候选不猜）。
+- **表格单元格 = 与段落同一套混排**：旧版单元格是纯 `Text` ⇒ 表内 `$…$` 只能画 TeX 源码（`\mathbb{R}`、`O(n^2)`）。现在每格走 `inlineflow::layout_cell`（把 TeX 从文本里剪掉再排；失败回落纯文本、源码不丢），`TableRow.flows: [[ConvoFlowPiece]]`（**嵌套模型**，Slint 1.18 支持）+ `flow-hs`；行高与列对齐都由 parley 算（`Layout::align`），`.slint` 只按坐标摆。⇒ 表内公式真排版、`:---:`/`---:` 生效。
+- **仍未对齐设计稿的点（如实记）**：①行内 `<br>` 在表内仍是字面量（没做表格内换行）；②远程图片要联网 + 缓存，离线就是「打开」卡片；③列宽仍按**字符估算**（`table_col_widths` 看的是含 TeX 源码的单元格），所以 `\mathbb{R}` 这类会让该列偏宽。
+
 **其它**
 - 媒体/图片的相对路径基准是 **`~/.agent-bridge/workspaces/syschat/`**（不是进程 CWD）；`file://` 要按绝对路径处理。
 - 经验沉淀目录：`~/.agents/rules/`（本会话新增了若干 LESSON：Slint 组件属性、macOS 拖拽期无事件、后端整条回传要客户端补字、`timeout_at`+`watch` 忙等、Windows 平台门控 dead_code 等）。

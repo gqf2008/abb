@@ -754,7 +754,81 @@ pub fn workspace() -> PathBuf {
 /// 图片内联（`ui::load_block_image`）、媒体卡「用播放器打开」与普通「打开」/链接点击
 /// （`ui::on_open_media` / `ui::on_open_link`）三处**必须共用本函数**，不得各写一份。
 pub fn resolve_media_path(src: &str) -> PathBuf {
-    resolve_media_path_in(&workspace(), src)
+    let base = workspace();
+    let direct = resolve_media_path_in(&base, src);
+    if direct.is_file() {
+        return direct;
+    }
+    // 回退：agent 常把文档写在**子目录**里、图片按「文档所在目录」写相对路径（消息里是
+    // `assets/demo.svg`，文件在 `md-demo/assets/demo.svg`）⇒ 在**工作区**里按路径分量后缀
+    // 找**唯一**匹配。找不到或有多个候选就不猜（返回原路径，调用方走「打开」卡片/报错）。
+    if !src.starts_with("file://") && !std::path::Path::new(src).is_absolute() {
+        if let Some(p) = find_by_suffix(&base, src) {
+            return p;
+        }
+    }
+    direct
+}
+
+/// 在 `base` 子树里找**路径后缀**等于 `rel` 的唯一文件（`rel` 按 `\"` 拼开）。
+///
+/// 有预算与深度上限（工作区可能很大，这个函数在 UI 线程上跑）：超预算/多个候选 ⇒ `None`。
+fn find_by_suffix(base: &std::path::Path, rel: &str) -> Option<PathBuf> {
+    let want: Vec<&str> = rel
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    if want.is_empty() {
+        return None;
+    }
+    let mut found: Option<PathBuf> = None;
+    let mut budget = 20_000usize;
+    let mut stack = vec![(base.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if budget == 0 {
+            break;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let p = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                if depth < 6 {
+                    stack.push((p, depth + 1));
+                }
+                continue;
+            }
+            let Some(tail) = p.strip_prefix(base).ok() else {
+                continue;
+            };
+            let tail: Vec<String> = tail
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect();
+            if tail.len() >= want.len()
+                && tail[tail.len() - want.len()..]
+                    .iter()
+                    .zip(&want)
+                    .all(|(a, b)| a == b)
+            {
+                if found.is_some() {
+                    return None; // 多个候选 ⇒ 不猜
+                }
+                found = Some(p);
+            }
+        }
+    }
+    found
 }
 
 /// [`resolve_media_path`] 的可注入基准版本（供单测；不做 IO、不查存在性）。
@@ -6973,6 +7047,29 @@ mod tests {
         // 幂等：再清一次不报错、不产生新条目
         clear_session_locked(&store, "s1").unwrap();
         assert_eq!(store.load().sessions.len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    /// 相对路径后缀回退：文档写在子目录、消息里只写 `assets/x.svg` 时要能找到。
+    /// 唯一匹配才认；多个候选不猜（宁可走「打开」卡片，也不给错图）。
+    #[test]
+    fn find_by_suffix_matches_unique_nested_asset() {
+        let base = std::env::temp_dir().join(format!("abb-suffix-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("md-demo/assets")).unwrap();
+        std::fs::write(base.join("md-demo/assets/demo.svg"), b"x").unwrap();
+        assert_eq!(
+            find_by_suffix(&base, "assets/demo.svg"),
+            Some(base.join("md-demo/assets/demo.svg")),
+            "唯一候选应被采用"
+        );
+        // 多个候选 ⇒ 不猜
+        std::fs::create_dir_all(base.join("other/assets")).unwrap();
+        std::fs::write(base.join("other/assets/demo.svg"), b"x").unwrap();
+        assert_eq!(find_by_suffix(&base, "assets/demo.svg"), None);
+        // 隐藏目录不参与（`.git` 之类不该被当素材源）
+        std::fs::create_dir_all(base.join(".hidden/assets")).unwrap();
+        std::fs::write(base.join(".hidden/assets/only.svg"), b"x").unwrap();
+        assert_eq!(find_by_suffix(&base, "assets/only.svg"), None);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

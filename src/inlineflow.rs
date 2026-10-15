@@ -67,7 +67,59 @@ pub fn layout(
     font_size: f32,
     cache: &Path,
 ) -> Option<FlowLayout> {
-    if math.is_empty() || text.trim().is_empty() {
+    if math.is_empty() {
+        return None;
+    }
+    layout_common(text, math, width, font_size, cache, 0)
+}
+
+/// **单元格**用：没有公式也要排（表格要靠它拿行高与对齐），并支持列对齐。
+///
+/// `text` 是单元格原文（**含公式的 TeX 源码**，`mdblocks` 的表内口径就是直接拼原文）；本函数
+/// 会先把各公式的 TeX 从文本里**剪掉**再排（否则内联图与源码会重复出现），剪不了/排不出来
+/// （非法 TeX）就回落成「把原文当纯文本排」——**绝不吞字**。
+/// `align`：`0` 左 / `1` 中 / `2` 右（来自表格的 `|:---|:--:|--:|`）。
+pub fn layout_cell(
+    text: &str,
+    math: &[(usize, String)],
+    width: f32,
+    font_size: f32,
+    cache: &Path,
+    align: u8,
+) -> Option<FlowLayout> {
+    if math.is_empty() {
+        return layout_common(text, &[], width, font_size, cache, align);
+    }
+    let mut out = String::new();
+    let mut adjusted: Vec<(usize, String)> = Vec::with_capacity(math.len());
+    let mut last = 0usize;
+    for (off, tex) in math {
+        let off = (*off).min(text.len());
+        if off < last || !text.is_char_boundary(off) {
+            // 偏移不合法（不应该发生）：别猜，直接走纯文本回落。
+            return layout_common(text, &[], width, font_size, cache, align);
+        }
+        let end = (off + tex.len()).min(text.len());
+        out.push_str(&text[last..off]);
+        adjusted.push((out.len(), tex.clone()));
+        last = end;
+    }
+    out.push_str(&text[last..]);
+    layout_common(&out, &adjusted, width, font_size, cache, align)
+        .or_else(|| layout_common(text, &[], width, font_size, cache, align))
+}
+
+/// [`layout`] 与 [`layout_cell`] 的公共实现（`math` 可为空 = 纯文本排版）。
+fn layout_common(
+    text: &str,
+    math: &[(usize, String)],
+    width: f32,
+    font_size: f32,
+    cache: &Path,
+    align: u8,
+) -> Option<FlowLayout> {
+    // 空文本**但有公式**也要排（整格只有一个公式时，剪掉 TeX 后文本就是空的）。
+    if text.trim().is_empty() && math.is_empty() {
         return None;
     }
     let width = width.max(1.0);
@@ -103,6 +155,15 @@ pub fn layout(
     }
     let mut pl = builder.build(text);
     pl.break_all_lines(Some(width));
+    // 列对齐（平文单元格靠它居中/右对齐；左对齐时是 no-op）。
+    pl.align(
+        match align {
+            1 => parley::Alignment::Center,
+            2 => parley::Alignment::Right,
+            _ => parley::Alignment::Left,
+        },
+        parley::AlignmentOptions::default(),
+    );
 
     // 3) 逐行取坐标，并按「文字 metrics ∪ 公式 metrics」自己算行高与基线。
     let mut pieces: Vec<FlowPiece> = Vec::new();
@@ -279,12 +340,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache);
     }
 
-    /// 没有公式 / 空文本 ⇒ `None`（不参与混排）。
+    /// 没有公式 ⇒ `None`（不参与混排）；整段只有一个公式（文本部分为空）⇒ 仍要排得出来。
     #[test]
     fn no_math_or_empty_is_not_flow() {
         let cache = tmp_cache("none");
-        assert!(layout("普通句子", &[], 400.0, 13.0, &cache).is_none());
-        assert!(layout("", &[(0, "x".to_string())], 400.0, 13.0, &cache).is_none());
+        assert!(
+            layout("普通句子", &[], 400.0, 13.0, &cache).is_none(),
+            "无公式的段落不该走混排"
+        );
+        let only = layout("", &[(0, "x".to_string())], 400.0, 13.0, &cache)
+            .expect("只有公式的段（文本为空）也要能排");
+        assert!(only.pieces.iter().any(|p| p.is_math), "应有一个公式块");
+        let _ = std::fs::remove_dir_all(&cache);
     }
 
     /// 片段文本必须能拼回原文（**除了被公式占掉的位置**）——防止坐标提取把字吞了/重复了。
@@ -305,6 +372,70 @@ mod tests {
             .collect();
         let norm = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
         assert_eq!(norm(&rebuilt), "甲乙丙丁戊", "拼回文本异常：{rebuilt:?}");
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+    /// 单元格混排：公式要**真排版**，且源码不得再当文字画一遍；非法 TeX 回落时源码不得丢。
+    #[test]
+    fn cell_math_is_typeset_without_duplicating_source() {
+        let cache = tmp_cache("cell");
+        let _ = std::fs::remove_dir_all(&cache);
+        // 整格只有一个公式（`mdblocks` 的表内口径：TeX 直接拼在文本里）
+        let l = layout_cell(
+            "f(x)=1",
+            &[(0, "f(x)=1".to_string())],
+            120.0,
+            12.0,
+            &cache,
+            0,
+        )
+        .expect("整格公式也要排得出来");
+        assert_eq!(l.pieces.iter().filter(|p| p.is_math).count(), 1);
+        let txt: String = l
+            .pieces
+            .iter()
+            .filter(|p| !p.is_math)
+            .map(|p| p.text.as_str())
+            .collect();
+        assert!(!txt.contains("f(x)"), "公式源码不得再画一遍：{txt:?}");
+
+        // 文本 + 公式混排
+        let cell = "增长 O(n^2) 很快";
+        let off = "增长 ".len();
+        let l2 = layout_cell(cell, &[(off, "O(n^2)".to_string())], 200.0, 12.0, &cache, 0)
+            .expect("混排应能排");
+        assert!(l2.pieces.iter().any(|p| p.is_math));
+        let txt2: String = l2
+            .pieces
+            .iter()
+            .filter(|p| !p.is_math)
+            .map(|p| p.text.as_str())
+            .collect();
+        assert!(txt2.contains("增长") && txt2.contains("很快"));
+        assert!(
+            !txt2.contains("n^2"),
+            "公式源码混排时也不该出现在文字里：{txt2:?}"
+        );
+
+        // 非法 TeX ⇒ 回落成纯文本，**源码不丢**
+        let cell3 = "前 \\frac{a}{ 后";
+        let l3 = layout_cell(
+            cell3,
+            &[(2, "\\frac{a}{".to_string())],
+            200.0,
+            12.0,
+            &cache,
+            0,
+        );
+        let txt3: String = l3
+            .map(|l| {
+                l.pieces
+                    .iter()
+                    .filter(|p| !p.is_math)
+                    .map(|p| p.text.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(txt3.contains("frac"), "回落必须保留源码：{txt3:?}");
         let _ = std::fs::remove_dir_all(&cache);
     }
 }

@@ -3390,3 +3390,59 @@ fn mathp_block_renders_flow_pieces_absolutely() {
     let ink = f.lowest_ink_row(fy, fy + fh, 4, 519);
     assert!(ink.is_some(), "`mathp` 内容应有墨迹（文字/图至少画出一个）");
 }
+
+/// 【诊断用·临时】把 owner 的 markdown 全能示例整篇渲染出来，供与设计稿逐节比对。
+#[test]
+#[ignore = "诊断用；默认不跑"]
+fn diag_demo_doc() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    std::fs::create_dir_all(dir).expect("建出图目录失败");
+    let md = std::fs::read_to_string(
+        "/Users/sqb/.agent-bridge/workspaces/syschat/md-demo/markdown-demo.md",
+    )
+    .expect("读示例文档失败");
+    let mut rows = vec![row("role", "怹")];
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(&md), 416.0);
+    let (ui, win, _m) = setup(rows, 8200);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("m"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(680, 8200));
+    apply_syschat_layout(&ui, 680.0);
+    println!("col-h={}", ui.get_dbg_col_h());
+    let f = settle_w(&win, 680, 8200);
+    write_png(&f, &dir.join("demo-doc.png"));
+}
+
+/// `svg_aspect`：`image` crate 读不了 SVG，自己从 `viewBox` / `width`·`height` 取比例。
+/// 不这么做，SVG 图片块的 `img-aspect` 恒 0 ⇒ 只能拿 120px 兜底高（源多大多小都一个样）。
+#[test]
+fn svg_aspect_reads_viewbox_and_wh() {
+    let dir = std::env::temp_dir().join(format!("abb-svg-aspect-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.svg");
+    std::fs::write(
+        &a,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="520" height="300" viewBox="0 0 520 300"></svg>"#,
+    )
+    .unwrap();
+    let asp = svg_aspect(&a).expect("应能读出比例");
+    assert!((asp - 300.0 / 520.0).abs() < 0.001, "viewBox 比例：{asp}");
+    // 只有 width/height（带单位）也能读
+    let b = dir.join("b.svg");
+    std::fs::write(&b, r#"<svg width="100px" height="25px"></svg>"#).unwrap();
+    assert!((svg_aspect(&b).unwrap() - 0.25).abs() < 0.001);
+    // 非 SVG 不该走这条（位图由 `image::image_dimensions` 负责）
+    let c = dir.join("c.png");
+    image::RgbaImage::from_pixel(4, 8, image::Rgba([0, 0, 0, 255]))
+        .save(&c)
+        .unwrap();
+    assert!(svg_aspect(&c).is_none(), "非 SVG 应返回 None");
+    let _ = std::fs::remove_dir_all(&dir);
+}
