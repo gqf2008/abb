@@ -3134,3 +3134,42 @@ fn crop(f: &Frame, x: u32, y: u32, w: u32, h: u32) -> Frame {
     }
     Frame { buf, w, h }
 }
+
+/// 用**真实会话里那张表**（owner 反馈「表格渲染不对」的原文本）验解析与渲染。
+#[test]
+#[ignore = "出图/定性用；默认不跑"]
+fn dump_real_table_for_review() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    std::fs::create_dir_all(dir).expect("建出图目录失败");
+    let md = "理解成给上面的 upstream 整理成表格：\n\n\
+| 语境 | upstream 指谁 | 相反方向 | 典型操作 |\n\
+|---|---|---|---|\n\
+| Git 分支跟踪 | 本地分支所跟踪的远程分支（如 `origin/main`） | downstream 分支（从你这里拉变更的） | `git push -u origin main`、`git branch -vv` |\n\
+| 开源协作 | 项目官方原仓库（`git remote add upstream <官方地址>`） | 你的 fork（`origin`） | 从 upstream 同步、向 upstream 提 PR |\n\
+| 数据流 / 业务链路 | 变更与数据的来源侧 | 承接结果、依赖你的一方 | 上游断供 → 下游受影响 |\n\n\
+一句话判据：**谁流向我，谁就是 upstream**。";
+    let blocks = crate::mdblocks::parse(md);
+    for b in &blocks {
+        println!(
+            "kind={:<6} header={:<5} cells={:?}",
+            b.kind, b.header, b.cells
+        );
+    }
+    let mut rows = vec![row("role", "怹")];
+    for b in blocks {
+        rows.push(block_row(b));
+    }
+    let (ui, win, _m) = setup(rows, 640);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("deepseek-flash"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(520, 640));
+    apply_syschat_layout(&ui, 520.0);
+    let f = settle_w(&win, 520, 640);
+    write_png(&f, &dir.join("REAL-table.png"));
+}

@@ -4357,22 +4357,43 @@ export component SystemChatWindow inherits Window {
                                 link-clicked(link) => { root.open-link(link); }
                             }
                         }
-                        if b.kind == "table": HorizontalBox {
+                        // 表格（2026-10-15 修）：**横向可滚动 + 每列最小宽度**。
+                        // 原来把 `(可用宽 - 16) / 列数` 硬塞给每格 ⇒ 4 列 CJK 时每列仅 ~100px，
+                        // 单元格疯狂换行（行高爆炸），而且整表比窗口宽、左列被裁（只有纵向滚动）。
+                        // 现在：每列宽 = max(均分, 132px 下限)，整表放进**横向 Flickable** ——
+                        // 窄表照旧铺满，宽表可左右滑（与附件行同一手法）。
+                        if b.kind == "table": Flickable {
                             width: 100%;
-                            spacing: 0px;
-                            for c in b.cells: Rectangle {
-                                horizontal-stretch: 1;
-                                background: b.header ? PixelTheme.bg : transparent;
-                                border-width: 1px;
-                                border-color: PixelTheme.edge;
-                                // 表格单元格按纯文本渲染（行内样式在表内不保证，见 mdblocks 注释）
-                                Text {
-                                    text: c;
-                                    font-size: 12px;
-                                    color: PixelTheme.text;
-                                    wrap: word-wrap;
-                                    // 每格可用宽 = （块内 416 − TableBox 左右 padding 16 − 两侧 1px 描边）/ 列数
-                                    width: (root.convo-text-width - 16px) / b.cells.length;
+                            // 照抄附件行的成环规避手法（见 `.slint` 里 `attach-count > 0: Flickable`）：
+                            // 用 **preferred-** 而不是 `.height/.width` 参与 content-*，避免
+                            // 「Flickable ⇄ 子布局」互相求值（编译期 binding loop）。
+                            height: tbl-row.preferred-height;
+                            // 宽度用**显式行宽**（preferred-width 可能小于被 max() 撑开的实际行宽，
+                            // 那会让 Flickable 自认内容更窄 ⇒ 视觉上左列被裁）。
+                            content-width: tbl-row.width;
+                            content-height: tbl-row.preferred-height;
+                            interactive: true;
+                            tbl-row := HorizontalBox {
+                                // **必须显式给宽**：布局默认吃父宽 ⇒ 与 Flickable 的 content-width 成环
+                                // （编译期就报 binding loop）。行宽 = 列数 × 每列宽（spacing 0）。
+                                width: b.cells.length
+                                    * max((root.convo-text-width - 16px) / b.cells.length, 132px);
+                                spacing: 0px;
+                                for c in b.cells: Rectangle {
+                                    background: b.header ? PixelTheme.bg : transparent;
+                                    border-width: 1px;
+                                    border-color: PixelTheme.edge;
+                                    // 单元格按纯文本渲染（行内样式在表内不保证，见 mdblocks 注释）
+                                    Text {
+                                        text: c;
+                                        font-size: 12px;
+                                        color: PixelTheme.text;
+                                        wrap: word-wrap;
+                                        width: max(
+                                            (root.convo-text-width - 16px) / b.cells.length,
+                                            132px
+                                        );
+                                    }
                                 }
                             }
                         }
