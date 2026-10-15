@@ -52,6 +52,21 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
   `AXUIElementCopyElementAtPosition(syswide, x, y)` ⇒ `pid=173 role=AXWindow title=登录`（锁屏期）。
   即锁屏期**命中面整体**属于 loginwindow，合成输入不可能落到应用上；这条判据本身就是「现在能不能做界面自动化」的答案，
   不依赖任何应用日志（本机 `AXIsProcessTrusted=true`，所以**不是**辅助功能权限造成的假阴性）。
+- ⚠️ **解锁 ≠ 能合成输入（2026-10-15 13:1x 实测，第三因子：辅助功能授权）**：屏幕已解锁
+  （`IOConsoleLocked=false`）后，探针窗也真开出来了（`onscreen=true`、520×560 @ (475,124)、`hit_areas=true`），
+  但三种合成输入**全部静默失效**：
+  ① `AXIsProcessTrusted()=false`（本会话的宿主是 codex app-server daemon，不是带 TCC 授权的终端 app）；
+  ② `CGEvent.post(.cghidEventTap)` 发 `mouseMoved` 到 (10,10)/(1400,900)/(300,400) 三个点，80ms 后读
+  `NSEvent.mouseLocation()` **纹丝不动**（无报错、无位移 ⇒ 被丢，不是坐标系问题）；
+  ③ `osascript → System Events` 读窗口/`click at` 报 **-25211「osascript 不允许辅助访问」**，`click at` 只回 `missing value`。
+  ⇒ 「打不进 app」现在要分**三个**因子排查：会话锁屏 / 窗口不在最上层 / 宿主无辅助功能权限——三者现象一样（日志零条），
+  但解法完全不同。前两个已实测复现，第三个就是本条。
+  另：`tell System Events to set frontmost of process … to true` **能**用（AppleEvents，不走 AX）——它会把 app 拉到前台，
+  但**不代表**后续 click 也能用；别拿「frontmost 变了」当「能点」的证据。
+- ⚠️ **点击前必须查 z-order（同一进程里也有遮挡）**：本机 ToDesk 全屏盖着、Otty 又在其上；ABB 激活后，
+  探针自己的**设置窗**（980×680 @ (245,94)）把对话窗标题栏的 ⤢ 坐标也盖住了（`attop` 实测最上层是它）。
+  所以「点按钮」前先跑一遍 attop 判最上层，**不是我们的目标窗就不要点**——否则一次误点会落进 ToDesk（远控），
+  风险不可控。
 - ⚠️ **同一份隔离 HOME 只能跑一个探针实例**：单实例是 `flock`，锁文件 = `$HOME/.agent-bridge/.gui.lock`。
   上一轮留下的探针还在跑时，新实例只打一行
   `[single-instance] 已有一个 agent-bridge「gui」实例在运行（flock 拿不到锁…）。本实例退出。` 然后 **exit 0**
