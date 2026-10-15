@@ -8127,6 +8127,11 @@ pub fn run_gui() -> Result<()> {
         let land_paste = land_into_pending.clone();
         let land_drop = land_into_pending.clone();
         let drop_ev = drop_tracker.clone();
+        // C2-B：一次拖放 = winit 逐文件发事件。攒一个短窗再整批落地，状态行才能报对个数
+        //（否则每条事件各写一次「已附加 1 个」，📎 却显示 N）。80ms 只等「同一轮事件循环里
+        // 的后续兄弟事件」，不等人——拖完松手后状态行立即可读。
+        let drop_batch = Rc::new(std::cell::RefCell::new(crate::syschat::DropBatcher::new()));
+        let drop_flush = slint::Timer::default();
         // D4：气泡跟随用的弱引用（对话窗 Moved/Resized → 气泡贴角）。
         let follow_bubble = bubble.as_weak();
         let follow_pump_ev = follow_pump.clone();
@@ -8183,7 +8188,17 @@ pub fn run_gui() -> Result<()> {
                         win.set_drag_hover(false);
                     }
                     if should_land {
-                        land_drop(vec![path.clone()], "已附加");
+                        drop_batch.borrow_mut().push(path.clone());
+                        let land = land_drop.clone();
+                        let batch = drop_batch.clone();
+                        drop_flush.start(
+                            slint::TimerMode::SingleShot,
+                            Duration::from_millis(80),
+                            move || {
+                                let paths = batch.borrow_mut().take();
+                                land(paths, "已附加");
+                            },
+                        );
                     }
                     return EventResult::Propagate;
                 }
@@ -10361,6 +10376,26 @@ mod tests {
         let (n, p) = vb_edit_apply_fetched(&mut s, "", "desc", None);
         assert_eq!(n, None);
         assert_eq!(p.as_deref(), Some("desc"));
+    }
+
+    /// C2-B 的接线守卫：`DroppedFile` **必须**走攒批（`DropBatcher` + 单发定时器整批落地），
+    /// 不许退回「每个事件各自 `land_drop(vec![path])`」——那会让状态行恒写「已附加 1 个」，
+    /// 而 📎 待发行显示 N（数字对不上）。判据两条同时成立：有攒批调用、无旧的直呼调用。
+    #[test]
+    fn dropped_files_are_batched_before_landing() {
+        let src = include_str!("ui.rs");
+        assert!(
+            src.contains("drop_batch.borrow_mut().push(path.clone());"),
+            "DroppedFile 必须先进攒批器（否则状态行按事件计数）"
+        );
+        assert!(
+            !src.contains("land_drop(vec![path.clone()], \"已附加\");"),
+            "不许每个 DroppedFile 各自落地（会把 N 个文件报成 1 个）"
+        );
+        assert!(
+            src.contains("crate::syschat::DropBatcher::new()"),
+            "攒批器必须接在拖放路径上"
+        );
     }
 
     // ── 卡 `abb-wording-role-label-kind-20261013`：角色块的**身份判据**（不是文案）──

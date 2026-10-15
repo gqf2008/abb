@@ -802,6 +802,34 @@ pub fn attachments_dir() -> PathBuf {
 /// 上游边界（**源码已实核，行为后果未在本机实测**）：winit 只注册 `NSFilenamesPboardType`
 /// （`:666-669`），其它类型取不到即 `return false`（`:376`/`:405`）⇒ 拖放源只提供别的类型时
 /// **一个事件都不会有**（浏览器直拖图片可能属于这一类；锁屏期无法做真机拖放验证，待复验）。
+/// 多文件拖放的「攒批」状态（C2-B 的根因修法）。
+///
+/// winit 对**一次**拖放手势会**逐文件**发 `DroppedFile`（`performDragOperation:` 每个文件各一回），
+/// 而 UI 的状态行想报的是「这次进来几个」。若每个事件各自落地一次，状态行会被最后一条覆盖成
+/// 「已附加 1 个文件」，📎 待发行却显示 N——两处数字对不上。UI 层把同窗内的事件攒进这里，
+/// 由一个短单发定时器整批落地：`take()` 给出的就是**这一批**的真实个数。
+#[derive(Default)]
+pub struct DropBatcher {
+    paths: Vec<PathBuf>,
+}
+
+impl DropBatcher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记一个落点，返回当前批内已攒到的个数（= 下一句状态行该报的数）。
+    pub fn push(&mut self, path: PathBuf) -> usize {
+        self.paths.push(path);
+        self.paths.len()
+    }
+
+    /// 取走整批（批随之清空，下一次手势从 0 重新计数）。
+    pub fn take(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.paths)
+    }
+}
+
 #[derive(Default)]
 pub struct DropTracker {
     hovering: bool,
@@ -3329,6 +3357,34 @@ mod tests {
         assert!(t.dropped(std::path::Path::new("/tmp/b.mov")));
         assert!(t.dropped(std::path::Path::new("/tmp/c.pdf")));
         assert!(!t.dropped(std::path::Path::new("/tmp/a.png")));
+    }
+
+    /// C2-B：一次拖放多文件，批计数必须等于文件数（不是 1）。
+    ///
+    /// 变异点：`take()` 只回最后一个（或 `push` 不累计）⇒ 本测红。
+    #[test]
+    fn drop_batcher_counts_whole_gesture() {
+        let mut b = DropBatcher::new();
+        assert_eq!(b.push(std::path::PathBuf::from("/tmp/a.png")), 1);
+        assert_eq!(b.push(std::path::PathBuf::from("/tmp/b.mov")), 2);
+        assert_eq!(
+            b.push(std::path::PathBuf::from("/tmp/c.pdf")),
+            3,
+            "一批 3 个 ⇒ 状态行报 3"
+        );
+        let taken = b.take();
+        assert_eq!(taken.len(), 3);
+        assert_eq!(
+            taken,
+            vec![
+                std::path::PathBuf::from("/tmp/a.png"),
+                std::path::PathBuf::from("/tmp/b.mov"),
+                std::path::PathBuf::from("/tmp/c.pdf")
+            ],
+            "批内顺序 = 事件到达顺序"
+        );
+        assert!(b.take().is_empty(), "取走即清空：下一次手势从 0 重新计数");
+        assert_eq!(b.push(std::path::PathBuf::from("/tmp/d.png")), 1);
     }
 
     /// 拖出/取消：收高亮 + 清去重集（下一轮重新可落）。
