@@ -1430,6 +1430,29 @@ impl Default for SelfResize {
 /// 位置取 `outer_position`、尺寸取 `inner_size`（与 [`logical_window_rect`] 同口径）：本窗是
 /// `no-frame: true` ⇒ 内外同框；另外 winit 的 `CursorMoved.position` 也是相对**视图**的
 /// （`event.locationInWindow()`），所以两者相加才是同一个坐标系的屏幕坐标。
+/// **原子**设置窗口外框：macOS 走 `platform::set_window_frame`（一次 `setFrame:display:`）；
+/// 其它平台返回 `false`，调用方回落「先尺寸/先位置」的两步写法。
+///
+/// 为什么需要它：实测（本文件自管缩放与最大化两处的注释）macOS 上同一拍里
+/// `set_size` + `set_position` 会**互相打架**（目标矩形在当前位置放不下时 resize 被拒 ⇒
+/// 表现为「⤢ 无效」「拖动发飘」）。一次 `setFrame:` 同时落位置与尺寸，正是系统绿点/拖拽
+/// 自己走的路。须在主线程（AppKit 非线程安全）——调用点都在 UI 线程。
+fn apply_window_rect_atomic(win: &slint::Window, r: &crate::syschat::WinRect) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use slint::winit_030::WinitWindowAccessor;
+        win.with_winit_window(|w| {
+            crate::platform::set_window_frame(w, r.x as f32, r.y as f32, r.w as f32, r.h as f32)
+        })
+        .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (win, r);
+        false
+    }
+}
+
 fn live_window_rect(win: &slint::Window) -> Option<crate::syschat::WinRect> {
     use slint::winit_030::WinitWindowAccessor;
     let sf = win.scale_factor();
@@ -1525,11 +1548,21 @@ impl SelfResize {
         if same {
             return true;
         }
-        // 顺序：**先尺寸后位置**。`set_outer_position` 在 macOS 上按「当时的窗口高」翻 y 轴
-        //（winit `flip_window_screen_coordinates` 用 `self.window().frame().size`），先改尺寸才
-        // 能让 y 换算落在最终高度上（反序会整体偏移新高度减旧高度那么多）。
+        // ⚠️ macOS 实测（2026-10-15，`ABB_VERIFY_SET_SIZE`/`ABB_VERIFY_TOGGLE_MAX` 探针）：
+        // 同一拍里 `set_size` 之后紧跟 `set_position`，**尺寸会被吃掉**（只调 set_size ⇒ 生效；
+        // 两个连调 ⇒ 尺寸不变、位置也不对）。所以位置**没变就不写**：east/south 拖动根本不
+        // 动原点，这条最常见路径退化为纯 set_size；要动原点的方向（north/west/角）由下一拍
+        // 的位置写回补（拖拽是连续事件，一帧的滞后肉眼不可见）。
+        // 首选**原子落地**（上面那段「两个请求互相打架」的根治手段）：macOS 一次 setFrame，
+        // 尺寸与位置一起生效；拿不到原生句柄（非 macOS / 窗口未 realize）才回落到两步写法。
+        if apply_window_rect_atomic(win, &next) {
+            return true;
+        }
+        let pos_same = (next.x - rect_now.x).abs() < 0.5 && (next.y - rect_now.y).abs() < 0.5;
         win.set_size(slint::LogicalSize::new(next.w, next.h));
-        win.set_position(slint::LogicalPosition::new(next.x, next.y));
+        if !pos_same {
+            win.set_position(slint::LogicalPosition::new(next.x, next.y));
+        }
         true
     }
 
@@ -1563,9 +1596,23 @@ fn toggle_syschat_maximize(win: &SystemChatWindow, state: &RefCell<crate::syscha
         return;
     };
     let next = state.borrow_mut().toggle(cur, work);
-    // 顺序同上（先尺寸后位置：macOS 的 y 轴翻转换算要用最终高度）。
-    w.set_size(slint::LogicalSize::new(next.w, next.h));
+    // ⚠️ 顺序（2026-10-15 实测纠偏）：**先位置后尺寸**。反过来（先 set_size）时，目标尺寸在
+    // 当前位置放不下（例如从 (475,124) 直接铺 1470×923）⇒ macOS 会拒绝这次 resize 并只做
+    // 夹取移动——窗口尺寸纹丝不动，正是「⤢ 无效」的根因。先把原点挪到工作区左上，再放大，
+    // 目标矩形就放得下；两个请求都生效。
+    // 首选**原子落地**（macOS 一次 `setFrame:`）：位置与尺寸一起落，不会被拒、也不会被夹取。
+    if apply_window_rect_atomic(&w, &next) {
+        return;
+    }
     w.set_position(slint::LogicalPosition::new(next.x, next.y));
+    // 尺寸挪到下一轮事件循环：同一拍里「挪到位 + 放大」仍会被 macOS 拒掉（实测两种顺序都不行）。
+    // 先让位置落地（小窗在工作区左上放得下），下一拍再放大，目标矩形才放得下。
+    let weak = win.as_weak();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.window().set_size(slint::LogicalSize::new(next.w, next.h));
+        }
+    });
 }
 
 /// A：泵的 16ms 节拍（稿/卡口径：16ms 合并，约一帧）。
@@ -3276,6 +3323,93 @@ pub fn run_gui() -> Result<()> {
         );
         // drop 会取消定时器：需保活到触发（与既有 Timer 同款处理，百字节级）。
         std::mem::forget(probe);
+
+        // `ABB_VERIFY_SET_SIZE=1`：单独验「Window::set_size 对这张真窗是否生效」。
+        // 之所以单独一刀：探针原则上只读（见上），而最大化/自管缩放的共同承重步正是
+        // set_size/set_position——它们不生效时，按钮和热区看起来都像「没反应」。
+        // 时序：2.5s（探针读完出厂事实）后设 700×700，再读两拍回填。
+        if std::env::var("ABB_VERIFY_SET_SIZE").is_ok() {
+            let weak = syschat_win.as_weak();
+            let t = Rc::new(slint::Timer::default());
+            let ticks = Rc::new(Cell::new(0u32));
+            let tc = Rc::clone(&t);
+            t.start(
+                slint::TimerMode::Repeated,
+                Duration::from_millis(500),
+                move || {
+                    let Some(w) = weak.upgrade() else {
+                        tc.stop();
+                        return;
+                    };
+                    ticks.set(ticks.get() + 1);
+                    let k = ticks.get();
+                    if k == 5 {
+                        use slint::winit_030::WinitWindowAccessor;
+                        let before = live_window_rect(&w.window());
+                        let vis = w
+                            .window()
+                            .with_winit_window(platform::visible_work_area)
+                            .flatten();
+                        let mon = monitor_work_area(&w.window());
+                        crate::log!("[verify-set-size] work-area visible={vis:?} monitor={mon:?}");
+                        crate::log!(
+                            "[verify-set-size] before={before:?} physical={:?}",
+                            w.window().size()
+                        );
+                        let (tw, th) = vis.map(|(_, _, w, h)| (w, h)).unwrap_or((700.0, 700.0));
+                        w.window().set_size(slint::LogicalSize::new(tw, th));
+                        crate::log!("[verify-set-size] requested logical {tw}x{th}");
+                    } else if k == 6 || k == 7 {
+                        let r = live_window_rect(&w.window());
+                        crate::log!(
+                            "[verify-set-size] after#{}={r:?} physical={:?}",
+                            k - 5,
+                            w.window().size()
+                        );
+                    }
+                    if k >= 7 {
+                        tc.stop();
+                    }
+                },
+            );
+            std::mem::forget(t);
+        }
+
+        // `ABB_VERIFY_TOGGLE_MAX=1`：不经过按钮、直接调同一个 `toggle_syschat_maximize`，
+        // 用来分辨「⤢ 没收到点击」与「最大化计算/写回失效」。
+        #[cfg(target_os = "macos")]
+        if std::env::var("ABB_VERIFY_TOGGLE_MAX").is_ok() {
+            let weak = syschat_win.as_weak();
+            let state = Rc::new(RefCell::new(crate::syschat::MaximizeState::default()));
+            let t = Rc::new(slint::Timer::default());
+            let ticks = Rc::new(Cell::new(0u32));
+            let tc = Rc::clone(&t);
+            t.start(
+                slint::TimerMode::Repeated,
+                Duration::from_millis(500),
+                move || {
+                    let Some(w) = weak.upgrade() else {
+                        tc.stop();
+                        return;
+                    };
+                    ticks.set(ticks.get() + 1);
+                    let k = ticks.get();
+                    if k == 5 {
+                        let before = live_window_rect(&w.window());
+                        crate::log!("[verify-toggle-max] before={before:?}");
+                        toggle_syschat_maximize(&w, &state);
+                        crate::log!("[verify-toggle-max] called toggle_syschat_maximize");
+                    } else if k == 6 || k == 7 {
+                        let r = live_window_rect(&w.window());
+                        crate::log!("[verify-toggle-max] after#{}={r:?}", k - 5);
+                    }
+                    if k >= 7 {
+                        tc.stop();
+                    }
+                },
+            );
+            std::mem::forget(t);
+        }
     }
 
     // 不变式：默认尺寸不得小于最小尺寸（`.slint` 的 `min-*`；同值由单测钉住）。破了它，系统会把
@@ -8137,6 +8271,7 @@ pub fn run_gui() -> Result<()> {
         // 的后续兄弟事件」，不等人——拖完松手后状态行立即可读。
         let drop_batch = Rc::new(std::cell::RefCell::new(crate::syschat::DropBatcher::new()));
         let drop_flush = slint::Timer::default();
+        let verify_input_cursor = Rc::new(std::cell::Cell::new(0u32));
         // D4：气泡跟随用的弱引用（对话窗 Moved/Resized → 气泡贴角）。
         let follow_bubble = bubble.as_weak();
         let follow_pump_ev = follow_pump.clone();
@@ -8208,6 +8343,28 @@ pub fn run_gui() -> Result<()> {
                     return EventResult::Propagate;
                 }
                 _ => {}
+            }
+            // `ABB_VERIFY_LOG_INPUT=1`（仅自查探针）：把 winit 层的鼠标事件打出来，
+            // 用来分辨「OS 没把事件送给窗口」与「Slint 命中没落到热区」——
+            // 有 MouseInput/CursorMoved 但没有 [selfresize] begin ⇒ 命中层丢了；
+            // 连事件都没有 ⇒ AppKit/winit 层就没送到。
+            if std::env::var("ABB_VERIFY_LOG_INPUT").is_ok() {
+                match ev {
+                    WindowEvent::MouseInput { state, button, .. } => {
+                        crate::log!("[verify-input] mouse state={state:?} button={button:?}");
+                    }
+                    WindowEvent::CursorMoved { position, .. } => {
+                        verify_input_cursor.set(verify_input_cursor.get() + 1);
+                        if verify_input_cursor.get() % 16 == 1 {
+                            crate::log!(
+                                "[verify-input] cursor #{} at {:?}",
+                                verify_input_cursor.get(),
+                                position
+                            );
+                        }
+                    }
+                    _ => {}
+                }
             }
             if let WindowEvent::ModifiersChanged(m) = ev {
                 super_held.set(m.state().super_key());
