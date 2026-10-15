@@ -25,6 +25,18 @@ slint = { version = "1.18", features = ["unstable-winit-030"] }
 # 行内代码/引用式图片等惰性上下文上连续两轮被独立审查证伪）。该版本已在依赖树里
 # （i-slint-common 依赖它），不引入新的下载或编译单元。
 pulldown-cmark = { version = "0.13.4", default-features = false }
+# 数学排版（2026-10-15，owner 明确要求「处理 LaTeX」）：KaTeX 的 Rust 移植（RaTeX）。
+# 块级公式在**本地离线**排成 SVG，再由 Slint（已带 resvg）按目标尺寸栅格化。
+# `embed-fonts` 把 KaTeX TTF（~580K）编进二进制 —— 行内公式仍走行内码（Slint 文字流里放不进
+# 图片，见 `src/mathrender.rs` 顶注）。嫌重时的正路：照 `crates/abb-chart` 先例挪成独立包。
+ratex-parser = "0.1.14"
+ratex-layout = "0.1.14"
+ratex-svg = { version = "0.1.14", features = ["standalone", "embed-fonts"] }
+# 行内公式混排（2026-10-15，owner 同意「自建混排层」）：**复用 Slint 自己的文字排版引擎**——
+# i-slint-core 走的就是 parley（`shared-parley`），而 parley 0.11 原生支持 inline box。（见 `src/inlineflow.rs`）
+# ⇒ 断行/基线/字体与 Slint 完全同源，且**不新增任何编译单元**（parley/fontique/swash/skrifa
+# 都已在 i-slint-core 的依赖树里，同 `pulldown-cmark` 的情况）。
+parley = "0.11"
 tokio = { version = "1", features = [
     "rt-multi-thread", "macros", "process", "time", "sync", "io-util", "signal"] }
 # #69 后台任务治理：TaskTracker（rt 特性）+ CancellationToken 优雅关闭

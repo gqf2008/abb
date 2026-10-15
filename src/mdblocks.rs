@@ -19,6 +19,7 @@
 //! - 任务列表 → `task`（`checked`）；
 //! - 表格 → 每行一个 `table` 块（`cells` 为单元格的行内 markdown，`header` 标表头行）；
 //! - 分隔线 → `hr`；
+//! - 数学 → 行内 `$…$` 成行内码留在原段；块级 `$$…$$` 独立成 `math` 块（TeX 原文，由 UI 真排版）；
 //! - 图片/媒体 → `image`/`audio`/`video`，恒为**独立块**（Slint 无法把图片排进文字流），
 //!   切成块后其前后的文字各自成段。识别三种写法：
 //!   1. markdown 图片/链接：`![alt](src)`、`[alt](src)`（src 扩展名是媒体）；
@@ -27,16 +28,17 @@
 //!   3. **裸媒体地址**：整段只有一个不含空白的 token 且扩展名是媒体（`https://…/a.mov`、
 //!      `./assets/a.mp4`）。
 //!
-//! 未知/不支持的节点（其它 HTML、脚注、数学）退化为文本，**绝不吞内容**；但被识别为媒体
+//! 未知/不支持的节点（其它 HTML、脚注）退化为文本，**绝不吞内容**；但被识别为媒体
 //! 标签的**开/闭标签本身**不再作为字面文本漏出（否则 `<audio …>` 成块后 `</audio>` 会
-//! 显示成一行转义文本）。
+//! 显示成一行转义文本）。数学自 2026-10-15 起开启 `ENABLE_MATH`：行内公式 `$x$` 成行内码，
+//! 块级公式 `$$…$$` 独立成 `math` 块（TeX 原文交 UI 侧 `mathrender` 真排版，见那里顶注）。
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 /// 一个渲染块。字段取并集（GUI 按 `kind` 取用）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MdBlock {
-    /// `h1|h2|h3|p|list|task|code|quote|table|hr|image|audio|video`
+    /// `h1|h2|h3|p|list|task|code|quote|table|hr|image|audio|video|math`
     pub kind: String,
     /// 行内 markdown 文本（[`inline_markdown_kind`] 那些 kind 用）；`code` 为代码原文；
     /// 结构化/媒体块（`table|hr|image|audio|video`）不用它（表格正文在 `cells`）。
@@ -53,6 +55,12 @@ pub struct MdBlock {
     pub cells: Vec<String>,
     /// 表格该行是否表头。
     pub header: bool,
+    /// **无标记的显示文本**（不走行内 markdown 重建、也不转义）：仅当 [`Self::math`] 非空时被
+    /// 消费（含行内公式的段落整段交给 `inlineflow` 混排，需要纯净字符流 + 字节偏移）。
+    pub plain: String,
+    /// 段落里**行内公式**的 `(字节偏移, TeX 原文)`，偏移量相对 [`Self::plain`]。按出现顺序。
+    /// 空 = 该块没有行内公式（一切照旧）。
+    pub math: Vec<(usize, String)>,
     /// 图片/媒体地址（本地路径或 `http(s)`）；`alt` 为替代文本/展示名。
     pub src: String,
     pub alt: String,
@@ -69,6 +77,8 @@ impl MdBlock {
             lang: String::new(),
             cells: Vec::new(),
             header: false,
+            plain: String::new(),
+            math: Vec::new(),
             src: String::new(),
             alt: String::new(),
         }
@@ -213,6 +223,15 @@ fn flush_cur(blocks: &mut Vec<MdBlock>, cur: &mut Option<MdBlock>) {
         if b.text.is_empty() {
             return;
         }
+        // `plain` 与 `math` 偏移一并收口：混排器拿的是 `plain`，偏移必须跟着它裁。
+        let lead = b.plain.len() - b.plain.trim_start().len();
+        if lead > 0 {
+            b.plain = b.plain.trim_start().to_string();
+            for (off, _) in &mut b.math {
+                *off = off.saturating_sub(lead);
+            }
+        }
+        b.plain = b.plain.trim_end().to_string();
         if b.kind == "p" {
             if let Some(m) = media_from_text(&b.text) {
                 blocks.push(m);
@@ -401,6 +420,10 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
+    // 数学（2026-10-15）：不开启时 `$…$` / `$$…$$` 只是普通文本（`$` 原样画给用户）。
+    // 开启后才能拿到 `InlineMath`/`DisplayMath` 事件——本仓按**降级可读**处理（见下面事件分支），
+    // **不是**真排版（KaTeX 式排版要把 TeX 转图片/SVG，属「要不要给托盘进程加依赖」的决策）。
+    opts.insert(Options::ENABLE_MATH);
     let parser = Parser::new_ext(markdown, opts);
 
     let mut blocks: Vec<MdBlock> = Vec::new();
@@ -601,7 +624,10 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                     cell.push_str(&t);
                 } else {
                     ensure_cur!();
-                    push_escaped_block(&t, cur.as_mut().unwrap());
+                    let b = cur.as_mut().unwrap();
+                    push_escaped_block(&t, b);
+                    // 无标记纯文本（仅含行内公式的段落用得上，见 `MdBlock::plain`）
+                    b.plain.push_str(&t);
                 }
             }
             Event::Code(c) => {
@@ -610,23 +636,29 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                         cell.push_str(&c);
                     } else {
                         ensure_cur!();
-                        let t = &mut cur.as_mut().unwrap().text;
-                        t.push('`');
-                        push_escaped(&c, t);
-                        t.push('`');
+                        let b = cur.as_mut().unwrap();
+                        b.text.push('`');
+                        push_escaped(&c, &mut b.text);
+                        b.text.push('`');
+                        b.plain.push_str(&c);
                     }
                 }
             }
             Event::SoftBreak => {
                 if !in_table {
                     ensure_cur!();
-                    cur.as_mut().unwrap().text.push(' ');
+                    let b = cur.as_mut().unwrap();
+                    b.text.push(' ');
+                    b.plain.push(' ');
                 }
             }
             Event::HardBreak => {
                 if !in_table {
                     ensure_cur!();
-                    cur.as_mut().unwrap().text.push('\n');
+                    // 混排器不分行段落内硬换行，统一当一个空格（与 `text` 的 `\n` 不同，见 `flush_cur`）
+                    let b = cur.as_mut().unwrap();
+                    b.text.push('\n');
+                    b.plain.push(' ');
                 }
             }
             Event::Rule => {
@@ -659,25 +691,52 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                     // 被消费掉的媒体开/闭标签（如成块后的 `</video>`）不再漏成文本
                 } else {
                     ensure_cur!();
-                    push_escaped_block(&h, cur.as_mut().unwrap());
+                    let b = cur.as_mut().unwrap();
+                    push_escaped_block(&h, b);
+                    b.plain.push_str(&h);
                 }
             }
             Event::FootnoteReference(r) => {
                 if !in_table {
                     ensure_cur!();
-                    let t = &mut cur.as_mut().unwrap().text;
-                    t.push('[');
-                    push_escaped(&r, t);
-                    t.push(']');
+                    let b = cur.as_mut().unwrap();
+                    b.text.push('[');
+                    push_escaped(&r, &mut b.text);
+                    b.text.push(']');
+                    b.plain.push('[');
+                    b.plain.push_str(&r);
+                    b.plain.push(']');
                 }
             }
-            Event::InlineMath(m) | Event::DisplayMath(m) => {
-                if !in_table {
+            // 数学（需 `ENABLE_MATH`；2026-10-15 起开启）。本层只负责**拆事件**：
+            // - 行内公式 `$x$` → 行内码（等宽、去 `$`），与上下文同段（UI 不做排版）；
+            // - 块级公式 `$$…$$` → **独立成块**（`kind == "math"`，`text` = TeX 原文），
+            //   由 UI 侧 `mathrender` 真排版成 SVG（KaTeX 移植）；排版失败才回落等宽源码；
+            // - 表内：不加行内码标记，直接取原文（与表内其它文本同口径：不转义、不成块）。
+            Event::InlineMath(m) => {
+                if in_table {
+                    cell.push_str(&m);
+                } else {
                     ensure_cur!();
-                    let t = &mut cur.as_mut().unwrap().text;
-                    t.push('`');
-                    push_escaped(&m, t);
-                    t.push('`');
+                    let b = cur.as_mut().unwrap();
+                    // 行内码形态保留在 `text` 里：非普通段落（标题/列表/引用）与混排失败时的
+                    // 回退路径都靠它，不能只记录坐标而把内容从 `text` 里拿掉（会丢字）。
+                    b.text.push('`');
+                    push_escaped(&m, &mut b.text);
+                    b.text.push('`');
+                    // 混排路径用：无标记纯文本里的字节偏移 + TeX 原文
+                    let off = b.plain.len();
+                    b.math.push((off, m.to_string()));
+                }
+            }
+            Event::DisplayMath(m) => {
+                if in_table {
+                    cell.push_str(&m);
+                } else {
+                    flush_cur(&mut blocks, &mut cur);
+                    let mut b = MdBlock::new("math");
+                    b.text = m.to_string();
+                    blocks.push(b);
                 }
             }
         }
@@ -1227,5 +1286,65 @@ mod tests {
         // 有样式 ⇒ 保持 StyledText
         assert_eq!(selectable_plain("p", "这是 **粗体**"), None);
         assert_eq!(selectable_plain("h2", "看 `code`"), None);
+    }
+    /// 数学（2026-10-15 开启 `ENABLE_MATH`）：`$…$` 不再是字面文本。
+    ///
+    /// 判据分三层（都在**同一份输入**上）：
+    /// - 行内 `$E=mc^2$` 留在段落里、`$` 被吃掉；
+    /// - 块级 `$$…$$` 独立成 `math` 块、原文（`\int`）保留、`$` 被吃掉；
+    /// - 表内公式**不丢**（`ENABLE_MATH` 让表格单元格也会收到 `InlineMath`，漏处理就会静默丢字）。
+    #[test]
+    fn math_inline_display_and_in_table() {
+        let bs = parse("质能方程 $E = mc^2$ 收尾。\n\n$$\n\\int_0^1 x\\,dx\n$$\n");
+        let p = bs.iter().find(|b| b.kind == "p").expect("段落应在");
+        assert!(
+            !p.text.contains('$'),
+            "行内数学的 `$` 必须被吃掉：{:?}",
+            p.text
+        );
+        assert!(
+            p.text.contains("E = mc^2"),
+            "行内数学正文应保留：{:?}",
+            p.text
+        );
+        let m = bs
+            .iter()
+            .find(|b| b.kind == "math")
+            .expect("块级数学应独立成块");
+        assert!(m.text.contains("\\int_0^1"), "TeX 原文应保留：{:?}", m.text);
+        assert!(
+            !m.text.contains('$'),
+            "块级数学的 `$$` 必须被吃掉：{:?}",
+            m.text
+        );
+
+        // 表内公式：既不能成块冲出表格，也不能丢内容
+        let t = parse("| 公式 |\n|---|\n| $E=mc^2$ |\n");
+        let cells: Vec<&str> = t
+            .iter()
+            .filter(|b| b.kind == "table")
+            .flat_map(|b| b.cells.iter().map(String::as_str))
+            .collect();
+        assert!(
+            cells.iter().any(|c| c.contains("E=mc^2")),
+            "表内数学不得丢：{cells:?}"
+        );
+        assert!(
+            cells.iter().all(|c| !c.contains('`') && !c.contains('$')),
+            "表内不加行内码标记、不留 `$`：{cells:?}"
+        );
+    }
+
+    /// 反例控制：不含数学的普通文本不受 `ENABLE_MATH` 影响（`$` 后无匹配 `$` 仍是字面量）。
+    #[test]
+    fn math_option_does_not_eat_lone_dollar() {
+        let bs = parse("价格 $5 和 $10，还有 $HOME 变量。");
+        assert_eq!(bs.len(), 1);
+        assert_eq!(bs[0].kind, "p");
+        assert!(
+            bs[0].text.contains("$5") && bs[0].text.contains("$10"),
+            "孤立 `$` 必须保持字面：{:?}",
+            bs[0].text
+        );
     }
 }

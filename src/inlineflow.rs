@@ -1,0 +1,310 @@
+//! **行内公式混排**：把「一段含 `$…$` 的文字」排成「文字 + 公式图」的同一行流。
+//!
+//! ## 为什么必须自己排
+//!
+//! Slint 的文字流里**放不进图片**（`Text`/`StyledText` 只有字形，没有内联对象；
+//! 实核 `i-slint-core/textlayout.rs`、`styled_text.rs`，1.18 仍如此）。所以只要一段话里
+//! 既有文字又有公式，就只能整段自己排——这就是本模块存在的原因。
+//!
+//! ## 为什么用 `parley`
+//!
+//! **Slint 自己的文字排版就是 `parley`**（`third_party/i-slint-core/textlayout/sharedparley.rs`，
+//! `shared-parley` feature），而 `parley` 0.11 原生支持 **inline box**
+//! （`InlineBox { id, index, width, height }` → 布局后给 `PositionedInlineBox { x, y, .. }`）。
+//! 于是我们和 Slint 用**同一个排版引擎、同一套字体（fontique 解析系统字体）**：断行与基线天然一致，
+//! 不会出现「图对不上文字基线」那类经典翻车。⇒ 也**不需要新增任何编译单元**（parley/fontique/
+//! swash/skrifa 都已在 i-slint-core 的依赖树里，与 `pulldown-cmark` 同一情况）。
+//!
+//! ## 输出形态：坐标 + 元素（不是自己光栅化）
+//!
+//! 本模块只算**坐标**，不画像素：文字片段仍交给 Slint 的 `Text`（清晰、字体一致、emoji 回退一致），
+//! 公式交给 `Image`（`mathrender` 出的 SVG）。`.slint` 侧按坐标**绝对定位**摆这些元素。
+//! 换来两个已知取舍（owner 2026-10-15 已确认）：①这些段落**不能拖选/复制**（不再是流式文本）；
+//! ②气泡宽度变化时要**重排**（调用方按新宽度重算，见 `ui::relayout_flow_rows`）。
+//!
+//! ## 失败绝不吞字
+//!
+//! 任一公式排版失败（非法 TeX）⇒ 整段返回 `None`，调用方回落成「等宽行内码」形态
+//! （`mdblocks` 一直把行内码留在 `text` 里，正是为了这条退路）。
+
+use std::path::Path;
+
+use parley::layout::PositionedLayoutItem;
+use parley::style::StyleProperty;
+use parley::{FontContext, InlineBox, InlineBoxKind, LayoutContext};
+
+/// 行内混排的一段（与 `.slint` 的 `ConvoFlowPiece` 一一对应）。
+pub struct FlowPiece {
+    pub is_math: bool,
+    /// 非公式：这一段的文字（一段 = 同一行内同一字体的连续文字）。
+    pub text: String,
+    /// 公式：排版好的图（`is_math` 为假时是空图）。
+    pub image: slint::Image,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// 一段话的混排结果。
+pub struct FlowLayout {
+    pub pieces: Vec<FlowPiece>,
+    /// 整段高（px）——调用方必须把它报给外层布局（裸容器不会被绝对定位的子项撑高）。
+    pub height: f32,
+    pub font_size: f32,
+}
+
+/// 排一段「文字 + 行内公式」。
+///
+/// `math` 是 `(字节偏移, TeX 原文)`，偏移相对 `text`（由 `mdblocks` 在解析时记下，见 `MdBlock::math`）。
+/// `width` 是可用宽度（px，= `convo-text-width`）；`cache` 是公式 SVG 的缓存目录。
+///
+/// 返回 `None` = 有公式排不出来（调用方回落），或这段没有公式。
+pub fn layout(
+    text: &str,
+    math: &[(usize, String)],
+    width: f32,
+    font_size: f32,
+    cache: &Path,
+) -> Option<FlowLayout> {
+    if math.is_empty() || text.trim().is_empty() {
+        return None;
+    }
+    let width = width.max(1.0);
+    let font_size = font_size.max(1.0);
+
+    // 1) 每个公式排成图；**任一失败就整段回落**（半段公式比全不排更糟）。
+    //    字号 = 正文同字号，否则行内公式会比周围字大一号。
+    let mut boxes = Vec::with_capacity(math.len());
+    for (_, tex) in math {
+        boxes.push(crate::mathrender::typeset_sized_in(
+            tex,
+            cache,
+            font_size as f64,
+        )?);
+    }
+
+    // 2) parley 排版：整段文字 + 每个公式一个 in-flow inline box。
+    let mut fcx = FontContext::new();
+    let mut lcx: LayoutContext<()> = LayoutContext::new();
+    let mut builder = lcx.ranged_builder(&mut fcx, text, 1.0, true);
+    builder.push_default(StyleProperty::FontSize(font_size));
+    for (i, (off, _)) in math.iter().enumerate() {
+        let m = &boxes[i];
+        builder.push_inline_box(InlineBox {
+            id: i as u64,
+            kind: InlineBoxKind::InFlow,
+            index: (*off).min(text.len()),
+            width: m.w,
+            // 只报「基线以上」：parley 把 box 底边贴上基线（`y = baseline - height`），
+            // 报整个高度会让行高多留一个下落部；下落部由我们下面按 `depth` 补。
+            height: m.ascent,
+        });
+    }
+    let mut pl = builder.build(text);
+    pl.break_all_lines(Some(width));
+
+    // 3) 逐行取坐标，并按「文字 metrics ∪ 公式 metrics」自己算行高与基线。
+    let mut pieces: Vec<FlowPiece> = Vec::new();
+    let mut y = 0.0f32;
+    for line in pl.lines() {
+        let mut t_asc = 0.0f32;
+        let mut t_desc = 0.0f32;
+        let mut t_line_h = 0.0f32;
+        let mut m_asc = 0.0f32;
+        let mut m_desc = 0.0f32;
+        for item in line.items() {
+            match item {
+                PositionedLayoutItem::GlyphRun(g) => {
+                    let m = g.run().metrics();
+                    t_asc = t_asc.max(m.ascent);
+                    t_desc = t_desc.max(m.descent);
+                    t_line_h = t_line_h.max(m.line_height);
+                }
+                PositionedLayoutItem::InlineBox(ib) => {
+                    let m = &boxes[ib.id as usize];
+                    m_asc = m_asc.max(m.ascent);
+                    m_desc = m_desc.max(m.depth);
+                }
+            }
+        }
+        let ascent = t_asc.max(m_asc);
+        let descent = t_desc.max(m_desc);
+        let line_h = t_line_h.max(ascent + descent).max(1.0);
+        let baseline = y + ascent;
+
+        for item in line.items() {
+            match item {
+                PositionedLayoutItem::GlyphRun(g) => {
+                    let run = g.run();
+                    let range = run.text_range();
+                    let s = text.get(range).unwrap_or("");
+                    if s.is_empty() {
+                        continue;
+                    }
+                    let asc = run.metrics().ascent;
+                    let desc = run.metrics().descent;
+                    let advance = g.advance();
+                    pieces.push(FlowPiece {
+                        is_math: false,
+                        text: s.to_string(),
+                        image: slint::Image::default(),
+                        x: g.offset(),
+                        y: baseline - asc,
+                        w: advance,
+                        h: asc + desc,
+                    });
+                }
+                PositionedLayoutItem::InlineBox(ib) => {
+                    let m = &boxes[ib.id as usize];
+                    pieces.push(FlowPiece {
+                        is_math: true,
+                        text: String::new(),
+                        image: m.image.clone(),
+                        x: ib.x,
+                        // 图顶放在「基线 − 图内基线以上高」⇒ 图内基线正好落在文字基线上，
+                        // 下落部（`depth`）自然伸到基线以下。
+                        y: baseline - m.ascent,
+                        w: m.w,
+                        h: m.h,
+                    });
+                }
+            }
+        }
+        y += line_h;
+    }
+
+    if pieces.is_empty() {
+        return None;
+    }
+    Some(FlowLayout {
+        pieces,
+        height: y.max(1.0),
+        font_size,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_cache(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("abb-flow-{tag}-{}", std::process::id()))
+    }
+
+    /// 基线对齐的**结构性**判据：公式块与同行文字块**垂直相交**，且公式顶不低于文字顶
+    /// （公式比文字高：带上标/分式时它会往上长，但绝不能整体沉到文字下面）。
+    ///
+    /// 为什么用「相交」而不是「顶对齐」：基线对齐下两者顶/底都不相等，只有基线相同；
+    /// 这里用它们必须互相跨越对方的中腰来钉住「没被顶到行外面去」。
+    #[test]
+    fn math_box_sits_on_the_text_baseline() {
+        let cache = tmp_cache("baseline");
+        let _ = std::fs::remove_dir_all(&cache);
+        let text = "质能方程 E=mc^2 表明质量与能量等价。";
+        let off = "质能方程 ".len();
+        let l =
+            layout(text, &[(off, "E=mc^2".to_string())], 400.0, 13.0, &cache).expect("应能排版");
+        let math = l.pieces.iter().find(|p| p.is_math).expect("应有一个公式块");
+        let words: Vec<&FlowPiece> = l.pieces.iter().filter(|p| !p.is_math).collect();
+        assert!(!words.is_empty(), "公式前后都应有文字");
+        let same_line: Vec<&&FlowPiece> = words
+            .iter()
+            .filter(|w| w.y < math.y + math.h && math.y < w.y + w.h)
+            .collect();
+        assert!(
+            !same_line.is_empty(),
+            "公式必须与同一行的文字共存：math=[{:.1},{:.1}) words={:?}",
+            math.y,
+            math.y + math.h,
+            words.iter().map(|w| (w.y, w.y + w.h)).collect::<Vec<_>>()
+        );
+        for w in &same_line {
+            // 公式顶必须在同行文字的**上半行**内（没被整体沉下去）；允许 1px 的亚像素差：
+            // 公式基线以上高与文字 ascent 不一定相等（`E=mc^2` 比文字矮一点）。
+            assert!(
+                math.y <= w.y + w.h * 0.5,
+                "公式不得整体沉到同行文字下方：math.y={:.1} word=[{:.1},{:.1})",
+                math.y,
+                w.y,
+                w.y + w.h
+            );
+            assert!(
+                math.y + math.h >= w.y + w.h * 0.5,
+                "公式必须跨过文字中腰（同一基线）：math=[{:.1},{:.1}) word=[{:.1},{:.1})",
+                math.y,
+                math.y + math.h,
+                w.y,
+                w.y + w.h
+            );
+        }
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    /// 断行：可用宽变窄 ⇒ 行数增加（宽度真的参与了排版，不是摆设）。
+    #[test]
+    fn narrower_width_breaks_into_more_lines() {
+        let cache = tmp_cache("wrap");
+        let _ = std::fs::remove_dir_all(&cache);
+        let text = "这里是一段比较长的说明文字用来逼出换行效果并且中间夹着公式。";
+        let off = "这里是一段比较长的说明文字用来逼出换行效果并且中间夹着".len();
+        let math = vec![(off, r"\frac{a}{b}".to_string())];
+        let wide = layout(text, &math, 600.0, 13.0, &cache).expect("宽版应能排版");
+        let narrow = layout(text, &math, 120.0, 13.0, &cache).expect("窄版应能排版");
+        assert!(
+            narrow.height > wide.height,
+            "窄宽度应更高（多行）：narrow={:.1} wide={:.1}",
+            narrow.height,
+            wide.height
+        );
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    /// 反例：非法 TeX ⇒ `None`（调用方据此回落成行内码，绝不吞字）。
+    #[test]
+    fn invalid_tex_falls_back() {
+        let cache = tmp_cache("bad");
+        let _ = std::fs::remove_dir_all(&cache);
+        assert!(
+            layout(
+                "前 $\\frac{a}{$ 后",
+                &[(2, r"\frac{a}{".to_string())],
+                400.0,
+                13.0,
+                &cache
+            )
+            .is_none(),
+            "非法公式必须回落"
+        );
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    /// 没有公式 / 空文本 ⇒ `None`（不参与混排）。
+    #[test]
+    fn no_math_or_empty_is_not_flow() {
+        let cache = tmp_cache("none");
+        assert!(layout("普通句子", &[], 400.0, 13.0, &cache).is_none());
+        assert!(layout("", &[(0, "x".to_string())], 400.0, 13.0, &cache).is_none());
+    }
+
+    /// 片段文本必须能拼回原文（**除了被公式占掉的位置**）——防止坐标提取把字吞了/重复了。
+    #[test]
+    fn pieces_rebuild_the_plain_text() {
+        let cache = tmp_cache("rebuild");
+        let _ = std::fs::remove_dir_all(&cache);
+        // 公式位置的字符在 `plain` 里本来就不存在（`$…$` 整段不进入 plain）
+        let text = "甲乙丙  丁戊";
+        let off = "甲乙丙 ".len();
+        let l = layout(text, &[(off, "x^2".to_string())], 400.0, 13.0, &cache).expect("排版");
+        assert_eq!(l.pieces.iter().filter(|p| p.is_math).count(), 1);
+        let rebuilt: String = l
+            .pieces
+            .iter()
+            .filter(|p| !p.is_math)
+            .map(|p| p.text.as_str())
+            .collect();
+        let norm = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        assert_eq!(norm(&rebuilt), "甲乙丙丁戊", "拼回文本异常：{rebuilt:?}");
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+}

@@ -2889,11 +2889,15 @@ fn handle_platform_window_event(
 //
 // 模块级口径：入参全是值，出的行由调用方灌进 model。
 // 一段消息 → 渲染行：角色行 + 若干内容块（B 批：完整 markdown）。
-fn role_row(label: &str, assistant: bool) -> SysChatBlockRow {
+/// 空白渲染行：只给 `kind`，其余字段取安全默认。
+///
+/// 为什么集中成工厂：`SysChatBlockRow` 的字段会随需求增长（表格列宽 / 图片宽高比 / …），
+/// 四个构造点各写一遍结构体字面量时，新增一个字段就要改四处。改成「`blank_row` + 逐字段
+/// 覆盖」后默认值只有一份，新增字段不会再漏点。
+fn blank_row(kind: &str) -> SysChatBlockRow {
     SysChatBlockRow {
-        kind: "role".into(),
-        text: label.into(),
-        role_assistant: assistant,
+        kind: kind.into(),
+        text: "".into(),
         styled: slint::StyledText::default(),
         level: 0,
         order: 0,
@@ -2904,10 +2908,23 @@ fn role_row(label: &str, assistant: bool) -> SysChatBlockRow {
             Vec::<slint::SharedString>::new(),
         ))),
         header: false,
+        table_rows: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<TableRow>::new()))),
+        col_ws: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<f32>::new()))),
         src: "".into(),
         alt: "".into(),
         img: slint::Image::default(),
         img_ok: false,
+        img_aspect: 0.0,
+        img_w: 0.0,
+        img_h: 0.0,
+        flow: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<ConvoFlowPiece>::new()))),
+        flow_h: 0.0,
+        flow_size: FLOW_FONT_PX,
+        math_off: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<i32>::new()))),
+        math_tex: slint::ModelRc::from(Rc::new(slint::VecModel::from(
+            Vec::<slint::SharedString>::new(),
+        ))),
+        role_assistant: false,
         think_expanded: false,
         think_live: false,
         think_elapsed: "".into(),
@@ -2916,11 +2933,89 @@ fn role_row(label: &str, assistant: bool) -> SysChatBlockRow {
         turn: -1,
     }
 }
+
+/// 行内公式段落的字号（px）：与正文段落（`.slint` 里 `p` 的 13px）一致，否则含公式的段落
+/// 字比邻居大一号。
+const FLOW_FONT_PX: f32 = 13.0;
+
+/// 构建渲染行时的**默认正文宽**：只在拿不到真实 `convo-text-width` 的场合用（单测、非窗口
+/// 路径）。与 `.slint` 里的默认 416px 同源（都从 `syschat` 的常量推）。
+fn default_flow_w() -> f32 {
+    (crate::syschat::SYSCHAT_PREFERRED_WIDTH - crate::syschat::CONVO_BLOCK_TEXT_INSET)
+        .max(crate::syschat::CONVO_TEXT_WIDTH_MIN)
+}
+
+/// `inlineflow` 结果 → Slint 模型（片段 + 整段高）。
+fn flow_model(l: &crate::inlineflow::FlowLayout) -> (slint::ModelRc<ConvoFlowPiece>, f32) {
+    let pieces: Vec<ConvoFlowPiece> = l
+        .pieces
+        .iter()
+        .map(|p| ConvoFlowPiece {
+            is_math: p.is_math,
+            text: p.text.as_str().into(),
+            img: p.image.clone(),
+            x: p.x,
+            y: p.y,
+            w: p.w,
+            h: p.h,
+        })
+        .collect();
+    (
+        slint::ModelRc::from(Rc::new(slint::VecModel::from(pieces))),
+        l.height,
+    )
+}
+
+/// 宽度变化时**原地重排**所有 `mathp` 行（源信息在行的 `math-off`/`math-tex` 里）。
+///
+/// 为什么可以原地重排而不用重建整段会话：流式期间重建会把未落盘的半轮弄丢；而 `mathp`
+/// 只依赖「纯文本 + 公式源 + 宽度」，刚好都在行里存着。排不出来（非法 TeX）就保持原样。
+fn relayout_flow_rows(model: &slint::VecModel<SysChatBlockRow>, width: f32) {
+    use slint::Model as _;
+    for i in 0..model.row_count() {
+        let Some(mut row) = model.row_data(i) else {
+            continue;
+        };
+        if row.kind.as_str() != "mathp" {
+            continue;
+        }
+        let offs: Vec<usize> = row.math_off.iter().map(|v| v.max(0) as usize).collect();
+        let texs: Vec<String> = row.math_tex.iter().map(|s| s.to_string()).collect();
+        if offs.len() != texs.len() || offs.is_empty() {
+            continue;
+        }
+        let math: Vec<(usize, String)> = offs.into_iter().zip(texs).collect();
+        if let Some(l) = crate::inlineflow::layout(
+            &row.plain,
+            &math,
+            width,
+            FLOW_FONT_PX,
+            &crate::mathrender::cache_dir(),
+        ) {
+            let (flow, h) = flow_model(&l);
+            row.flow = flow;
+            row.flow_h = h;
+            row.flow_size = l.font_size;
+            model.set_row_data(i, row);
+        }
+    }
+}
+
+fn role_row(label: &str, assistant: bool) -> SysChatBlockRow {
+    let mut r = blank_row("role");
+    r.text = label.into();
+    r.role_assistant = assistant;
+    r
+}
 /// 加载块图片：本地路径直读；http(s) 读本地缓存（未缓存则先空，由后台下载后重载）。
 /// 本地路径统一按 **syschat 工作区**基准解析（[`crate::syschat::resolve_media_path`]）。
-fn load_block_image(src: &str) -> (slint::Image, bool) {
+///
+/// 第三个返回值是**源宽高比**（高/宽，`0` = 未知/加载失败）：`.slint` 用它把图片块的
+/// 高度算成「视口宽 × 比例」——裸 `Rectangle` **不会**被 `Image` 子项撑高（实测只报 ~30px，
+/// 图片却实画 ~200px ⇒ 后面的块全被图片盖住、滞底也算不到底），所以必须显式给高度。
+fn load_block_image(src: &str) -> (slint::Image, bool, f32) {
     if src.is_empty() {
-        return (slint::Image::default(), false);
+        return (slint::Image::default(), false, 0.0);
     }
     let path: Option<std::path::PathBuf> =
         if src.starts_with("http://") || src.starts_with("https://") {
@@ -2930,9 +3025,17 @@ fn load_block_image(src: &str) -> (slint::Image, bool) {
             let p = crate::syschat::resolve_media_path(src);
             p.is_file().then_some(p)
         };
-    match path.and_then(|p| slint::Image::load_from_path(&p).ok()) {
-        Some(img) => (img, true),
-        None => (slint::Image::default(), false),
+    let Some(path) = path else {
+        return (slint::Image::default(), false, 0.0);
+    };
+    // 只读头部拿尺寸（不解码整图）；SVG 等拿不到时回落 0 ⇒ `.slint` 用 200px 兜底高度。
+    let aspect = image::image_dimensions(&path)
+        .ok()
+        .and_then(|(w, h)| (w > 0 && h > 0).then(|| h as f32 / w as f32))
+        .unwrap_or(0.0);
+    match slint::Image::load_from_path(&path) {
+        Ok(img) => (img, true, aspect),
+        Err(_) => (slint::Image::default(), false, 0.0),
     }
 }
 /// 加载待发附件缩略图（本地文件）。失败回落 `thumb-ok=false`（UI 显示字形，不空白）。
@@ -2942,8 +3045,52 @@ fn load_thumb(path: &std::path::Path) -> (slint::Image, bool) {
         Err(_) => (slint::Image::default(), false),
     }
 }
+#[cfg(test)]
 fn block_row(b: crate::mdblocks::MdBlock) -> SysChatBlockRow {
-    let (img, img_ok) = load_block_image(&b.src);
+    block_row_w(b, default_flow_w())
+}
+
+/// [`block_row`] 的可注入宽度版：含行内公式的普通段落走 `mathp`（parley 混排）。
+fn block_row_w(b: crate::mdblocks::MdBlock, flow_w: f32) -> SysChatBlockRow {
+    // 含行内公式的**普通段落**：整段交给 `inlineflow` 混排（文字 + 公式图）。
+    //   - 排不出来（非法 TeX）⇒ 不进这个分支，落到下面常规渲染：`text` 里的等宽行内码是退路；
+    //   - 其它 kind（标题/列表/引用）**不混排**（保持行内码）；`mathp` 只针对最简单的段落，
+    //     不做列表缩进/引用条那些自绘。
+    if b.kind == "p" && !b.math.is_empty() {
+        if let Some(l) = crate::inlineflow::layout(
+            &b.plain,
+            &b.math,
+            flow_w,
+            FLOW_FONT_PX,
+            &crate::mathrender::cache_dir(),
+        ) {
+            let mut r = blank_row("mathp");
+            let (flow, h) = flow_model(&l);
+            r.flow = flow;
+            r.flow_h = h;
+            r.flow_size = l.font_size;
+            r.math_off = slint::ModelRc::from(Rc::new(slint::VecModel::from(
+                b.math.iter().map(|(o, _)| *o as i32).collect::<Vec<_>>(),
+            )));
+            r.math_tex = slint::ModelRc::from(Rc::new(slint::VecModel::from(
+                b.math
+                    .iter()
+                    .map(|(_, t)| slint::SharedString::from(t.as_str()))
+                    .collect::<Vec<_>>(),
+            )));
+            r.plain = b.plain.into();
+            r.text = b.text.into();
+            return r;
+        }
+    }
+    let (img, img_ok, img_aspect) = load_block_image(&b.src);
+    // 块级公式（`kind == "math"`）：**真排版**成 SVG（KaTeX 的 Rust 移植，见 `mathrender`）。
+    // 失败（非法 TeX / 写盘失败）⇒ `None`，.slint 回落成等宽源码显示（绝不吐字）。
+    let math = if b.kind == "math" {
+        crate::mathrender::typeset(&b.text)
+    } else {
+        None
+    };
     // 卡 `abb-v11-message-actions`：**无行内样式**的块其 `StyledText` 与纯文本逐字等价
     // ⇒ 换成只读 `TextInput` 后观感不变，白得「可拖选 + ⌘C」。判定与「展示文本」都收敛在
     // `mdblocks::selectable_plain`（`None` = 这块不参与替换：结构化/媒体块、或有行内样式
@@ -2973,104 +3120,172 @@ fn block_row(b: crate::mdblocks::MdBlock) -> SysChatBlockRow {
     } else {
         slint::StyledText::default()
     };
-    SysChatBlockRow {
-        kind: b.kind.into(),
-        styled,
-        text: b.text.into(),
-        level: b.level,
-        order: b.order,
-        checked: b.checked,
-        marker: marker.into(),
-        lang: b.lang.into(),
-        cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
-            b.cells
-                .into_iter()
-                .map(slint::SharedString::from)
-                .collect::<Vec<_>>(),
-        ))),
-        header: b.header,
-        src: b.src.into(),
-        alt: b.alt.into(),
-        img,
-        img_ok,
-        role_assistant: false,
-        think_expanded: false,
-        think_live: false,
-        think_elapsed: "".into(),
-        selectable,
-        plain: plain.into(),
-        turn: -1,
+    let mut r = blank_row(&b.kind);
+    r.styled = styled;
+    r.text = b.text.into();
+    r.level = b.level;
+    r.order = b.order;
+    r.checked = b.checked;
+    r.marker = marker.into();
+    r.lang = b.lang.into();
+    r.cells = slint::ModelRc::from(Rc::new(slint::VecModel::from(
+        b.cells
+            .into_iter()
+            .map(slint::SharedString::from)
+            .collect::<Vec<_>>(),
+    )));
+    r.header = b.header;
+    r.src = b.src.into();
+    r.alt = b.alt.into();
+    r.img = img;
+    r.img_ok = img_ok;
+    r.img_aspect = img_aspect;
+    // 公式排版成功 ⇒ 用真图（自然尺寸入 `img-w/img-h`；`img-aspect` = 高/宽 供等比缩放）。
+    if let Some(m) = math {
+        r.img = m.image;
+        r.img_ok = true;
+        r.img_w = m.w;
+        r.img_h = m.h;
+        r.img_aspect = if m.w > 0.0 { m.h / m.w } else { 0.0 };
     }
+    r.selectable = selectable;
+    r.plain = plain.into();
+    r
 }
 /// 助手轮动作行（卡 `abb-v11-message-actions`，稿 v11.1 `.acts`）。
 ///
 /// 只放**序号**，正文与提示词由点击时按序号解析（[`crate::syschat::action_target`]）：
 /// Slint 侧不必搬整段正文，历史也只在一处被解读。`turn < 0` = 刚跑完的那条（历史下标未知）。
 fn acts_row(turn: i32) -> SysChatBlockRow {
-    SysChatBlockRow {
-        kind: "acts".into(),
-        text: "".into(),
-        styled: slint::StyledText::default(),
-        level: 0,
-        order: 0,
-        checked: false,
-        marker: "".into(),
-        lang: "".into(),
-        cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
-            Vec::<slint::SharedString>::new(),
-        ))),
-        header: false,
-        src: "".into(),
-        alt: "".into(),
-        img: slint::Image::default(),
-        img_ok: false,
-        role_assistant: false,
-        think_expanded: false,
-        think_live: false,
-        think_elapsed: "".into(),
-        selectable: false,
-        plain: "".into(),
-        turn,
-    }
+    let mut r = blank_row("acts");
+    r.turn = turn;
+    r
 }
 /// 思考块行（E2）：内容放 `text`，展开态/进行态/耗时放专用字段；
 /// 默认**折叠**（`expanded=false`）；`live` = 思考仍在进行（流式展开让打字机可见，
 /// 一旦进入正文或收尾就自动收起）。
 fn think_row(text: &str, elapsed: &str, expanded: bool, live: bool) -> SysChatBlockRow {
-    SysChatBlockRow {
-        kind: "think".into(),
-        text: text.into(),
-        styled: slint::StyledText::default(),
-        level: 0,
-        order: 0,
-        checked: false,
-        marker: "".into(),
-        lang: "".into(),
-        cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(
-            Vec::<slint::SharedString>::new(),
-        ))),
-        header: false,
-        src: "".into(),
-        alt: "".into(),
-        img: slint::Image::default(),
-        img_ok: false,
-        role_assistant: false,
-        think_expanded: expanded,
-        think_live: live,
-        think_elapsed: elapsed.into(),
-        // 思考文本是**纯文本**（不是 markdown）⇒ 恒可选中，且无样式可言。
-        selectable: true,
-        plain: text.into(),
-        turn: -1,
+    let mut r = blank_row("think");
+    r.text = text.into();
+    r.think_expanded = expanded;
+    r.think_live = live;
+    r.think_elapsed = elapsed.into();
+    // 思考文本是**纯文本**（不是 markdown）⇒ 恒可选中，且无样式可言。
+    r.selectable = true;
+    r.plain = text.into();
+    r
+}
+/// 一个字符的估算显示宽（px，字号 12）：CJK/全角 ≈ 1em = 12，其余 ≈ 0.55em ≈ 6.6。
+///
+/// Slint 里无法在 Rust 侧量真实字体，只能按字符类别估：**估窄了 → 该格换行（可接受）；
+/// 估宽了 → 留白**。列宽只用来让各行列对齐与定行高，不追求像素级贴合。
+fn est_char_px(c: char) -> f32 {
+    if is_wide_char(c) {
+        12.0
+    } else {
+        6.6
     }
 }
+
+/// 全角/宽字符判定（CJK、假名、韩文、全角标点、emoji）。
+fn is_wide_char(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x115F
+        | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF | 0xA000..=0xA4CF | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6 | 0x1F300..=0x1FAFF | 0x20000..=0x3FFFD)
+}
+
+/// 每列宽 = 该列最长单元格的估算宽 + 左右内边距 10，夹在 `[44, 240]`。
+///
+/// 与旧实现（`4bb9cbb`：每列 `max(均分, 132px)`）的区别就在这里：**列宽跟着内容走**，
+/// 所以「键/值」这类短表不会再被撑出巨大列间距；长格在 240 上限处换行。
+fn table_col_widths(rows: &[Vec<String>]) -> Vec<f32> {
+    let n = rows.iter().map(Vec::len).max().unwrap_or(0);
+    (0..n)
+        .map(|ci| {
+            let longest = rows
+                .iter()
+                .filter_map(|r| r.get(ci))
+                .map(|s| s.chars().map(est_char_px).sum::<f32>())
+                .fold(0.0f32, f32::max);
+            (longest + 10.0).clamp(44.0, 240.0)
+        })
+        .collect()
+}
+
+/// 整表（连续的若干 `table` 块）→ **一个**渲染行。
+///
+/// 为什么必须整表成一个块：列宽（各列对齐）与该行最高的单元格（行高）只有拿到**全部行**
+/// 才算得出来；旧实现一行一个块、每个块各自一个 Flickable，就是「左列被裁 + 每行独立横滑 +
+/// 列间距巨大」的来源（`4bb9cbb` 残留，2026-10-15 owner 实录）。
+fn table_row(rows: &[crate::mdblocks::MdBlock]) -> SysChatBlockRow {
+    let cells: Vec<Vec<String>> = rows.iter().map(|b| b.cells.clone()).collect();
+    let ws = table_col_widths(&cells);
+    let n = ws.len();
+    let trs: Vec<TableRow> = rows
+        .iter()
+        .map(|b| {
+            let mut cs: Vec<slint::SharedString> = b
+                .cells
+                .iter()
+                .map(|c| slint::SharedString::from(c.as_str()))
+                .collect();
+            // 行短了补齐：`.slint` 侧按 `col-ws[ci]` 取宽，缺列会越界。
+            cs.resize(n, slint::SharedString::default());
+            TableRow {
+                cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(cs))),
+                header: b.header,
+            }
+        })
+        .collect();
+    let mut r = blank_row("table");
+    r.table_rows = slint::ModelRc::from(Rc::new(slint::VecModel::from(trs)));
+    r.col_ws = slint::ModelRc::from(Rc::new(slint::VecModel::from(ws)));
+    r
+}
+
+/// 块序列 → 渲染行：**连续的 `table` 块合成一个整表行**，其余块走 [`block_row`]。
+///
+/// 分组只在这里做一次（`rows_for` 与 `stream_rows` 共用），两处口径不会漂。
+#[cfg(test)]
+fn push_block_rows(rows: &mut Vec<SysChatBlockRow>, blocks: Vec<crate::mdblocks::MdBlock>) {
+    push_block_rows_w(rows, blocks, default_flow_w())
+}
+
+/// [`push_block_rows`] 的可注入宽度版（含行内公式的段落会用到宽度）。
+fn push_block_rows_w(
+    rows: &mut Vec<SysChatBlockRow>,
+    blocks: Vec<crate::mdblocks::MdBlock>,
+    flow_w: f32,
+) {
+    let mut i = 0usize;
+    while i < blocks.len() {
+        if blocks[i].kind == "table" {
+            let mut j = i + 1;
+            while j < blocks.len() && blocks[j].kind == "table" {
+                j += 1;
+            }
+            rows.push(table_row(&blocks[i..j]));
+            i = j;
+        } else {
+            rows.push(block_row_w(blocks[i].clone(), flow_w));
+            i += 1;
+        }
+    }
+}
+
+#[cfg(test)]
 fn rows_for(role: &str, text: &str) -> Vec<SysChatBlockRow> {
+    rows_for_w(role, text, default_flow_w())
+}
+
+fn rows_for_w(role: &str, text: &str, flow_w: f32) -> Vec<SysChatBlockRow> {
     let assistant = role == "assistant";
     let label = if assistant { "怹" } else { "你" };
     let mut rows = vec![role_row(label, assistant)];
-    for b in crate::mdblocks::parse(text) {
-        rows.push(block_row(b));
-    }
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(text), flow_w);
     rows
 }
 /// 一轮历史 → 渲染行：角色行 +（有思考则）思考块 + 正文 markdown 块 +
@@ -3078,8 +3293,13 @@ fn rows_for(role: &str, text: &str) -> Vec<SysChatBlockRow> {
 ///
 /// `index` 是这一轮在**本会话历史里的下标**——动作行只带序号，点击时再按序号解析
 /// 正文/提示词（见 [`acts_row`] 的注释）。
+#[cfg(test)]
 fn rows_for_turn(t: &crate::syschat::Turn, index: usize) -> Vec<SysChatBlockRow> {
-    let mut rows = rows_for(&t.role, &t.text);
+    rows_for_turn_w(t, index, default_flow_w())
+}
+
+fn rows_for_turn_w(t: &crate::syschat::Turn, index: usize, flow_w: f32) -> Vec<SysChatBlockRow> {
+    let mut rows = rows_for_w(&t.role, &t.text, flow_w);
     if !t.thought.is_empty() {
         // 历史里的思考块**默认折叠**（需求 #11），耗时历史未存 ⇒ 不显示数字。
         rows.insert(1, think_row(&t.thought, "", false, false));
@@ -3096,6 +3316,7 @@ fn rows_for_turn(t: &crate::syschat::Turn, index: usize) -> Vec<SysChatBlockRow>
 /// ① 流式进行中（此轮还没落盘，按序号也解析不到）；② 已收尾但下标定位不到
 ///（见 `syschat::last_assistant_index`）。**不许**用「负值 = 刚跑完那条」这类哨兵当身份：
 /// 两条同值哨兵会一起解析到同一轮（独立评审判 Critical，见 `syschat::action_target` 的文档）。
+#[cfg(test)]
 fn stream_rows(
     revealed_text: &str,
     has_thought: bool,
@@ -3104,13 +3325,31 @@ fn stream_rows(
     live: bool,
     acts_turn: Option<i32>,
 ) -> Vec<SysChatBlockRow> {
+    stream_rows_w(
+        revealed_text,
+        has_thought,
+        thought_text,
+        elapsed,
+        live,
+        acts_turn,
+        default_flow_w(),
+    )
+}
+
+fn stream_rows_w(
+    revealed_text: &str,
+    has_thought: bool,
+    thought_text: &str,
+    elapsed: &str,
+    live: bool,
+    acts_turn: Option<i32>,
+    flow_w: f32,
+) -> Vec<SysChatBlockRow> {
     let mut rows = vec![role_row("怹", true)];
     if has_thought {
         rows.push(think_row(thought_text, elapsed, live, live));
     }
-    for b in crate::mdblocks::parse(revealed_text) {
-        rows.push(block_row(b));
-    }
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(revealed_text), flow_w);
     if let Some(turn) = acts_turn {
         // 空回合（无正文也无思考）不挂：那会指向一条不存在的答复。
         if !revealed_text.is_empty() || has_thought {
@@ -3541,6 +3780,19 @@ pub fn run_gui() -> Result<()> {
     apply_syschat_layout(&syschat_win, syschat_logical_width(&syschat_win));
     let syschat_model: Rc<slint::VecModel<SysChatBlockRow>> = Rc::new(slint::VecModel::default());
     syschat_win.set_blocks(slint::ModelRc::from(syschat_model.clone()));
+    // 宽度变化 ⇒ 含行内公式的段落要**原地重排**（`mathp` 是坐标排好的，不像流式文本那样自动
+    // 回流）。放在这里而不是上面 `on_titlebar_width_changed` 的初始位置：那时 `syschat_model`
+    // 还没建（回调是单槽 `set`，晚设覆盖早设，所以只能有一处）。
+    {
+        let cw = syschat_win.as_weak();
+        let model = syschat_model.clone();
+        syschat_win.on_titlebar_width_changed(move |w| {
+            if let Some(win) = cw.upgrade() {
+                apply_syschat_layout(&win, w);
+                relayout_flow_rows(&model, win.get_convo_text_width());
+            }
+        });
+    }
 
     /// 用当前累积文本重建「流式气泡」的行：从 `start` 起到末尾全替换。
     ///
@@ -3582,7 +3834,7 @@ pub fn run_gui() -> Result<()> {
         let turns = crate::syschat::load_history();
         let mut rows: Vec<SysChatBlockRow> = Vec::new();
         for (i, t) in turns.iter().enumerate() {
-            rows.extend(rows_for_turn(t, i));
+            rows.extend(rows_for_turn_w(t, i, win.get_convo_text_width()));
         }
         model.set_vec(rows);
         // 请求滞底：递增 epoch，由 .slint 的 changed 处理器把 content-y 设成越界值、
@@ -7767,7 +8019,7 @@ pub fn run_gui() -> Result<()> {
                 return; // 空消息 / 纯附件：产品口径不发
             };
             // 三种落点都先把用户行上屏 + 清空输入区（用户要知道“我说过了”）。
-            for r in rows_for("user", &text) {
+            for r in rows_for_w("user", &text, w.get_convo_text_width()) {
                 model.push(r);
             }
             w.set_draft("".into());
@@ -8033,20 +8285,16 @@ pub fn run_gui() -> Result<()> {
                 return;
             }
             // 归档**当前会话**（那一行的 tag 就写着「当前会话」）。
-            let (_list, current) = crate::syschat::session_list();
-            if current.is_empty() {
-                w.set_status_is_error(true);
-                w.set_status_line("没有可归档的会话（当前会话为空）。".into());
-                return;
-            }
-            let title = sessions
-                .borrow()
-                .iter()
-                .find(|s| s.id == current)
-                .map(|s| s.title.clone())
-                .unwrap_or_default();
-            match crate::syschat::archive_session(&current) {
-                Ok(()) => {
+            // 判据（含「空会话不归档」闸门）在 `syschat::archive_current` 里（可单测）；
+            // 这里只负责把结果画成状态行 + 面板收起/重载。
+            match crate::syschat::archive_current() {
+                Ok(outcome) if !outcome.archived => {
+                    // 空会话：**不归档、不新建**——归档它只会让 `ensure_current` 再起一条空会话，
+                    // 归档列表被一串用不到的「新会话」空壳塞满（owner 2026-10-15 实测）。
+                    w.set_status_is_error(false);
+                    w.set_status_line("当前是空会话，无需归档（发起消息后再归档）。".into());
+                }
+                Ok(outcome) => {
                     // 归档当前会话 ⇒ current 换到别的会话（见 `ensure_current`）：
                     // 排队项属于旧会话（同切会话口径）、对话区要重载。
                     pump.borrow_mut().clear();
@@ -8058,7 +8306,8 @@ pub fn run_gui() -> Result<()> {
                     w.set_status_is_error(false);
                     w.set_status_line(
                         format!(
-                            "已归档「{title}」——历史文件未删，可在会话菜单的「已归档」里找回。"
+                            "已归档「{}」——历史文件未删，可在会话菜单的「已归档」里找回。",
+                            outcome.title
                         )
                         .into(),
                     );
@@ -8627,8 +8876,19 @@ pub fn run_gui() -> Result<()> {
                         // 不然后面第二轮收尾后模型里会同时留下两条「刚跑完那条」的动作行。
                         let acts =
                             crate::syschat::last_assistant_index(&crate::syschat::load_history());
-                        let rows =
-                            stream_rows(&final_text, has_thought, &thought, &elapsed, false, acts);
+                        let flow_w = win_w
+                            .upgrade()
+                            .map(|w| w.get_convo_text_width())
+                            .unwrap_or_else(default_flow_w);
+                        let rows = stream_rows_w(
+                            &final_text,
+                            has_thought,
+                            &thought,
+                            &elapsed,
+                            false,
+                            acts,
+                            flow_w,
+                        );
                         if s0 != usize::MAX {
                             sync_stream_rows(&syschat_model_t, s0, rows);
                         } else if !stopped && (!final_text.is_empty() || has_thought) {
@@ -8693,7 +8953,12 @@ pub fn run_gui() -> Result<()> {
                     };
                     let thought = tw_think.borrow().shown().to_string();
                     let text = tw_text.borrow().shown().to_string();
-                    let rows = stream_rows(&text, has_thought, &thought, &elapsed, live, None);
+                    let flow_w = win_w
+                        .upgrade()
+                        .map(|w| w.get_convo_text_width())
+                        .unwrap_or_else(default_flow_w);
+                    let rows =
+                        stream_rows_w(&text, has_thought, &thought, &elapsed, live, None, flow_w);
                     sync_stream_rows(&syschat_model_t, stream_start.get(), rows);
                     if let Some(w) = win_w.upgrade() {
                         w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));

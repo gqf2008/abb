@@ -138,10 +138,22 @@ fn row(kind: &str, text: &str) -> SysChatBlockRow {
             Vec::<slint::SharedString>::new(),
         ))),
         header: false,
+        table_rows: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<TableRow>::new()))),
+        col_ws: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<f32>::new()))),
         src: "".into(),
         alt: "".into(),
         img: slint::Image::default(),
         img_ok: false,
+        img_aspect: 0.0,
+        img_w: 0.0,
+        img_h: 0.0,
+        flow: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<ConvoFlowPiece>::new()))),
+        flow_h: 0.0,
+        flow_size: 13.0,
+        math_off: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<i32>::new()))),
+        math_tex: slint::ModelRc::from(Rc::new(slint::VecModel::from(
+            Vec::<slint::SharedString>::new(),
+        ))),
         role_assistant: false,
         think_expanded: false,
         think_live: false,
@@ -160,16 +172,20 @@ fn acts_row(turn: i32) -> SysChatBlockRow {
     r
 }
 
-fn table_row(cells: &[&str]) -> SysChatBlockRow {
-    let mut r = row("table", "");
-    r.header = true;
-    r.cells = slint::ModelRc::from(Rc::new(slint::VecModel::from(
-        cells
-            .iter()
-            .map(|s| slint::SharedString::from(*s))
-            .collect::<Vec<_>>(),
-    )));
-    r
+/// 多行整表：`rows[0]` 作表头（与 `mdblocks` 的产出同口径）；走**生产**的整表构造点
+///（列宽/行高只有拿到整表才算得出来）。
+fn table_of(rows: &[&[&str]]) -> SysChatBlockRow {
+    let bs: Vec<crate::mdblocks::MdBlock> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, cs)| {
+            let mut b = crate::mdblocks::MdBlock::new("table");
+            b.header = i == 0;
+            b.cells = cs.iter().map(|s| s.to_string()).collect();
+            b
+        })
+        .collect();
+    super::table_row(&bs)
 }
 
 /// 暗像素判据：正文/描边是墨黑 `#1c1a17`（RGB 28,26,23），面板底是 `#ffffff` / 暖米 `#fdf6e9`。
@@ -321,8 +337,10 @@ fn fixture() -> Vec<SysChatBlockRow> {
         row("list", "第三项"),
         row("quote", &format!("引用块：{LONG}{LONG}")),
         row("code", &code),
-        table_row(&["列一", "列二"]),
-        table_row(&["一段比较长的单元格内容，用来撑出表格行的高度", "b"]),
+        table_of(&[
+            &["列一", "列二"],
+            &["一段比较长的单元格内容，用来撑出表格行的高度", "b"],
+        ]),
         row(
             "p",
             &format!("末尾长段落（这一段的底部就是判据盯的位置）：{LONG}{LONG}"),
@@ -3156,9 +3174,7 @@ fn dump_real_table_for_review() {
         );
     }
     let mut rows = vec![row("role", "怹")];
-    for b in blocks {
-        rows.push(block_row(b));
-    }
+    push_block_rows(&mut rows, blocks);
     let (ui, win, _m) = setup(rows, 640);
     ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
         slint::SharedString::from("新会话"),
@@ -3172,4 +3188,205 @@ fn dump_real_table_for_review() {
     apply_syschat_layout(&ui, 520.0);
     let f = settle_w(&win, 520, 640);
     write_png(&f, &dir.join("REAL-table.png"));
+}
+
+// ───────── 表格整块化 / 列宽 / 图片高度（2026-10-15）─────────
+
+/// 连续 `table` 块必须合成**一个**渲染行（列宽与行高只有拿到整表才算得出来）。
+#[test]
+fn table_blocks_merge_into_one_row_with_content_sized_columns() {
+    use slint::Model as _;
+    let bs = crate::mdblocks::parse("| 键 | 值 |\n|---|---|\n| a | 1 |\n| b | 2 |\n");
+    let mut rows = Vec::new();
+    push_block_rows(&mut rows, bs);
+    assert_eq!(
+        rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+        vec!["table"],
+        "整表必须是一个渲染行（旧实现一行一个块 ⇒ 每行各自 Flickable）"
+    );
+    assert_eq!(rows[0].table_rows.row_count(), 3, "表头 + 2 数据行");
+    let ws: Vec<f32> = rows[0].col_ws.iter().collect();
+    assert_eq!(ws.len(), 2);
+    assert!(
+        ws.iter().all(|w| *w < 100.0),
+        "短内容列宽要贴内容（旧实现 132px 起步 ⇒ 列间距巨大）：{ws:?}"
+    );
+
+    // 反向控制：长内容列必须更宽（否则上面那条可能只是「列宽恒小」白过）
+    let bs = crate::mdblocks::parse(
+        "| 键 | 值 |\n|---|---|\n| a | 一段很长的单元格内容用来把这一列撑宽 |\n",
+    );
+    let mut rows = Vec::new();
+    push_block_rows(&mut rows, bs);
+    let ws2: Vec<f32> = rows[0].col_ws.iter().collect();
+    assert!(ws2[1] > ws[1], "长内容列应更宽：{ws2:?} vs {ws:?}");
+}
+
+/// 图片块必须把**自己渲染出来的高度**报给布局。
+///
+/// 旧实现：块是裸 `Rectangle` + `Image{height:200px}`，却只向布局报 ~30px ⇒ 图片后的内容
+/// 被图片盖住、滞底也算不到底（owner 2026-10-15「图片没有正确渲染」的根因）。
+#[test]
+fn image_block_reports_rendered_height() {
+    // 造一张 200×100 的真 PNG（宽高比 0.5），不依赖 `~/.agent-bridge` 里有没有示例图
+    let dir = std::env::temp_dir().join(format!("abb-img-h-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.png");
+    image::RgbaImage::from_pixel(200, 100, image::Rgba([10, 120, 200, 255]))
+        .save(&path)
+        .unwrap();
+
+    let blocks = crate::mdblocks::parse(&format!("![t]({})", path.display()));
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].kind, "image");
+    // 三态都要对：不存在的路径不得谎报 `img-ok`（旧口径 `img-ok=false` 走「打开」卡）
+    assert!(!block_row(crate::mdblocks::MdBlock::new("image")).img_ok);
+    let r = block_row(blocks.into_iter().next().unwrap());
+    assert!(r.img_ok, "图片应加载成功");
+    assert!(
+        (r.img_aspect - 0.5).abs() < 0.01,
+        "宽高比应为 0.5（高/宽）：{}",
+        r.img_aspect
+    );
+
+    let height_with = |rows: Vec<SysChatBlockRow>| {
+        let (ui, _win, _m) = setup(rows, 900);
+        ui.window().set_size(slint::PhysicalSize::new(520, 900));
+        apply_syschat_layout(&ui, 520.0);
+        ui.get_dbg_col_h()
+    };
+    let h_no = height_with(vec![role_row("怹", true)]);
+    let h_img = height_with(vec![role_row("怹", true), r]);
+    assert!(
+        h_img - h_no > 120.0,
+        "图片块应把渲染高度报给布局：无图 {h_no} / 有图 {h_img}（旧实现只差 ~30px）"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 块级公式真排版出图（人工核对用；`AGENT_BRIDGE_HOME` 指到临时目录可避免写真实缓存）。
+///
+/// 为什么 `#[ignore]`：它经 `block_row` 走生产 `mathrender::typeset` ⇒ 会往
+/// `<bridge>/syschat/math-cache/` **写 SVG**，而全量门禁的隔离守卫不允许测试写运行数据。
+/// 排版逻辑本身的判据在 `mathrender::tests`（缓存目录可注入），这里只负责出图。
+#[test]
+#[ignore = "出图/定性用；默认不跑"]
+fn dump_math_typeset_for_review() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    std::fs::create_dir_all(dir).expect("建出图目录失败");
+    let md = "行内数学：质能方程 $E = mc^2$ 混排。\n\n\
+块级公式：\n\n$$\n\\int_0^1 x^2 \\, dx = \\frac{1}{3}\n$$\n\n\
+再来一个：\n\n$$\n\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}, \\quad \\sqrt{x^2+y^2}\n$$\n\n\
+非法公式兜底：\n\n$$\n\\frac{a}{\n$$\n";
+    let mut rows = vec![row("role", "怹")];
+    push_block_rows(&mut rows, crate::mdblocks::parse(md));
+    let (ui, win, _m) = setup(rows, 900);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("m"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(520, 900));
+    apply_syschat_layout(&ui, 520.0);
+    println!("col-h={}", ui.get_dbg_col_h());
+    let f = settle_w(&win, 520, 900);
+    write_png(&f, &dir.join("math-typeset.png"));
+}
+
+/// 行内公式混排出图（人工核对用；`AGENT_BRIDGE_HOME` 指到临时目录避免写真实缓存）。
+///
+/// 与 `dump_math_typeset_for_review` 同因 `#[ignore]`：它经生产 `block_row_w` 走
+/// `inlineflow` + `mathrender::typeset`，会往 `<bridge>/syschat/math-cache/` 写 SVG。
+#[test]
+#[ignore = "出图/定性用；默认不跑"]
+fn dump_inline_math_for_review() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    std::fs::create_dir_all(dir).expect("建出图目录失败");
+    let md = "行内公式（应与文字同一基线、正常换行）：\n\n\
+质能方程 $E = mc^2$ 说明质量可以转化为能量；常见的还有 $\\frac{a+b}{c}$、\
+$\\sqrt{x^2+y^2}$、$\\sum_{i=1}^{n} i$ 等等，这几个应当能和文字排在同一行并自动换行。\n\n\
+普通段落（对照，不受影响）：这里的文字走 Slint 原生排版，**粗体** 与 `代码` 都在。\n\n\
+块级公式（对照）：\n\n$$\n\\int_0^1 x^2 \\, dx = \\frac{1}{3}\n$$";
+    let mut rows = vec![row("role", "怹")];
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(md), 416.0);
+    let (ui, win, _m) = setup(rows, 900);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("m"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(520, 900));
+    apply_syschat_layout(&ui, 520.0);
+    println!("col-h={}", ui.get_dbg_col_h());
+    let f = settle_w(&win, 520, 900);
+    write_png(&f, &dir.join("inline-math.png"));
+}
+
+/// `mathp` 块：按 Rust 算好的坐标**绝对定位**渲染文字片段与公式图。
+///
+/// 这条不碰文件系统（片段直接构造；公式用内存里的纯色图），所以不需要 `#[ignore]`：
+/// 它守的是 `.slint` 的 `mathp` 分支本身（`flow-h` 有没有被外层布局认下来 + 片段真的画出来）。
+#[test]
+fn mathp_block_renders_flow_pieces_absolutely() {
+    let solid = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+        &[20u8, 20, 20, 255].repeat(12 * 12),
+        12,
+        12,
+    );
+    let mk = |flow_h: f32| {
+        let mut r = row("mathp", "");
+        r.flow_size = 13.0;
+        r.flow_h = flow_h;
+        r.flow = slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+            ConvoFlowPiece {
+                is_math: false,
+                text: "文字片段甲乙".into(),
+                img: slint::Image::default(),
+                x: 0.0,
+                y: 0.0,
+                w: 60.0,
+                h: 16.0,
+            },
+            ConvoFlowPiece {
+                is_math: true,
+                text: "".into(),
+                img: slint::Image::from_rgba8(solid.clone()),
+                x: 70.0,
+                y: 2.0,
+                w: 12.0,
+                h: 12.0,
+            },
+        ])));
+        r
+    };
+    let height_with = |row: SysChatBlockRow| {
+        let (ui, _win, _m) = setup(vec![role_row("怹", true), row], 700);
+        ui.window().set_size(slint::PhysicalSize::new(520, 700));
+        apply_syschat_layout(&ui, 520.0);
+        ui.get_dbg_col_h()
+    };
+    // 判据：`flow-h` 必须真的驱动整段高（40 → 100 应恰好高 60；裸容器不会被绝对定位子项撑高，
+    // 所以这条一旦回退成「由子项算高」就会红）。
+    let h40 = height_with(mk(40.0));
+    let h100 = height_with(mk(100.0));
+    assert!(
+        (h100 - h40 - 60.0).abs() < 4.0,
+        "`mathp` 的 flow-h 必须驱动整段高：40 → {h40}，100 → {h100}"
+    );
+
+    // 出图：文字与那张图都必须真的画出来（墨迹存在）。
+    let (ui, win, _m) = setup(vec![role_row("怹", true), mk(40.0)], 700);
+    ui.window().set_size(slint::PhysicalSize::new(520, 700));
+    apply_syschat_layout(&ui, 520.0);
+    let f = settle_w(&win, 520, 700);
+    let fy = ui.get_dbg_flick_y().round() as u32;
+    let fh = ui.get_dbg_flick_h().round() as u32;
+    let ink = f.lowest_ink_row(fy, fy + fh, 4, 519);
+    assert!(ink.is_some(), "`mathp` 内容应有墨迹（文字/图至少画出一个）");
 }

@@ -453,15 +453,54 @@ pub fn archived_session_list() -> Vec<SessionMeta> {
     store.archived()
 }
 
-/// 归档某会话（卡 `abb-v11-session-archive`）：归档后从 [`session_list`] 里隐藏，
-/// **不删任何数据**（`sessions/<id>.jsonl` 原样保留，[`unarchive_session`] 即找回）。
+/// [`archive_current`] 的结果：`archived = false` 表示当前是空会话、按口径**未归档**；
+/// `title` 是被处理的会话标题（状态行用）。
+pub struct ArchiveOutcome {
+    pub archived: bool,
+    pub title: String,
+}
+
+/// 归档**当前**会话（GUI「🗄 归档…」的收口）。先经过空会话闸门。
 ///
-/// 归档的是**当前**会话时，`current` 会自动换到最近活动的未归档会话（一条不剩则起一条新的）
-/// ——不变量：当前会话永远出现在列表里，否则消息会写进用户看不见的会话。
-pub fn archive_session(id: &str) -> Result<(), String> {
+/// 为什么要这个闸门（owner 2026-10-15 实测）：空会话被归档毫无意义，而且归档后
+/// [`SessionStore::ensure_current`] 发现「没有未归档会话」会**立刻新建一条空会话** ⇒
+/// 用户连点几次就把归档列表塞满一串永远用不到的「新会话」空壳（实测盘上 25 条会话里 20 条
+/// 是这么来的）。所以：当前会话为空 ⇒ **不归档、不新建**，由调用方给一句状态行。
+pub fn archive_current() -> Result<ArchiveOutcome, String> {
     let store = SessionStore::production();
     let _g = store.lock()?;
-    store.set_archived(id, true)
+    archive_current_locked(&store)
+}
+
+/// [`archive_current`] 的实现：**调用方必须已持历史锁**（单测用临时 base 直接驱动）。
+fn archive_current_locked(store: &SessionStore) -> Result<ArchiveOutcome, String> {
+    let mut state = store.load();
+    store.ensure_current(&mut state);
+    let id = state.current.clone();
+    let title = state
+        .sessions
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| s.title.clone())
+        .unwrap_or_default();
+    if is_empty_session(&store.read_history(&id)) {
+        return Ok(ArchiveOutcome {
+            archived: false,
+            title,
+        });
+    }
+    if let Some(i) = state.sessions.iter().position(|s| s.id == id) {
+        state.sessions[i].archived = true;
+    }
+    // current 的落位交给同一套判据（与 `set_archived` 一致，不在这里再挑一次）。
+    store.ensure_current(&mut state);
+    store
+        .save(&state)
+        .map_err(|e| format!("写入会话索引失败：{e}"))?;
+    Ok(ArchiveOutcome {
+        archived: true,
+        title,
+    })
 }
 
 /// 取消归档（找回）。同样只动索引里的这一位，历史文件不碰。
@@ -6828,5 +6867,48 @@ mod tests {
             "写回必须带 archived 这一位：{txt}"
         );
         assert_eq!(arr.len(), 2, "唯一会话被归档 ⇒ 索引里新起一条：{txt}");
+    }
+    /// 空会话**不归档**（owner 2026-10-15 实测：25 条会话里 20 条是被这么造出来的空壳）。
+    ///
+    /// 判据两层：
+    /// - 正面：空会话 ⇒ `archived == false` 且**索引一字未动**（不得新建、不得落盘）；
+    /// - 反向控制：同一会话一旦有内容，就能真正归档（否则上面那条可能只是「函数恒不归档」）。
+    #[test]
+    fn archive_current_refuses_empty_session_but_archives_content() {
+        let (store, base) = tmp_store("arch-current-empty");
+        std::fs::create_dir_all(&base).unwrap();
+        let mut st = store.load();
+        st.sessions = vec![SessionMeta {
+            id: "empty".into(),
+            title: "新会话".into(),
+            created_at: 1,
+            updated_at: 1,
+            provider: String::new(),
+            archived: false,
+            context_tokens: 0,
+        }];
+        st.current = "empty".into();
+        store.save(&st).unwrap();
+        let before = std::fs::read_to_string(base.join("sessions.json")).unwrap();
+
+        let out = archive_current_locked(&store).unwrap();
+        assert!(!out.archived, "空会话不得被归档");
+        assert_eq!(out.title, "新会话");
+        assert_eq!(
+            std::fs::read_to_string(base.join("sessions.json")).unwrap(),
+            before,
+            "拒绝归档时索引必须一字未动（不得新建会话、不得落盘）"
+        );
+
+        // 反向控制：给它一句内容，就必须能归档
+        store
+            .append_turns("empty", &[turn_of("user", "你好")])
+            .unwrap();
+        let out = archive_current_locked(&store).unwrap();
+        assert!(out.archived, "有内容的会话必须能归档");
+        assert!(
+            store.archived().iter().any(|s| s.id == "empty"),
+            "被归档的会话应出现在归档列表里"
+        );
     }
 }

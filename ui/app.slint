@@ -3104,6 +3104,28 @@ export component SettingsWindow inherits Window {
 // 行内 markdown 由 Rust 侧解析成 Slint `styled-text`（`src/mdblocks.rs::styled`）；
 // GUI 直绑 `text: b.styled`。**不要**在 .slint 里写 `@markdown("{b.text}")`——那不是插值
 // 模板，会被当编译期常量渲染成字面量（评审 B1/B2，2026-10-13）。
+// 行内公式混排的一段（`kind == "mathp"`）：由 Rust 侧 `inlineflow` 用 parley 算好坐标，
+// 这里只按坐标绝对定位——文字仍交给 `Text`（清晰、字体一致），公式交给 `Image`（ratex SVG）。
+// 为什么不用 `HorizontalBox`/`FlexboxLayout`：Slint 的 flex 对齐里**没有 baseline**
+//（`CrossAxisAlignment` 只有 auto/stretch/start/end/center）⇒ 公式对不上文字基线。
+export struct ConvoFlowPiece {
+    is-math: bool,
+    text: string,
+    img: image,
+    x: length,
+    y: length,
+    w: length,
+    h: length,
+}
+
+// 表格的一行（整表一个块）。为什么不是「一行一个块」：列宽/该行最高单元格只有**拿到整表**才算得出来；
+// 旧版一行一个 `SysChatBlockRow` ⇒ 每行各自一个 Flickable、各自套 min 列宽，结果是左列被裁 +
+// 列间距巨大 + 各行能独立横滑（`4bb9cbb` 残留，2026-10-15 owner 实录）。
+export struct TableRow {
+    cells: [string],
+    header: bool,
+}
+
 export struct SysChatBlockRow {
     kind: string,        // role|h1|h2|h3|p|list|task|code|quote|table|hr|image|audio|video
     text: string,        // 纯文本（code 原文 / 角色名 / 表格单元格）
@@ -3117,12 +3139,33 @@ export struct SysChatBlockRow {
     checked: bool,
     marker: string,     // 列表标记（• / 1. / ☑ / ☐）——Rust 侧算好，避 Slint int→string
     lang: string,
-    cells: [string],     // 表格行单元格
+    cells: [string],     // 表格行单元格（旧字段，保留给旧用例/兼容；渲染已改用 table-rows）
     header: bool,
+    // 表格（`kind == "table"`，**整表一个块**）：`table-rows` = 全部行（含表头行）；
+    // `col-ws` = Rust 侧按字符类别估的每列宽（px）——列对齐与「行高取该行最高格」都靠它。
+    table-rows: [TableRow],
+    col-ws: [length],
     src: string,         // 图片/媒体地址（本地路径或 http(s)）
     alt: string,
     img: image,          // 已加载的图片（本地/已缓存）；未加载时为空
     img-ok: bool,        // 图片是否已成功加载（否则显示链接回退）
+    // 图片显示高用的**源宽高比**（源高/源宽）；`0` = 未知/未加载（按旧值 200px 回退）。
+    // 为什么要它：裸 `Rectangle` 不会因 `Image` 子项而长高（实测该块只向布局报 ~30px，
+    // 图片却实画 ~200px ⇒ 后面的块全被图片盖住、滞底也算不到底）。
+    img-aspect: float,
+    // 块级公式图片的**自然尺寸**（px，`kind == "math"` 且排版成功时才有意义；其余恒 0）。
+    // 与 `img-aspect` 的分工：那个用于「按气泡宽铺满」的媒体图，这两个用于「保持自然大小」
+    // 的公式图（公式不该被拉到满宽）。
+    img-w: length,
+    img-h: length,
+    // 行内公式混排（`kind == "mathp"`，见 `src/inlineflow.rs`）：
+    //   `flow` = 定位好的片段（文字/公式图）；`flow-h` = 整段高（裸容器不会被绝对定位的子项撑高）；
+    //   `flow-size` = 文字字号；`math-off`/`math-tex` = 源信息（宽变时原地重排用，见 `ui::relayout_flow_rows`）。
+    flow: [ConvoFlowPiece],
+    flow-h: length,
+    flow-size: length,
+    math-off: [int],
+    math-tex: [string],
     // 思考块（E2 需求 #11：`kind == "think"`）专用字段。默认**折叠**；`think-live` = 思考仍在
     // 进行（流式展开让打字机可见，进正文/收尾即收起）；`think-elapsed` 由 Rust 格式化（如 3.2s）。
     think-expanded: bool,
@@ -4357,42 +4400,42 @@ export component SystemChatWindow inherits Window {
                                 link-clicked(link) => { root.open-link(link); }
                             }
                         }
-                        // 表格（2026-10-15 修）：**横向可滚动 + 每列最小宽度**。
-                        // 原来把 `(可用宽 - 16) / 列数` 硬塞给每格 ⇒ 4 列 CJK 时每列仅 ~100px，
-                        // 单元格疯狂换行（行高爆炸），而且整表比窗口宽、左列被裁（只有纵向滚动）。
-                        // 现在：每列宽 = max(均分, 132px 下限)，整表放进**横向 Flickable** ——
-                        // 窄表照旧铺满，宽表可左右滑（与附件行同一手法）。
+                        // 表格（2026-10-15 重做，**整表一个块**）：
+                        // 旧版（`4bb9cbb`）一行一个 Flickable、每列固定 `max(均分,132px)` ⇒
+                        //   ① 窄内容列也占 132px 起，列间距巨大；② 每行各自横滑、互不同步；
+                        //   ③ 左侧仍有 ~30px 被裁。
+                        // 现在：列宽由 Rust 按内容估（`b.col-ws`）⇒ 短列收窄、长格换行；整表只放
+                        // **一个** Flickable，所有列一起滑；行高由该行最高格决定（用命名元素算高度，
+                        // 别指望裸 `Rectangle` 会被子 `Text` 撑高——图片块就是这么静默少报高度的）。
                         if b.kind == "table": Flickable {
                             width: 100%;
-                            // 照抄附件行的成环规避手法（见 `.slint` 里 `attach-count > 0: Flickable`）：
-                            // 用 **preferred-** 而不是 `.height/.width` 参与 content-*，避免
-                            // 「Flickable ⇄ 子布局」互相求值（编译期 binding loop）。
-                            height: tbl-row.preferred-height;
-                            // 宽度用**显式行宽**（preferred-width 可能小于被 max() 撑开的实际行宽，
-                            // 那会让 Flickable 自认内容更窄 ⇒ 视觉上左列被裁）。
-                            content-width: tbl-row.width;
-                            content-height: tbl-row.preferred-height;
+                            // preferred- 而不是 .width/.height 参与 content-*（与附件行同款，
+                            // 避免「Flickable ⇄ 子布局」互相求值成环）。
+                            height: tbl-grid.preferred-height;
+                            content-width: tbl-grid.preferred-width;
+                            content-height: tbl-grid.preferred-height;
                             interactive: true;
-                            tbl-row := HorizontalBox {
-                                // **必须显式给宽**：布局默认吃父宽 ⇒ 与 Flickable 的 content-width 成环
-                                // （编译期就报 binding loop）。行宽 = 列数 × 每列宽（spacing 0）。
-                                width: b.cells.length
-                                    * max((root.convo-text-width - 16px) / b.cells.length, 132px);
+                            tbl-grid := VerticalBox {
                                 spacing: 0px;
-                                for c in b.cells: Rectangle {
-                                    background: b.header ? PixelTheme.bg : transparent;
-                                    border-width: 1px;
-                                    border-color: PixelTheme.edge;
-                                    // 单元格按纯文本渲染（行内样式在表内不保证，见 mdblocks 注释）
-                                    Text {
-                                        text: c;
-                                        font-size: 12px;
-                                        color: PixelTheme.text;
-                                        wrap: word-wrap;
-                                        width: max(
-                                            (root.convo-text-width - 16px) / b.cells.length,
-                                            132px
-                                        );
+                                for trow in b.table-rows: HorizontalBox {
+                                    spacing: 0px;
+                                    for cell[ci] in trow.cells: Rectangle {
+                                        width: b.col-ws[ci];
+                                        // 撑到该行最高格（否则短格边框短一截，格子看起来错位）。
+                                        vertical-stretch: 1;
+                                        height: cell-txt.preferred-height + 8px;
+                                        background: trow.header ? PixelTheme.bg : transparent;
+                                        border-width: 1px;
+                                        border-color: PixelTheme.edge;
+                                        // 单元格按纯文本渲染（行内样式在表内不保证，见 mdblocks 注释）
+                                        cell-txt := Text {
+                                            x: 5px;
+                                            width: b.col-ws[ci] - 10px;
+                                            text: cell;
+                                            font-size: 12px;
+                                            color: PixelTheme.text;
+                                            wrap: word-wrap;
+                                        }
                                     }
                                 }
                             }
@@ -4402,19 +4445,69 @@ export component SystemChatWindow inherits Window {
                             height: 2px;
                             background: PixelTheme.edge;
                         }
-                        if b.kind == "image": Rectangle {
+                        // 数学（块级 `$$…$$`）：**真排版**（KaTeX 的 Rust 移植，见图 `src/mathrender.rs`）。
+                        // 失败时（`img-ok` 假）回落等宽源码：公式排不出来最多不好看，**不能少字**。
+                        // 行内公式仍走行内码（`.slint` 的文字流里放不进图片，见 mathrender 顶注）。
+                        if b.kind == "math" && b.img-ok: Rectangle {
+                            width: 100%;
+                            // 自然尺寸显示；过宽时等比缩到气泡内（`img-aspect` = 高/宽）。
+                            height: math-img.height + 12px;
+                            background: PixelTheme.bg;
+                            border-radius: 6px;
+                            math-img := Image {
+                                source: b.img;
+                                width: min(b.img-w, root.convo-text-width - 16px);
+                                height: self.width * b.img-aspect;
+                                x: (parent.width - self.width) / 2;
+                                y: 6px;
+                                image-fit: contain;
+                            }
+                        }
+                        // 排版失败/markdown 里混了非法 TeX ⇒ 等宽显示原始 TeX（至少不丢内容）。
+                        if b.kind == "math" && !b.img-ok: Rectangle {
+                            width: 100%;
+                            height: math-txt.preferred-height + 16px;
+                            background: PixelTheme.bg;
+                            border-radius: 6px;
+                            math-txt := Text {
+                                x: 8px;
+                                width: root.convo-text-width - 16px;
+                                text: b.text;
+                                font-family: "ui-monospace, Menlo, Consolas, monospace";
+                                font-size: 12.5px;
+                                color: PixelTheme.text;
+                                horizontal-alignment: center;
+                                wrap: word-wrap;
+                            }
+                        }
+                        // 图片（2026-10-15 修）：裸 `Rectangle` 不会被子 `Image` 撑高（实测该块只向
+                        // 布局报 ~30px，图片却实画 ~200px ⇒ 后面的文字被图片盖住、滞底也算不到底）。
+                        // 现在高度显式由「视口宽 × 源宽高比」算，夹在 [120, 360]；未知比例回落 200px。
+                        // 设计稿 `.media img{width:100%;height:auto}` 的口径 = 按比例、不裁剪（contain）。
+                        if b.kind == "image" && b.img-ok: Rectangle {
+                            width: 100%;
+                            height: max(
+                                120px,
+                                min(360px, root.convo-text-width * b.img-aspect)
+                            );
+                            border-width: 2px;
+                            border-color: PixelTheme.edge;
+                            border-radius: 6px;
+                            background: PixelTheme.bg;
+                            Image {
+                                source: b.img;
+                                width: 100%;
+                                height: 100%;
+                                image-fit: contain;
+                            }
+                        }
+                        if b.kind == "image" && !b.img-ok: Rectangle {
                             width: 100%;
                             border-width: 2px;
                             border-color: PixelTheme.edge;
                             border-radius: 6px;
                             background: PixelTheme.bg;
-                            if b.img-ok: Image {
-                                source: b.img;
-                                width: 100%;
-                                height: 200px;
-                                image-fit: contain;
-                            }
-                            if !b.img-ok: HorizontalBox {
+                            HorizontalBox {
                                 padding: 8px;
                                 spacing: 8px;
                                 Text {
@@ -4464,6 +4557,30 @@ export component SystemChatWindow inherits Window {
                         }
                         if b.kind == "p" && b.selectable: ConvoSelectableText {
                             body: b.plain;  avail: root.convo-text-width;  size: 13px;
+                        }
+                        // 含行内公式的段落（`mathp`）：坐标由 Rust 用 parley 混排（见 inlineflow.rs），
+                        // 这里只绝对定位。整段是一个图/字混排的盒子，**不可拖选**（owner 已确认取舍）。
+                        if b.kind == "mathp": Rectangle {
+                            width: 100%;
+                            height: b.flow-h;
+                            for p in b.flow: Rectangle {
+                                x: p.x;
+                                y: p.y;
+                                width: p.w;
+                                height: p.h;
+                                if !p.is-math: Text {
+                                    text: p.text;
+                                    font-size: b.flow-size;
+                                    color: PixelTheme.text;
+                                    wrap: no-wrap;
+                                }
+                                if p.is-math: Image {
+                                    source: p.img;
+                                    width: 100%;
+                                    height: 100%;
+                                    image-fit: contain;
+                                }
+                            }
                         }
                         if b.kind == "p" && !b.selectable: StyledText {
                             width: root.convo-text-width;   // 见本区顶部注释
