@@ -212,6 +212,17 @@ after#2 = 0,231 520×560
    （重点怀疑 `FollowPump`/开窗锚定/`KEEP_VISIBLE` 复显）；
 3. 收口方向：让「最大化/自管缩放」成为**唯一**允许写对话窗几何的路径（缩放会话期间其余让路，D4 已有 `paused`）。
 
+**❌ 2026-10-15 15:45 去掉气泡跟随（owner 口径）后 ⤢ 仍不落地**：`ABB_VERIFY_TOGGLE_MAX=1`
+（`vis=true active=true`）→ `next=0,33,1470×923`，`after=0,231,520×560` ⇒ **跟随不是元凶**。
+另外注意一个**强线索**：请求 `y=33`，实测落在 **y=231**（差 198）——**位置也没按请求落地，且差值是常数**
+⇒ 高度怀疑**坐标系口径不一致**（`work` 来自 AppKit 的 `visibleFrame`，而 `set_position` 是 winit 的
+左上原点；两者若混用，位置会整体偏移，尺寸则可能被 macOS 按「新位置放不下」的旧逻辑夹住）。
+**下一步（优先级从这开始）**：先把 `work=(0,33,1470,923)` 这个矩形**用三种口径各打印一次**
+（AppKit `frame`/`visibleFrame`、winit `current_monitor().position()/size()`、`primary_monitor().size()`），
+对齐到同一坐标系再写；这一步没做之前，任何几何写入的读数都别当结论。
+**本轮已按 owner 口径改掉的**：① **气泡跟随整体去掉**（`FollowPump` 不再驱动任何几何，只保留事件记录）；
+② **气泡与对话框互斥**（开窗藏气泡、失焦/关窗后气泡回来——`bubble_visible(enabled, dialog_visible)`）。
+
 **下一步（强烈建议新开会话做，二十分钟能定性）**：
 1. 在 `apply_window_rect_atomic` 已删的现状下，给**所有** `set_size`/`set_position`/`setFrame` 调用点
    加带 tag 的日志（谁写的、写的什么值），再跑 `ABB_VERIFY_TOGGLE_MAX=1` ⇒ 一眼看出**是谁把窗口写回 0,231/520×560**；

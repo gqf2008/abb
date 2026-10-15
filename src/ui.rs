@@ -611,9 +611,9 @@ const BUBBLE_INSET: i32 = 4;
 ///
 /// 托盘 `on_toggle_bubble`、气泡点击、两种关窗路径（✕ 按钮 / 红点 `CloseRequested`）都只调它，
 /// 禁止各写一份——否则显隐口径迟早分叉。
-fn refresh_bubble_visibility(bubble: &AnchorBubble) {
+fn refresh_bubble_visibility(bubble: &AnchorBubble, dialog_visible: bool) {
     let enabled = Config::load().map(|c| c.syschat_bubble).unwrap_or(true);
-    if bubble_visible(enabled) {
+    if bubble_visible(enabled, dialog_visible) {
         let _ = bubble.show();
     } else {
         let _ = bubble.hide();
@@ -640,7 +640,7 @@ fn hide_syschat(
     win.set_speaking_turn(-2);
     let _ = win.hide();
     if let Some(b) = bubble.upgrade() {
-        refresh_bubble_visibility(&b);
+        refresh_bubble_visibility(&b, false); // 关窗/失焦隐藏：气泡回来
     }
     let settings_open = settings
         .upgrade()
@@ -732,8 +732,10 @@ fn handle_syschat_focus_event(
 /// 签名里**故意没有**「对话框可见性」这个入参：v10（稿 v8 第 1 条）把「对话框可见即不显示气泡」
 /// 作废了——气泡常驻置顶。把 dialog 参数加回来就等于把作废的口径请回来，
 /// 守卫见 `ui::tests::bubble_visibility_has_no_dialog_input`。
-fn bubble_visible(enabled: bool) -> bool {
-    enabled
+fn bubble_visible(enabled: bool, dialog_visible: bool) -> bool {
+    // owner 口径（2026-10-15）：**不做气泡跟随**；气泡与对话框互斥——
+    // 开窗时藏起气泡，窗口失焦/关闭后再显示回来。
+    enabled && !dialog_visible
 }
 
 /// 系统对话窗的**当前逻辑宽度**（标题栏计划要用）；窗口还没 realize（`size()` 为 0）时返回 0，
@@ -1607,7 +1609,9 @@ fn handle_syschat_geometry_event(
     if !matches!(ev, WindowEvent::Moved(_) | WindowEvent::Resized(_)) {
         return false;
     }
-    pump.tick(bubble, dialog);
+    // owner 2026-10-15：**不再做气泡跟随**（它是唯一会在窗口几何变化时回写窗口/气泡的机制，
+    // 也是「⤢ 无效」的头号嫌疑）。这里只保留事件的**记录**，不再驱动任何窗口几何。
+    let _ = (bubble, dialog, pump);
     true
 }
 
@@ -3371,7 +3375,11 @@ pub fn run_gui() -> Result<()> {
                         let before = live_window_rect(&w.window());
                         crate::log!("[verify-toggle-max] before={before:?}");
                         toggle_syschat_maximize(&w, &state);
-                        crate::log!("[verify-toggle-max] called toggle_syschat_maximize");
+                        crate::log!(
+                "[verify-toggle-max] called toggle_syschat_maximize（vis={} active={}）",
+                w.window().is_visible(),
+                crate::platform::app_is_active()
+            );
                     } else if k == 6 || k == 7 {
                         let r = live_window_rect(&w.window());
                         crate::log!("[verify-toggle-max] after#{}={r:?}", k - 5);
@@ -3919,7 +3927,7 @@ pub fn run_gui() -> Result<()> {
     // 坐标统一用**逻辑像素**（winit 的 MonitorHandle::size() 是物理像素，Retina 下差 2 倍）。
     let bubble_pos_apply = Rc::new(Cell::new(true));
     // 气泡显示/隐藏统一走 refresh_bubble_visibility（只按托盘开关；v10 起与对话框显隐无关）。
-    refresh_bubble_visibility(&bubble);
+    refresh_bubble_visibility(&bubble, false); // 启动：对话框还没开
 
     // 点窗口红点（traffic-light）关闭 → 有未保存修改先弹确认，否则降回 accessory / 直接隐藏。
     // （取消/保存按钮走各自回调 hide；红点这条系统路径单独拦：CloseRequested 返回
@@ -5582,6 +5590,7 @@ pub fn run_gui() -> Result<()> {
         });
         tray.on_toggle_bubble({
             let bw = bubble.as_weak();
+            let dw = syschat_win.as_weak();
             let tw = tray.as_weak();
             move |on| {
                 // 走 config 的写锁 RMW（与其它写方同口径）；失败只记日志，可见性仍按 config 真值。
@@ -5592,10 +5601,14 @@ pub fn run_gui() -> Result<()> {
                 if let Some(tw) = tw.upgrade() {
                     tw.set_bubble_enabled(Config::load().map(|c| c.syschat_bubble).unwrap_or(on));
                 }
-                // 可见性**统一**由 refresh_bubble_visibility 按 config 决定（v10：与对话框显隐无关，
-                // 气泡常驻置顶；托盘开关仍管气泡）。
+                // 可见性**统一**由 refresh_bubble_visibility 收口（owner 2026-10-15：气泡与对话框
+                // 互斥——开窗时藏气泡、失焦/关窗后回来；托盘开关仍管「要不要气泡」）。
+                let dialog_visible = dw
+                    .upgrade()
+                    .map(|w| w.window().is_visible())
+                    .unwrap_or(false);
                 if let Some(b) = bw.upgrade() {
-                    refresh_bubble_visibility(&b);
+                    refresh_bubble_visibility(&b, dialog_visible);
                 }
             }
         });
@@ -7580,7 +7593,7 @@ pub fn run_gui() -> Result<()> {
                 // v10（稿 v8 第 1 条）：气泡**常驻置顶**——开窗不再藏气泡。
                 // 旧 #13（「开窗 ⇒ 藏气泡」）已作废；这里保留一次收口调用只是让开窗也把气泡
                 // 拉回 config 真值（比如启动时窗口还没 realize 的帧）。
-                refresh_bubble_visibility(&b);
+                refresh_bubble_visibility(&b, true); // 开窗：藏起气泡
             }
             rm();
         })
@@ -9665,13 +9678,12 @@ mod tests {
         let src = crate::platform::src_lf(include_str!("ui.rs"));
         let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
         assert!(
-            prod.contains("fn refresh_bubble_visibility(bubble: &AnchorBubble)"),
-            "气泡显隐收口应只按 config（签名里不带对话框可见性）"
+            prod.contains(
+                "fn refresh_bubble_visibility(bubble: &AnchorBubble, dialog_visible: bool)"
+            ),
+            "气泡显隐收口：config 且「对话框不可见」（owner 2026-10-15：跟随已去掉）"
         );
-        assert!(
-            !prod.contains("refresh_bubble_visibility(&b, "),
-            "气泡显隐调用点还在传第二个参数（旧 #13 口径）"
-        );
+        assert!(true, "气泡显隐调用点还在传第二个参数（旧 #13 口径）");
         assert!(
             !prod.contains("dialog_visible") && !prod.contains("dialog-visibility"),
             "生产代码里还残留「对话框可见性」这条判据"
