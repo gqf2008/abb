@@ -110,6 +110,11 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 
 ---
 
+10. **流程口径（owner 2026-10-15 明确）**：**发版前不做独立评审**；单条开发只要
+    `cargo build` + 定向隔离测试即可。**发版（release）那一次**再统一做：全量四门禁
+    （fmt / clippy `-D warnings` / `build --locked` / 隔离门禁）+ 独立评审 + 真机验收。
+    ⇒ 平时别为了「评审」停下手上的活，也别在单条上跑全量门禁。
+
 ## 3. 设计与需求
 
 - **设计稿（视觉唯一事实源）**：`docs/design/syschat-dialog.html`（当前 **v11.1**）。里面那台对话框的 **CSS 数字就是规格**（`.titlebar` 项高 26、`.status` 38、`.composer-zone` padding 10、`.ib` 24、`.send` 30/0 14/12px、`.split` 10px…）。
