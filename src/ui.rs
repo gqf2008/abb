@@ -731,7 +731,7 @@ fn handle_syschat_focus_event(
 ///
 /// 签名里**故意没有**「对话框可见性」这个入参：v10（稿 v8 第 1 条）把「对话框可见即不显示气泡」
 /// 作废了——气泡常驻置顶。把 dialog 参数加回来就等于把作废的口径请回来，
-/// 守卫见 `ui::tests::bubble_visibility_has_no_dialog_input`。
+/// 守卫见 `ui::tests::bubble_visibility_is_mutually_exclusive_with_dialog`。
 fn bubble_visible(enabled: bool, dialog_visible: bool) -> bool {
     // owner 口径（2026-10-15）：**不做气泡跟随**；气泡与对话框互斥——
     // 开窗时藏起气泡，窗口失焦/关闭后再显示回来。
@@ -9687,13 +9687,13 @@ mod tests {
     /// v10（稿 v8 第 1 条）「气泡常驻置顶」：显隐只看托盘开关，**不再看对话框是否可见**。
     ///
     /// 判别力（负向）：
-    /// 1. 把 `bubble_visible` 改成 `enabled && !dialog_visible`（旧 #13 口径）⇒ 行为断言必红；
-    /// 2. 把对话框可见性加回收口签名 / 调用点 ⇒ 结构守卫必红。
+    /// owner 口径（2026-10-15）：**开窗时藏气泡，失焦/关窗后显气泡**。
+    /// 变异：把判据改成只看 `enabled`（旧「常驻置顶」口径）⇒ 下面第 2/3 条必红。
     #[test]
-    fn bubble_visibility_has_no_dialog_input() {
-        // 行为：开关开 ⇒ 显示；关 ⇒ 不显示（没有第三个输入）。
-        assert!(bubble_visible(true));
-        assert!(!bubble_visible(false));
+    fn bubble_visibility_is_mutually_exclusive_with_dialog() {
+        assert!(bubble_visible(true, false), "开关开 + 窗口未开 ⇒ 显示气泡");
+        assert!(!bubble_visible(true, true), "窗口开着 ⇒ 藏气泡");
+        assert!(!bubble_visible(false, false), "开关关 ⇒ 永不显示");
         // 结构：只扫**生产代码**（`mod tests` 之前）——测试自己的字面量不能当证据。
         let src = crate::platform::src_lf(include_str!("ui.rs"));
         let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
@@ -9703,10 +9703,13 @@ mod tests {
             ),
             "气泡显隐收口：config 且「对话框不可见」（owner 2026-10-15：跟随已去掉）"
         );
-        assert!(true, "气泡显隐调用点还在传第二个参数（旧 #13 口径）");
+        // 四个调用点各自把「对话框当前是否可见」传进来（开窗必须传 true，关窗/失焦必须传 false）
+        // ——任一调用点漏传/传反，这条就会红。
         assert!(
-            !prod.contains("dialog_visible") && !prod.contains("dialog-visibility"),
-            "生产代码里还残留「对话框可见性」这条判据"
+            prod.contains("refresh_bubble_visibility(&b, true)")
+                && prod.matches("refresh_bubble_visibility(&b, false)").count() >= 1
+                && prod.contains("refresh_bubble_visibility(&bubble, false)"),
+            "开窗藏气泡（true）、关窗/失焦/启动显气泡（false）三条调用点必须都在"
         );
     }
 
