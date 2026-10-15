@@ -1430,29 +1430,6 @@ impl Default for SelfResize {
 /// 位置取 `outer_position`、尺寸取 `inner_size`（与 [`logical_window_rect`] 同口径）：本窗是
 /// `no-frame: true` ⇒ 内外同框；另外 winit 的 `CursorMoved.position` 也是相对**视图**的
 /// （`event.locationInWindow()`），所以两者相加才是同一个坐标系的屏幕坐标。
-/// **原子**设置窗口外框：macOS 走 `platform::set_window_frame`（一次 `setFrame:display:`）；
-/// 其它平台返回 `false`，调用方回落「先尺寸/先位置」的两步写法。
-///
-/// 为什么需要它：实测（本文件自管缩放与最大化两处的注释）macOS 上同一拍里
-/// `set_size` + `set_position` 会**互相打架**（目标矩形在当前位置放不下时 resize 被拒 ⇒
-/// 表现为「⤢ 无效」「拖动发飘」）。一次 `setFrame:` 同时落位置与尺寸，正是系统绿点/拖拽
-/// 自己走的路。须在主线程（AppKit 非线程安全）——调用点都在 UI 线程。
-fn apply_window_rect_atomic(win: &slint::Window, r: &crate::syschat::WinRect) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        use slint::winit_030::WinitWindowAccessor;
-        win.with_winit_window(|w| {
-            crate::platform::set_window_frame(w, r.x as f32, r.y as f32, r.w as f32, r.h as f32)
-        })
-        .unwrap_or(false)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (win, r);
-        false
-    }
-}
-
 fn live_window_rect(win: &slint::Window) -> Option<crate::syschat::WinRect> {
     use slint::winit_030::WinitWindowAccessor;
     let sf = win.scale_factor();
@@ -1553,11 +1530,6 @@ impl SelfResize {
         // 两个连调 ⇒ 尺寸不变、位置也不对）。所以位置**没变就不写**：east/south 拖动根本不
         // 动原点，这条最常见路径退化为纯 set_size；要动原点的方向（north/west/角）由下一拍
         // 的位置写回补（拖拽是连续事件，一帧的滞后肉眼不可见）。
-        // 首选**原子落地**（上面那段「两个请求互相打架」的根治手段）：macOS 一次 setFrame，
-        // 尺寸与位置一起生效；拿不到原生句柄（非 macOS / 窗口未 realize）才回落到两步写法。
-        if apply_window_rect_atomic(win, &next) {
-            return true;
-        }
         let pos_same = (next.x - rect_now.x).abs() < 0.5 && (next.y - rect_now.y).abs() < 0.5;
         win.set_size(slint::LogicalSize::new(next.w, next.h));
         if !pos_same {
@@ -1605,14 +1577,6 @@ fn toggle_syschat_maximize(win: &SystemChatWindow, state: &RefCell<crate::syscha
     // 当前位置放不下（例如从 (475,124) 直接铺 1470×923）⇒ macOS 会拒绝这次 resize 并只做
     // 夹取移动——窗口尺寸纹丝不动，正是「⤢ 无效」的根因。先把原点挪到工作区左上，再放大，
     // 目标矩形就放得下；两个请求都生效。
-    // 首选**原子落地**（macOS 一次 `setFrame:`）：位置与尺寸一起落，不会被拒、也不会被夹取。
-    let atomic_ok = apply_window_rect_atomic(&w, &next);
-    if std::env::var("ABB_VERIFY_TOGGLE_MAX").is_ok() {
-        crate::log!("[verify-toggle-max] atomic_setFrame_ok={atomic_ok}");
-    }
-    if atomic_ok {
-        return;
-    }
     w.set_position(slint::LogicalPosition::new(next.x, next.y));
     // 尺寸挪到下一轮事件循环：同一拍里「挪到位 + 放大」仍会被 macOS 拒掉（实测两种顺序都不行）。
     // 先让位置落地（小窗在工作区左上放得下），下一拍再放大，目标矩形才放得下。
