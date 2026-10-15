@@ -3389,6 +3389,47 @@ pub fn run_gui() -> Result<()> {
     // 开窗尺寸夹到 min，而标题栏控件条的首帧是按默认宽算的（D 批那个坑）。仅断言，不参与逻辑。
     debug_assert!(crate::syschat::SYSCHAT_PREFERRED_WIDTH >= crate::syschat::SYSCHAT_MIN_W);
     debug_assert!(crate::syschat::SYSCHAT_DEFAULT_H >= crate::syschat::SYSCHAT_MIN_H);
+    // **对照实验**（`ABB_VERIFY_SETTINGS=1`）：对**设置窗**做与对话窗一模一样的写入实验。
+    // owner 的疑问「设置窗为什么可以（缩放）？」只能靠对照来回答：同样的 `set_size`，
+    // 若设置窗落地、对话窗不落地 ⇒ 差别在对话窗自己的其它写方；若两边都不落地 ⇒
+    // 「设置窗可以」是旧版印象。全程不需要人工点击。
+    if std::env::var("ABB_VERIFY_SETTINGS").is_ok() {
+        use slint::winit_030::WinitWindowAccessor;
+        show_window_and_focus(&settings);
+        let sw = settings.as_weak();
+        let t = Rc::new(slint::Timer::default());
+        let ticks = Rc::new(Cell::new(0u32));
+        t.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(500),
+            move || {
+                let n = ticks.get() + 1;
+                ticks.set(n);
+                let Some(w) = sw.upgrade() else { return };
+                let facts = w
+                    .window()
+                    .with_winit_window(|x| (x.is_resizable(), x.is_decorated(), x.inner_size()));
+                crate::log!(
+                    "[verify-settings] t={}ms facts={facts:?} size={:?}",
+                    n * 500,
+                    w.window().size()
+                );
+                match n {
+                    // 2.5s：请求 1000×700（都在 min 880×620 之上）
+                    5 => {
+                        w.window().set_size(slint::LogicalSize::new(1000.0, 700.0));
+                        crate::log!("[verify-settings] 已请求 set_size(1000,700)");
+                    }
+                    7 | 9 => {
+                        crate::log!("[verify-settings] 回读 after: {:?}", w.window().size());
+                    }
+                    _ => {}
+                }
+            },
+        );
+        std::mem::forget(t);
+    }
+
     slint_pixel::install_title_bar_controls_no_quit(&syschat_win);
     // v11c：`⤢` 在 macOS 上**自己实现**（`set_maximized` 对 no-frame 窗不可靠：「最大化后被
     // size 拉回」、`is_maximized()` 也跟不上自管尺寸，见 [`toggle_syschat_maximize`]）。
