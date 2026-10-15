@@ -1585,7 +1585,18 @@ fn toggle_syschat_maximize(win: &SystemChatWindow, state: &RefCell<crate::syscha
     let weak = win.as_weak();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(w) = weak.upgrade() {
+            // 探针：证明这一拍真的跑了、写的什么、写完窗口是什么（⤢ 定位用）。
             w.window().set_size(slint::LogicalSize::new(next.w, next.h));
+            if std::env::var("ABB_VERIFY_TOGGLE_MAX").is_ok() {
+                crate::log!(
+                    "[verify-toggle-max] 下一拍已 set_size({},{}) → 现 size={:?}",
+                    next.w,
+                    next.h,
+                    w.window().size()
+                );
+            }
+        } else if std::env::var("ABB_VERIFY_TOGGLE_MAX").is_ok() {
+            crate::log!("[verify-toggle-max] 下一拍 upgrade 失败（窗口已 drop）");
         }
     });
 }

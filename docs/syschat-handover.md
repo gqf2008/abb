@@ -220,6 +220,27 @@ after#2 = 0,231 520×560
 **下一步（优先级从这开始）**：先把 `work=(0,33,1470,923)` 这个矩形**用三种口径各打印一次**
 （AppKit `frame`/`visibleFrame`、winit `current_monitor().position()/size()`、`primary_monitor().size()`），
 对齐到同一坐标系再写；这一步没做之前，任何几何写入的读数都别当结论。
+**🔑 2026-10-15 15:55 决定性读数（这一条把范围缩到最小）**：
+```
+[verify-set-size] work-area visible=Some((0.0,33.0,1470.0,923.0)) monitor=Some((0,0,1470,956))
+[verify-set-size] before=Some(0,124 520×560)  physical=1040×1120
+[verify-set-size] requested logical 1470x923
+[verify-set-size] after#1=Some(0,**231** 520×560) physical=1040×1120   ← 只 set_size，却**位置动了**(124→231)
+[verify-set-size] after#2=Some(0,231 520×560)
+[verify-toggle-max] 下一拍已 set_size(1470,923) → 现 size=PhysicalSize{1040,1120}   ← 写进去了、无效
+```
+1. **`Window::set_size` 对对话窗是彻底 no-op**（尺寸一次都没变过），而同 API 在**设置窗**上有效
+   （`1000×700` → 落地并保持）⇒ **不是平台问题，是这张窗自己的状态**。
+2. **只要 `set_size`，位置却会变**（124→231）⇒ 说明**另有一条路径在根据「尺寸变化」重摆窗口**，
+   而且**尺寸写本身被丢掉了**。⇒ 最可能：这张窗的 Slint/winit 侧尺寸被**固定/绑定**（或它的
+   `min==max` 之类被当成不可缩放），任何 `set_size` 都被忽略，而重摆那条路照常跑。
+3. 两窗 `.slint` 的尺寸属性**表面一致**（`no-frame` + `preferred-*` + `min-*`，都无 `max-*`）；
+   **下一步（最省事）**：把设置窗与对话窗的**窗口级声明逐行 diff**（含 `callback self-resize-begin`
+   / `resize-hit-areas` / `resize-self-managed` 三个属性各自声明在**组件内哪个位置**——对话窗那三个
+   是在 `Rectangle` 之后才声明的，设置窗在 `Rectangle` 之前，**声明位置不同**可能让 Slint 的
+   窗口属性求值顺序不同）；或者干脆**把对话窗的窗口级声明整段换成设置窗那份**（只改 min 值），
+   这是「路 1 照抄」的最小可用形态。
+
 **本轮已按 owner 口径改掉的**：① **气泡跟随整体去掉**（`FollowPump` 不再驱动任何几何，只保留事件记录）；
 ② **气泡与对话框互斥**（开窗藏气泡、失焦/关窗后气泡回来——`bubble_visible(enabled, dialog_visible)`）。
 
