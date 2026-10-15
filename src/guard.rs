@@ -1257,8 +1257,8 @@ mod tests {
     use super::*;
 
     /// 建临时 guard 环境（真实目录，canonicalize 可用）：返回 (ws 根, ws, guard)。
-    fn temp_guard_env() -> (PathBuf, PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("abb-guard-test-{}", uuid::Uuid::new_v4()));
+    fn temp_guard_env() -> (crate::testtmp::TempPath, PathBuf, PathBuf) {
+        let root = crate::testtmp::TempPath::new("abb-guard-test");
         let ws = root.join("ws");
         std::fs::create_dir_all(ws.join("sub")).unwrap();
         std::fs::create_dir_all(root.join("outside")).unwrap();
@@ -1277,7 +1277,7 @@ mod tests {
     /// 错误文案因此不能混成一句。
     #[test]
     fn workspace_resolution_distinguishes_missing_workspace_from_unknown_key() {
-        let root = std::env::temp_dir().join(format!("abb-guard-miss-{}", uuid::Uuid::new_v4()));
+        let root = crate::testtmp::TempPath::new("abb-guard-miss");
         let mut cfg = crate::config::Config::default();
         cfg.bots = vec![crate::config::BotConfig {
             name: "显示名".to_string(),
@@ -1309,7 +1309,7 @@ mod tests {
 
     #[test]
     fn workspace_resolution_rejects_unsafe_alias_before_touching_temp_root() {
-        let root = std::env::temp_dir().join(format!("abb-guard-key-{}", uuid::Uuid::new_v4()));
+        let root = crate::testtmp::TempPath::new("abb-guard-key");
         let mut cfg = crate::config::Config::default();
         cfg.bots = vec![crate::config::BotConfig {
             name: "显示名".to_string(),
@@ -1381,7 +1381,7 @@ mod tests {
 
     #[test]
     fn owner_guard_files_written_with_bash_matcher() {
-        let root = std::env::temp_dir().join(format!("abb-guard-owner-{}", uuid::Uuid::new_v4()));
+        let root = crate::testtmp::TempPath::new("abb-guard-owner");
         let exe = root.join("abb.exe");
         std::fs::create_dir_all(&root).unwrap();
         ensure_owner_guard_files_at(&root, &exe).unwrap();
@@ -1403,8 +1403,8 @@ mod tests {
     }
 
     /// 删除保护单测环境：临时工作区（canonical 化，对齐 guard 的 canonical 判定）+ 子目录。
-    fn owner_delete_env() -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("abb-trash-guard-{}", uuid::Uuid::new_v4()));
+    fn owner_delete_env() -> (crate::testtmp::TempPath, PathBuf) {
+        let root = crate::testtmp::TempPath::new("abb-trash-guard");
         let ws = root.join("ws");
         std::fs::create_dir_all(ws.join("sub")).unwrap();
         (root, std::fs::canonicalize(&ws).unwrap())
@@ -2244,7 +2244,7 @@ mod tests {
     fn guard_write_skips_unchanged_content() {
         // #170：内容相同跳过写盘（消除并发 rename 竞争窗口）。验证：同内容重复写
         // 不触发写盘（mtime 不变）；内容变化（exe 路径变更）才写。
-        let guard = std::env::temp_dir().join(format!("abb-guard-skip-{}", uuid::Uuid::new_v4()));
+        let guard = crate::testtmp::TempPath::new("abb-guard-skip");
         std::fs::create_dir_all(&guard).unwrap();
         let path = guard.join("settings.json");
 
@@ -2280,7 +2280,7 @@ mod tests {
         // 若调用点被改回无条件原子写（#170 bug 形态），第二次调用会重写文件、
         // mtime 前进 → 断言失败（NTFS/APFS 粒度足够；粗粒度文件系统上此断言
         // 至多退化为恒真，不会误报失败）。
-        let root = std::env::temp_dir().join(format!("abb-guard-skip-at-{}", uuid::Uuid::new_v4()));
+        let root = crate::testtmp::TempPath::new("abb-guard-skip-at");
         let guard = root.join("guard");
         std::fs::create_dir_all(&guard).unwrap();
         let exe = Path::new("C:/Program Files/ABB/abb.exe");

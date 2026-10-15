@@ -111,4 +111,6 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo build --locked
 tools/check_test_isolation.sh
-echo "✅ 四条门禁全绿；checkout 内未产生 target/（中间产物在 ${CARGO_TARGET_DIR}）"
+# 兜底：清掉 TMPDIR 里陈旧的测试夹具（见脚本头注；根因修复在 src/testtmp.rs 的 RAII 归属）。
+tools/clean_test_fixtures.sh
+echo "✅ 四条门禁全绿；checkout 内未产生 target/（中间产物在 ${CARGO_TARGET_DIR}）；测试夹具残留已清扫"

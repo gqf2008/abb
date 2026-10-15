@@ -66,6 +66,8 @@ mod task_store;
 mod teambuilder;
 mod teamflow;
 mod teamreg;
+#[cfg(test)]
+mod testtmp;
 mod tidy;
 mod trash;
 mod ui;

@@ -1636,8 +1636,8 @@ mod tests {
     use crate::task_store::{CreatedBy, TaskDelivery, TaskLimits, TaskPayload, TaskTrigger};
 
     /// 每个用例一个 temp 根目录：**绝不碰用户真实的 `~/.agent-bridge`**。
-    fn tmp_root(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("abb-task-test-{tag}-{}", uuid::Uuid::new_v4()));
+    fn tmp_root(tag: &str) -> crate::testtmp::TempPath {
+        let p = crate::testtmp::TempPath::new(&format!("abb-task-test-{tag}"));
         let _ = std::fs::create_dir_all(&p);
         p
     }
@@ -3600,7 +3600,7 @@ mod tests {
             std::collections::HashMap::new(),
             None,
         ));
-        let rec = std::env::temp_dir().join(format!("abb-task-lf-{}.jsonl", uuid::Uuid::new_v4()));
+        let rec = crate::testtmp::TempPath::file("abb-task-lf", "jsonl");
         let stop = tokio_util::sync::CancellationToken::new();
         run_attempt(
             bot,
@@ -4035,7 +4035,7 @@ mod tests {
         // ——这同时验证了「默认回创建者」不需要打开跨会话投递。
         let router = Arc::new(Router::new(false, msgs, bots, None));
 
-        let rec = std::env::temp_dir().join(format!("abb-task-e2e-{}.jsonl", uuid::Uuid::new_v4()));
+        let rec = crate::testtmp::TempPath::file("abb-task-e2e", "jsonl");
         let stop = tokio_util::sync::CancellationToken::new();
         run_attempt(
             bot,
@@ -4194,8 +4194,7 @@ mod tests {
         );
         let router = Arc::new(Router::new(false, msgs, bots, None));
 
-        let rec =
-            std::env::temp_dir().join(format!("abb-task-cancel-{}.jsonl", uuid::Uuid::new_v4()));
+        let rec = crate::testtmp::TempPath::file("abb-task-cancel", "jsonl");
         // 让 mock agent 记录 prompt 之后延迟应答：造出确定的「已进 agent、尚未收尾」
         // 窗口，取消请求才有东西可打断（否则 mock 快到请求写下去时这轮已经跑完了）。
         let mut cfg = mock_cfg(&rec);
@@ -4205,7 +4204,8 @@ mod tests {
 
         // 取消请求由另一个任务在「这轮真的进了 agent」之后投递（= 跑到一半取消）；
         // 主流程前台跑 `run_attempt`，这样 `states` 不必跨任务移动。
-        let rec_for_watch = rec.clone();
+        // 夹具的归属留在本用例（TempPath），watcher 只借走路径副本：
+        let rec_for_watch = rec.path().to_path_buf();
         let req = paths.cancel_file("tk_slow");
         let watcher = tokio::spawn(async move {
             let mut waited_ms = 0u64;
@@ -4300,8 +4300,7 @@ mod tests {
         );
         let router = Arc::new(Router::new(false, msgs, bots, None));
 
-        let rec =
-            std::env::temp_dir().join(format!("abb-task-alert-{}.jsonl", uuid::Uuid::new_v4()));
+        let rec = crate::testtmp::TempPath::file("abb-task-alert", "jsonl");
         let stop = tokio_util::sync::CancellationToken::new();
         run_attempt(
             bot,
