@@ -2494,16 +2494,38 @@ pub fn clear_history() -> std::io::Result<()> {
 }
 
 /// 清空指定会话的历史。
+///
+/// ⚠️ **索引必须跟着回到「空会话」形态**（不是只删文件）：`sessions.json` 里的 `title` 是
+/// 「首条用户消息」，只删历史文件会在列表里留下一条「有旧标题、没内容」的**幽灵会话**
+/// ——名字与内容不一致（`is_empty_session` 判空、列表却还写着旧标题）。
+/// 2026-10-15 实测：`hi`/`😀` 两条归档会话就是这么来的（创建后有轮次 ⇒ 标题已落，后来
+/// 在对话窗点了「清空」⇒ 文件没了、索引没动）。
 pub fn clear_session(id: &str) -> std::io::Result<()> {
     let store = SessionStore::production();
     let _guard = store
         .lock()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
+    clear_session_locked(&store, id)
+}
+
+/// [`clear_session`] 的实现：**调用方必须已持历史锁**（单测用临时 base 直接驱动）。
+fn clear_session_locked(store: &SessionStore, id: &str) -> std::io::Result<()> {
     match std::fs::remove_file(store.history_path(id)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
+    // 索引复位：标题回「新会话」、上下文用量归零；`id` 与 `created_at` 不动（调用方/当前
+    // 会话还持有这个 id，换 id 会把 current 弄丢）。存储里没这条就什么也不做。
+    let mut state = store.load();
+    if let Some(s) = state.sessions.iter_mut().find(|s| s.id == id) {
+        s.title = "新会话".to_string();
+        s.context_tokens = 0;
+        store
+            .save(&state)
+            .map_err(|e| std::io::Error::other(format!("写入会话索引失败：{e}")))?;
+    }
+    Ok(())
 }
 
 /// 截断单条文本到 [`MAX_HISTORY_CHARS`] 字符（按 char，避免切断 UTF-8）。
@@ -6910,5 +6932,47 @@ mod tests {
             store.archived().iter().any(|s| s.id == "empty"),
             "被归档的会话应出现在归档列表里"
         );
+    }
+    /// 「清空」必须把索引也复位成**空会话形态**——否则列表里留下「有旧标题、没内容」的
+    /// 幽灵会话（2026-10-15 实测：`hi` / `😀` 两条归档会话就是这么来的——有轮次 ⇒ 标题
+    /// 已落进索引；后来在对话窗点「清空」⇒ 历史文件没了、索引没动）。
+    #[test]
+    fn clear_session_resets_title_so_no_titled_ghost_remains() {
+        let (store, base) = tmp_store("clear-ghost");
+        std::fs::create_dir_all(&base).unwrap();
+        let mut st = store.load();
+        st.sessions = vec![SessionMeta {
+            id: "s1".into(),
+            title: "hi".into(),
+            created_at: 1,
+            updated_at: 2,
+            provider: "p".into(),
+            archived: false,
+            context_tokens: 1234,
+        }];
+        st.current = "s1".into();
+        store.save(&st).unwrap();
+        store.append_turns("s1", &[turn_of("user", "hi")]).unwrap();
+        assert_eq!(store.read_history("s1").len(), 1, "前提：清空前有历史");
+
+        clear_session_locked(&store, "s1").unwrap();
+        assert!(store.read_history("s1").is_empty(), "历史应被清空");
+        let st2 = store.load();
+        let s = st2
+            .sessions
+            .iter()
+            .find(|s| s.id == "s1")
+            .expect("会话条目必须还在（换 id 会把 current 弄丢）");
+        assert_eq!(s.title, "新会话", "标题必须回到空会话形态，否则就是幽灵");
+        assert_eq!(s.context_tokens, 0, "上下文用量应归零");
+        assert_eq!(s.provider, "p", "模型选择不动");
+        assert!(
+            is_empty_session(&store.read_history("s1")),
+            "清空后必须被判为空会话（不再能被归档）"
+        );
+        // 幂等：再清一次不报错、不产生新条目
+        clear_session_locked(&store, "s1").unwrap();
+        assert_eq!(store.load().sessions.len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

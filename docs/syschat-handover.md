@@ -400,6 +400,7 @@ after#2 = 0,231 520×560
 - **数学渲染器（`ratex`，MIT）**：`ENABLE_MATH` 只让 `pulldown` 发 `InlineMath`/`DisplayMath` 事件，真排版另起一层——`ratex-parser`→`ratex-layout`→`ratex-svg`（`standalone`+`embed-fonts`，KaTeX TTF 内嵌 ~580K）出**自包含 SVG** → 写 `syschat/math-cache/<sha256>-<字号×100>.svg` → Slint（已带 resvg）栅格化。**缓存键必须含字号**（行内 13px / 块级 15px 同公式分开存）。`MathImage` 同时给 `w/h/ascent/depth`——行内混排靠 `ascent/depth` 贴基线。**失败绝不吞字**：非法 TeX ⇒ `None` ⇒ `.slint` 回落等宽源码。
 - **`ENABLE_MATH` 的副作用边界**：开它之后表格单元格也会收到 math 事件，漏处理就会**静默丢字** ⇒ 表内分支必须先 `push_str` 原文（单测 `math_inline_display_and_in_table` 钉住）；孤立 `$`（`$5`/`$HOME`）仍是字面量（反例单测 `math_option_does_not_eat_lone_dollar`）。
 - **空会话不归档**：GUI「🗄 归档…」改走 `syschat::archive_current()`——`is_empty_session` 为真就直接回「无需归档」，**不落盘、不新建**。为什么必须挡：归档空会话后 `ensure_current` 发现「没有未归档会话」会**立刻再造一条空会话** ⇒「归档空会话 → 新建空会话」能无限刷（owner 盘上实测 25 条会话里 20 条是这么来的空壳）。判据在 `syschat` 单测里做了正反两面（空 ⇒ 不归档且索引一字未动；有内容 ⇒ 必须能归档）。
+- **「清空」必须把索引也复位**（`clear_session`）：`sessions.json` 的 `title` = 「首条用户消息」，以前只删 `sessions/<id>.jsonl`、**不动索引** ⇒ 列表里留下「有旧标题、没内容」的**幽灵会话**（`is_empty_session` 判空、列表却还写着旧标题）。owner 盘上实测两条：`hi`、`😀`（创建后有轮次 ⇒ 标题已落；后来在对话窗点「清空」⇒ 文件没了、索引没动；再被归档就成了那个样子）。现在清空同时把该条目复位成空会话形态（`title` → 「新会话」、`context_tokens` → 0；`id`/`created_at`/`provider` 不动——换 id 会把 `current` 弄丢）。判据 `clear_session_resets_title_so_no_titled_ghost_remains`（清后必须被判空会话、幂等）。
 
 **其它**
 - 媒体/图片的相对路径基准是 **`~/.agent-bridge/workspaces/syschat/`**（不是进程 CWD）；`file://` 要按绝对路径处理。
@@ -435,6 +436,10 @@ B=/Volumes/DataExt/tmp/ABB-stage-<head>/ABB.app; mkdir -p "$B/Contents/MacOS" "$
 cp "$T/agent-bridge" "$T/abb-agent" "$B/Contents/MacOS/"
 cp app-assets/Info.plist "$B/Contents/Info.plist"; cp app-assets/AppIcon.icns "$B/Contents/Resources/"
 cp LICENSE "$B/Contents/Resources/ABB-LICENSE.txt"
+# 版本号必须与 Cargo.toml 一致（`scripts/build.sh` 有这一步，手工配方以前漏了 ⇒ 「关于」里
+# 一直显示 Info.plist 模板里的旧值 2.0.3）。**必需在签名之前改**，改完再签（plist 被签名封住）。
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+sed -i '' "s|<string>2\.[0-9]*\.[0-9]*</string>|<string>$VERSION</string>|g" "$B/Contents/Info.plist"
 for f in "$B/Contents/MacOS/agent-bridge" "$B/Contents/MacOS/abb-agent"; do
   codesign -s "agent-bridge-dev" --force --timestamp=none --entitlements app-assets/abb.entitlements "$f" >/dev/null; done
 codesign -s "agent-bridge-dev" --force --timestamp=none --identifier "agent-bridge" \
@@ -461,8 +466,7 @@ grep -a "harness 装配" ~/.agent-bridge/logs/service.out | tail -1
 > 用 `LC_ALL=C grep -a` 或按字节数（python `data.count(pat.encode())`）。本轮实测：新构建与已装机两份二进制里
 > `添加附件（可多选，也可拖入窗口或 ⌘V 粘贴）`、`[selfresize] begin dir=`、`agent_thought_chunk`、`_session/steering` **都在（各 1）**。
 >
-> 📦 **最新暂存件**（2026-10-15 13:2x，`main = 0057811`）：`/Volumes/DataExt/tmp/ABB-stage-0057811/ABB.app`（**已装机**，sha 见上）；更早的 `ABB-stage-5978f34` 仍在盘上作历史
-> ——本节命令**实测到签名那一步全绿**（`tools/check_entitlements.sh` 三项齐全 + 上述四个串都在）。
+> 📦 **最新暂存件**（2026-10-15 23:2x，`main = a2cab99`，含表格/图片/行内公式/空会话归档/清空幽灵修复）：`/Volumes/DataExt/tmp/ABB-stage-a2cab99/ABB.app`（**已装机**；主二进制 sha256 `agent-bridge c1cdd30e…` / `abb-agent 7eefbf49…`，与装机后逐字节一致）；更早的 `ABB-stage-0057811`、`ABB-stage-5978f34` 仍在盘上作历史。旧 bundle 备份：`ABB.app.prev-20261015-232738` / `…-180631`。
 > 要用的时候只剩最后三段（quit / `mv` 备份 / `ditto` + `open`）。
 
 ### 7.3 接手第一小时建议
