@@ -68,11 +68,12 @@ pub fn layout(
     width: f32,
     font_size: f32,
     cache: &Path,
+    align: u8,
 ) -> Option<FlowLayout> {
     if math.is_empty() {
         return None;
     }
-    layout_common(text, math, width, font_size, cache, 0)
+    layout_common(text, math, width, font_size, cache, align)
 }
 
 /// **单元格**用：没有公式也要排（表格要靠它拿行高与对齐），并支持列对齐。
@@ -323,7 +324,7 @@ mod tests {
         let text = "质能方程 E=mc^2 表明质量与能量等价。";
         let off = "质能方程 ".len();
         let l =
-            layout(text, &[(off, "E=mc^2".to_string())], 400.0, 13.0, &cache).expect("应能排版");
+            layout(text, &[(off, "E=mc^2".to_string())], 400.0, 13.0, &cache, 0).expect("应能排版");
         let math = l.pieces.iter().find(|p| p.is_math).expect("应有一个公式块");
         let words: Vec<&FlowPiece> = l.pieces.iter().filter(|p| !p.is_math).collect();
         assert!(!words.is_empty(), "公式前后都应有文字");
@@ -368,8 +369,8 @@ mod tests {
         let text = "这里是一段比较长的说明文字用来逼出换行效果并且中间夹着公式。";
         let off = "这里是一段比较长的说明文字用来逼出换行效果并且中间夹着".len();
         let math = vec![(off, r"\frac{a}{b}".to_string())];
-        let wide = layout(text, &math, 600.0, 13.0, &cache).expect("宽版应能排版");
-        let narrow = layout(text, &math, 120.0, 13.0, &cache).expect("窄版应能排版");
+        let wide = layout(text, &math, 600.0, 13.0, &cache, 0).expect("宽版应能排版");
+        let narrow = layout(text, &math, 120.0, 13.0, &cache, 0).expect("窄版应能排版");
         assert!(
             narrow.height > wide.height,
             "窄宽度应更高（多行）：narrow={:.1} wide={:.1}",
@@ -390,7 +391,8 @@ mod tests {
                 &[(2, r"\frac{a}{".to_string())],
                 400.0,
                 13.0,
-                &cache
+                &cache,
+                0
             )
             .is_none(),
             "非法公式必须回落"
@@ -403,10 +405,10 @@ mod tests {
     fn no_math_or_empty_is_not_flow() {
         let cache = tmp_cache("none");
         assert!(
-            layout("普通句子", &[], 400.0, 13.0, &cache).is_none(),
+            layout("普通句子", &[], 400.0, 13.0, &cache, 0).is_none(),
             "无公式的段落不该走混排"
         );
-        let only = layout("", &[(0, "x".to_string())], 400.0, 13.0, &cache)
+        let only = layout("", &[(0, "x".to_string())], 400.0, 13.0, &cache, 0)
             .expect("只有公式的段（文本为空）也要能排");
         assert!(only.pieces.iter().any(|p| p.is_math), "应有一个公式块");
         let _ = std::fs::remove_dir_all(&cache);
@@ -420,7 +422,7 @@ mod tests {
         // 公式位置的字符在 `plain` 里本来就不存在（`$…$` 整段不进入 plain）
         let text = "甲乙丙  丁戊";
         let off = "甲乙丙 ".len();
-        let l = layout(text, &[(off, "x^2".to_string())], 400.0, 13.0, &cache).expect("排版");
+        let l = layout(text, &[(off, "x^2".to_string())], 400.0, 13.0, &cache, 0).expect("排版");
         assert_eq!(l.pieces.iter().filter(|p| p.is_math).count(), 1);
         let rebuilt: String = l
             .pieces
