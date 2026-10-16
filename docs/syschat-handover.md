@@ -497,3 +497,58 @@ grep -a "harness 装配" ~/.agent-bridge/logs/service.out | tail -1
    工作区指引因此一直写着旧数字（`manual:1`），改动在他那里从未生效。改造完用户**看得见的那份载体**（bundle 里的
    工作区指引 / GUI）之后，**要装包**（§7.2），并核对 `strings /Applications/ABB.app/Contents/MacOS/agent-bridge | grep abb-guide-v`
    与启动日志，而不是只看仓库里的 `cargo build`。本轮装包记录见 §0 顶部。
+
+---
+
+### 7.4 发版 · 清理 · 收录外部产物（3.0.0 起沿用，2026-10-17 定稿）
+
+这一节把「发版 / 清理 / 把并行会话的产物收进仓库」三件事的**可复现流程与边界**写死，
+避免下一个人重新摸索（都是踩过或差点踩到的）。
+
+**① 发版**
+
+1. **版本位**：根 `Cargo.toml` 的 `version` + `Cargo.lock` 里 `name = "agent-bridge"` 那一条，
+   **两处都要改**（只改前者会让 `cargo build --locked` 红）。`crates/abb-agent` / `crates/abb-chart`
+   是**独立包**，各自 `0.1.0`，不跟产品版本走。`Info.plist` 的版本由装机流程按根 `Cargo.toml` sed
+   （§7.2 第 3 步）——**不要**手工在 plist 里编版本。
+2. **发正式版 = 推 tag**：`git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z`。
+   `release.yml` 的触发就是 `tags: ["v*"]`（macOS runner 上构建 + 签名 + 公证 + 出 release 产物），
+   **不需要**本机 target 目录。tag 是**不可撤回的对外承诺** ⇒ 打之前先确认 `main` 门禁全绿。
+3. **本机装机**：照 §7.2 的配方（构建 → 组 stage → **改版本 → 再签名** → entitlements 守卫 →
+   quit/`mv`/`ditto`/`open`）。**装机后核 sha256 要跟「暂存件」比，不是跟上一版比**——
+   同一份源码重编**不是逐字节可复现**（实测过）。
+
+**② 清理（删除类，先列清单再动手）**
+
+- **分支 / 写树**：先 `git branch --merged main`（哪些已并入）+ 逐个 `git -C <写树> status --porcelain`
+  **确认 0 项未提交**，再 `git worktree remove <写树>` → `git branch -d <分支>`。**分支被写树占用时
+  `git branch -d` 会拒绝**，所以顺序不能反。**未并入 main 的分支不要删**——先评估是不是该合并
+  （3.0.0 那轮就有一个 `fix/test-fixture-tmp-leak` 是「该合并」而不是「该删」）。
+- **磁盘（`/Volumes/DataExt/tmp`，用户策略：中间产物绝不落 228G 启动盘）**：
+  `ABB-stage-*` 可全清；`ABB.app.prev-*` **至少留最新 1 份**（回滚能力）；
+  `abb-target` / `abb-target-release` 清了会**全量重建**（debug 十几分钟 / release 约 3 分钟）。
+  **≥100MB 或目录级删除必须先列清单 + 让 owner 二次确认**，得到「全清 / 1+2」这种明确答复再动。
+- **运行数据缓存**：`~/.agent-bridge/syschat/{math,media}-cache/` 是**纯缓存**（删了按需重建：
+  公式重排、`data:` URI 内联媒体自动重解码、远程图需联网重下）。
+- **`sessions.json` 改之前必须**：① 先备份（`sessions.json.backup-<ts>-<原因>`）；
+  ② **先退出 APP**（在跑时会被它写回覆盖）。**幽灵会话判据** = 索引里有条目、但
+  `sessions/<id>.jsonl` 不存在（根因曾是 `clear_session` 不复位索引，已修）。
+  ⚠️ **不要**加「加载时按历史文件缺失过滤会话」的守卫——**新建会话本来就还没有历史文件**，
+  那样会把刚建的会话一起吞掉。
+
+**③ 收录并行会话 / 外部产物**（chatwoot 调研、codex schema 这类）
+
+- **未跟踪 = 随时会丢**（`git clean`、换写树、重克隆都会带走）。owner 说「要保留」时，
+  **收进版本库**才算真保留，光放着不算。
+- **流程**：先**密钥扫描**（`sk-*` / `AIza*` / `ghp_*` / `token` / `api_key` / PEM 私钥）——
+  **零命中才提交**；提交信息里写明「**来自并行会话，本次只做收录，未改动其内容**」
+  （将来追来源时不会误记成自己写的）。归置沿用既有约定：协议参考 → `reference/`，
+  设计稿/调研 → `docs/`（`docs/design/README.md` 里注明「第三方参考稿，非 ABB 设计稿」）。
+- **禁止**为了「清干净」跑 `git clean -fdx`：那正是把这些未跟踪资料删掉的路径。
+
+**④ 两条会骗人的手法（这轮实测）**
+
+- **裸跑 `cargo test` 会写真实 `~/.agent-bridge`** ⇒ 必须用 `tools/check_test_isolation.sh`
+  （裸跑还会因真实 HOME 的窗口状态让 `v11_split_*` 这类用例**偶发红**，误判成回归）。
+- **反引号写进 `git commit -m "…"` 会被 shell 当命令替换吃掉**（消息里出现空档）⇒ 长消息一律
+  用 `git commit -F - <<'EOF' … EOF`（heredoc 加引号，零替换）。
