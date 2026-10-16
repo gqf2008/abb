@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABB 系统对话 · 设计稿 v15</title>
+<title>ABB 系统对话 · 设计稿 v16</title>
 <style>
   :root{
     --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
@@ -330,7 +330,7 @@
 <!-- /左列 -->
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v15</h1>
+  <h1>ABB 系统对话 · 设计稿 v16</h1>
   <div class="sub">本轮：交互细化（面板位置 / 截屏 / 上下文用量条 / 可拉升 / 消息动作 / 归档 / 新建去重）</div>
   <div class="sub" style="color:var(--info)"><b>v11 新增的交互要求</b>（本稿先画示意，walgit 已登记待逐步实现）</div>
   <ol>
@@ -352,6 +352,14 @@
     <li><b>新建会话图标</b>：<code>＋</code> → <b>对话气泡</b>图标（同 logo 里那个气泡，14px，墨黑描边色），放在 历史会话 <code>🗂</code> 左边。</li>
     <li><b>附件移进输入框内</b>：输入区**不再有框外图标列**；框内底部一行（靠右）＝ <code>[😊 表情] [📎 附件] [✂ 截图] [⋯ 更多(定时)]</code> + <code>发送</code> + <code>🗑 清空</code>，全部**同一水平线**。</li>
     <li><b>输入区边距一致</b>：去掉框外图标列后，输入框左右各留 10px（原来右侧偏大）。</li>
+  </ol>
+  <div class="sub" style="color:var(--info)"><b>v16：音视频内联播放器 / 剪贴板支持图片 / 待发附件可退格删除</b>（2026-10-16 owner 口径）</div>
+  <ol>
+    <li><b>音视频 = 内联播放器</b>（v15 的「一行链接」作废）：与稿上方 mock 一致——<b>卡片（2px 描边）+ 海报帧/画面 + 播放控件 + 下方 <code>.cap</code> 说明条</b>。
+      控件按稿的播放器还原：<b>▶/⏸、进度条（可拖）、当前时间/总时长、音量、全屏</b>（先做 ▶/⏸ + 进度 + 时间，音量/全屏随其后）。<br>
+      <span style="color:var(--dim)">实现路径（Slint 没有 <code>audio</code>/<code>video</code> 元素）：<b>视频</b>用本机 <code>ffmpeg</code> 把帧以 <code>rawvideo/rgba</code> 流式喂给 Slint（<code>Image::from_rgba8</code> + Timer 翻帧，内存有界、不落整段帧到磁盘）；<b>音频</b>用 <code>afplay</code> 播放 + 自绘进度（<code>ffprobe</code> 取时长）。海报帧 = <code>ffmpeg -frames:v 1</code> 抽首帧并缓存。</span></li>
+    <li><b>剪贴板要支持图片</b>：截图工具（如 PixPin）把**图片**放进剪贴板，<b>不是文件</b> ⇒ ⌘V 现在只认文件 URL，图片粘不进来。口径：<b>⌘V 依次尝试 ①文件 → ②剪贴板图片（PNG/TIFF）</b>，图片写进附件目录后与 📎/✂ 走同一条待发路径。</li>
+    <li><b>待发附件可退格删除</b>：输入框为空（或光标在末尾且没有可删字符）时按 <b>Backspace</b> ⇒ 删掉**最后一个待发附件**（再按继续往前删）；✕ 徽标仍然可用。状态行报「已移除附件 X」。</li>
   </ol>
   <div class="sub" style="color:var(--info)"><b>v15：底色统一 / 思考块 1+10 行 / 生成贴底 / 单线分割 / 左右分栏对齐</b>（2026-10-16 owner 口径）</div>
   <ol>
