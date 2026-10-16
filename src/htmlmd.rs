@@ -399,7 +399,7 @@ pub fn html_to_markdown(html: &str) -> String {
                             out.push_str(&text);
                         }
                     } else {
-                        let text = format!("]({})", "".to_string());
+                        let text = "])".to_string();
                         if in_cell {
                             cell.push_str(&text);
                         } else {
@@ -412,7 +412,7 @@ pub fn html_to_markdown(html: &str) -> String {
                     if href.is_empty() {
                         open.push(String::new()); // 占位：闭标签时不再写 `](…)`
                     } else {
-                        let text = format!("[");
+                        let text = "[".to_string();
                         if in_cell {
                             cell.push_str(&text);
                         } else {

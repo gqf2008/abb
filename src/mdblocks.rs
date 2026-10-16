@@ -1157,10 +1157,15 @@ mod tests {
 
     /// 非媒体 HTML（`<div>` 等）仍走「退化为转义文本」路径，绝不吞内容。
     #[test]
-    fn non_media_html_still_degrades_to_text() {
+    fn non_media_html_renders_but_never_swallows_text() {
+        // v21 起：**块级 HTML 渲染**（不再是贴源码）——标签消失、正文留下。
         let b = parse("<div>甲</div>");
         assert_eq!(kinds(&b), vec!["p"], "{:?}", kinds(&b));
-        assert!(b[0].text.contains("div"), "HTML 不得被吞：{}", b[0].text);
+        assert_eq!(b[0].text, "甲", "块级 HTML 应渲染成段落：{:?}", b[0].text);
+        // 但「不吞内容」这条硬口径不变：不在 BLOCK_TAGS 里的标签走既有退化路径，文字**永远在**。
+        let b = parse("<foo>乙</foo>");
+        let all: String = b.iter().map(|x| x.text.clone()).collect();
+        assert!(all.contains('乙'), "认不出的 HTML 也不许吞内容：{all}");
     }
 
     /// 行内 HTML 媒体与 markdown 图片同口径：切出独立块，前后文字各自成段。
