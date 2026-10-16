@@ -3645,6 +3645,81 @@ fn diag_row_heights() {
     }
 }
 
+/// 回归守卫：**滞底后 `content-y` 必须落在合法区间**（= 白屏的成因）。
+///
+/// 背景（owner 反复报的「生成中消息区整片空白」）：滞底原来写越界哨兵 `-999999px`、指望
+/// Slint「延迟夹取」——`ABB_SYSCHAT_DEBUG=1` 的现场日志（1135/1135 行）证明**夹取不发生**：
+/// 模型有 14 行、内容高 1460 / 视口 326，`content-y` 长期停在 `-999999` ⇒ 视口落在内容外 ⇒
+/// **整片空白**，`turn-end` 后也不恢复。现在直接算真实底部，值恒合法。
+///
+/// ⚠️ Slint 约定：**往下滚是负值**，到底 = `height - content-height`（写成正数会被夹回 0 =
+/// 等于没滚——这正是我第一版「修复」失败的原因，别再踩）。
+#[test]
+fn convo_stick_to_bottom_never_goes_out_of_range() {
+    let long: String = (0..12)
+        .map(|i| format!("第 {i} 段：把架构图做成 HTML 页面，需要把图存成文件并配上说明，再套一个自适应模板。"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut rows = vec![row("role", "你")];
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(&long), 416.0, false);
+    rows.push(row("role", "怹"));
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(&long), 416.0, false);
+    let (ui, win, _m) = setup(rows, 400);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("m"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(520, 400));
+    apply_syschat_layout(&ui, 520.0);
+    let _ = settle_w(&win, 520, 400);
+    // 模拟流式每拍：Rust 递增 scroll-epoch 请求滞底（处理器与布局定高的先后顺序也一并覆盖）。
+    for _ in 0..3 {
+        ui.set_scroll_epoch(ui.get_scroll_epoch().wrapping_add(1));
+        let _ = settle_w(&win, 520, 400);
+    }
+    let f = settle_w(&win, 520, 400);
+    let content_h = ui.get_dbg_content_h();
+    let view_h = ui.get_dbg_flick_h();
+    let y = ui.get_dbg_content_y();
+    let bottom = (view_h - content_h).min(0.0);
+    println!(
+        "content_h={content_h:.1} view_h={view_h:.1} content_y={y:.1}（合法底部={bottom:.1}）"
+    );
+    assert!(
+        content_h > view_h,
+        "样例必须长到需要滚动，否则没覆盖滞底路径：content_h={content_h:.1} view_h={view_h:.1}"
+    );
+    // ① 不能是越界哨兵（= 白屏签名）。
+    assert!(
+        y > -100_000.0,
+        "content-y 是越界哨兵值（Slint 没有夹取它）⇒ 视口落到内容外 ⇒ 消息区空白：y={y:.1}"
+    );
+    // ② 必须落在 [height−content-height, 0]（Slint 的合法区间，往下为负）。
+    assert!(
+        y <= 0.5 && y >= bottom - 1.0,
+        "content-y 超出合法区间 [{bottom:.1}, 0] ⇒ 视口落在内容外 ⇒ 空白：y={y:.1}"
+    );
+    // ③ 而且要**真的到底**（滞底语义）：容差 1px。
+    assert!(
+        (y - bottom).abs() <= 1.0,
+        "滞底没到底：y={y:.1} 应为 {bottom:.1}（内容高 {content_h:.1} / 视口 {view_h:.1}）"
+    );
+    // ④ 视口里必须看得到墨迹（不是空白）。
+    let fy = ui.get_dbg_flick_y().round() as u32;
+    let lowest = f
+        .lowest_ink_row(fy, fy + view_h.round() as u32, 4, 519)
+        .expect("视口内应看得到内容");
+    assert!(
+        (lowest as f32) < fy as f32 + view_h,
+        "视口内应看得到最底一行的墨迹：lowest={lowest} 视口={fy}..{}",
+        fy as f32 + view_h
+    );
+}
+
 /// 【诊断用·临时】思考块（折叠 + 展开）下面到底有没有线。
 #[test]
 #[ignore = "诊断用；默认不跑"]

@@ -3805,6 +3805,9 @@ export component SystemChatWindow inherits Window {
     // **不能**改成给 content-y 绑一个「超大值」属性：绑了值后 Slint 就不再夹取
     //（flickable.rs:113-119 带 `!y.has_binding()`），越界值原样生效 ⇒ 消息区空白。
     in-out property <int> scroll-epoch: 0;
+    // 「有新内容就贴底」（见 `scroll-epoch` 处理器）：请求过滞底就不再清零 —— v15 口径
+    // 「生成中始终贴底」。用于 `content-height` 迟到（处理器先跑、布局后定高）时补跟。
+    property <bool> stick-latch: false;
     // 输入框内容（与 PixelTextInput.text 双向绑定；发送后 Rust 置空）
     in-out property <string> draft: "";
 
@@ -4269,6 +4272,13 @@ export component SystemChatWindow inherits Window {
             // 下面各处的减数 = 各级 padding 之和（块内基准 416 已在 Rust 里扣掉根+col padding），
             // 宁可略窄（估高偏大 ⇒ 最多底部多留空白），**不能偏宽**（偏宽就回到估高不足）。
             flick := Flickable {
+                // 内容（迟到的）长起来后补跟底部：处理器先于布局跑时，`scroll-epoch` 那条算不出
+                // 真值（`content-height` 还是 0）。赋值恒合法 ⇒ 与 Slint 的夹取不冲突。
+                changed content-height => {
+                    if (root.stick-latch) {
+                        self.content-y = min(0px, self.height - self.content-height);
+                    }
+                }
                 // 消息区高由 Rust 按分割条比例写（`syschat::split_convo_h`）；**不**用
                 // `vertical-stretch: 1` —— 否则它会吃掉全部剩余高度，分割条拖动就没意义了。
                 height: root.convo-h;
@@ -5763,6 +5773,17 @@ export component SystemChatWindow inherits Window {
     // ⚠️ content-y 必须保持**无绑定**（本组件不绑它，也不用 ScrollView/ScrollBar——
     //    它们会给 content-y 加绑定）。一旦有绑定，`!y.has_binding()` 为假 ⇒ 夹取被跳过。
     changed scroll-epoch => {
-        flick.content-y = -999999px;
+        // ⚠️ **不要**写 `-999999px` 让 Slint「延迟夹取」落到底——**实测夹取根本不发生**：
+        // `ABB_SYSCHAT_DEBUG=1` 的现场日志（1135/1135 行）显示，生成中每 50ms 重写一次越界值，
+        // `content-y` 就长期停在 `-999999`（模型有 14 行、内容高 1460 / 视口 326），
+        // 视口落在内容外 ⇒ **消息区整片空白**（owner 反复报的白屏，状态行还停在「正在思考」），
+        // 连 `turn-end` 之后都不恢复。**直接给真实底部**，值恒在合法区间 ⇒ 无此路径。
+        //
+        // ⚠️ Slint 的约定（踩过）：**往下滚 `content-y` 是负值**，到底 = `height - content-height`
+        // （实测 326−1460 = −1134）。写成正数会被夹回 0 = 等于没滚（上一版就是这么错的一次）。
+        flick.content-y = min(0px, flick.height - flick.content-height);
+        // 布局尚未定高时上面算出来是 0（`content-height` 还是 0）——挂 latch 等它长起来再补
+        //（`Flickable.changed content-height`）。latch 不清零 = 「有新内容就贴底」= v15 口径。
+        root.stick-latch = true;
     }
 }
