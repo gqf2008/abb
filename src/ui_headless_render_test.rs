@@ -3620,8 +3620,11 @@ fn diag_media_player() {
 fn diag_think_lines() {
     let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
     let _ = std::fs::create_dir_all(dir);
-    let long = "用户要把架构图做成 HTML 页面。需要：① 把图存成文件 ② 配说明 ③ 单文件即开即用。\
-先读工作区里的图片与说明，再套一个自适应模板，最后把下载入口补上。";
+    let long: String = (0..20)
+        .map(|i| format!("第 {i} 行：用户要把架构图做成 HTML 页面，需要把图存成文件并配上说明，再套一个自适应模板。"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let long: &str = &long;
     let rows = vec![
         role_row("怹", true),
         think_row(long, "3.2s", false, false),
