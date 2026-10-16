@@ -62,6 +62,65 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
 /// 所以这里同样认——将来 abb 一旦注入就自动生效。
 pub const MAX_OUTPUT_TOKENS_ENV: &str = "ABB_AGENT_MAX_OUTPUT_TOKENS";
 
+/// 思考档位的环境变量名（abb 的 `agent::abb_provider_env` 注入；空/缺省 = 不干预）。
+///
+/// 值 = `off|minimal|low|medium|high|xhigh|max`（大小写不敏感）。它决定 rpi 的
+/// [`rpi_ai::types::ThinkingLevel`]，OpenAI 兼容层据此在请求体里放 `reasoning_effort`
+/// （`openai_completions.rs`：仅当 `model.reasoning && compat.supports_reasoning_effort`）。
+pub const THINKING_LEVEL_ENV: &str = "ABB_AGENT_THINKING_LEVEL";
+
+/// 解析思考档位：未设/空/`off` ⇒ `None`（= 别碰，维持 rpi 默认 `Off`）。
+///
+/// 认不出的值**不报错**（只 warn 并当没设）：它与 `MAX_OUTPUT_TOKENS` 同类，
+/// 是调优旋钮而非启动前提，读不懂不该让 agent 起不来。
+pub fn thinking_level(env: &dyn EnvSource) -> Option<rpi_ai::types::ThinkingLevel> {
+    use rpi_ai::types::ThinkingLevel;
+    let raw = optional(env, THINKING_LEVEL_ENV)?;
+    let value = raw.trim().to_ascii_lowercase();
+    let level = match value.as_str() {
+        "" | "off" | "none" | "no" => return None,
+        "minimal" | "min" => ThinkingLevel::Minimal,
+        "low" => ThinkingLevel::Low,
+        "medium" | "mid" => ThinkingLevel::Medium,
+        "high" => ThinkingLevel::High,
+        "xhigh" | "x-high" => ThinkingLevel::Xhigh,
+        "max" => ThinkingLevel::Max,
+        other => {
+            tracing::warn!("忽略无法识别的 {THINKING_LEVEL_ENV}={other}");
+            return None;
+        }
+    };
+    Some(level)
+}
+
+/// 把思考档位**同时**标到模型上：rpi 的 openai 兼容层只在
+/// `model.reasoning && compat.supports_reasoning_effort` 时才真发 `reasoning_effort`
+///（`Model::new` 给的是 `reasoning: false` + `compat: None` ⇒ 只设 builder 的档位**不生效**）。
+fn mark_model_reasoning(model: &mut Model) {
+    use rpi_ai::model::StreamingProtocolCompat;
+    use rpi_ai::model::OpenaiCompletionsCompat as Compat;
+    model.reasoning = true;
+    // `compat` 是按 api 分叉的**枚举**，不是 flat 结构：chat 走 `OpenaiCompletions` 分支
+    //（`supports_reasoning_effort` 只在这个分支里有意义），responses 分支同理。
+    let compat = match model.compat.clone() {
+        Some(existing) => existing,
+        None => match model.api {
+            Api::OpenaiResponses | Api::AzureOpenaiResponses | Api::OpenaiCodexResponses => {
+                StreamingProtocolCompat::OpenaiResponses(Default::default())
+            }
+            _ => StreamingProtocolCompat::OpenaiCompletions(Compat::default()),
+        },
+    };
+    let compat = match compat {
+        StreamingProtocolCompat::OpenaiCompletions(mut c) => {
+            c.supports_reasoning_effort = Some(true);
+            StreamingProtocolCompat::OpenaiCompletions(c)
+        }
+        other => other,
+    };
+    model.compat = Some(compat);
+}
+
 /// 未指定时的单回合输出上限。
 ///
 /// **必须对齐被替代组件的默认值**：fork 的默认就是 65_536，而我第一版写成 8_192——
@@ -289,7 +348,7 @@ fn openai_backend(env: &dyn EnvSource) -> Result<Backend, String> {
     } else {
         Api::OpenaiCompletions
     };
-    let model = custom_model(
+    let mut model = custom_model(
         &model_id,
         api,
         "openai",
@@ -298,6 +357,9 @@ fn openai_backend(env: &dyn EnvSource) -> Result<Backend, String> {
         // openai 家族在 rpi 里真发图（chat 已端到端实测）。
         true,
     );
+    if thinking_level(env).is_some() {
+        mark_model_reasoning(&mut model);
+    }
     if responses {
         let provider = OpenAiResponsesProvider::with_models_without_env_api_key(
             "openai",
@@ -418,6 +480,48 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    /// 思考档位解析：缺省/空/off ⇒ `None`（= 不干预，行为与旧版一致）；
+    /// 认不出的值**不报错**，当没设（调优旋钮不该让 agent 起不来）。
+    #[test]
+    fn thinking_level_parses_and_unknown_is_ignored() {
+        use rpi_ai::types::ThinkingLevel;
+        let with = |value: &str| {
+            FakeEnv(HashMap::from([(
+                THINKING_LEVEL_ENV.to_string(),
+                value.to_string(),
+            )]))
+        };
+        assert_eq!(thinking_level(&FakeEnv(HashMap::new())), None);
+        assert_eq!(thinking_level(&with("")), None);
+        assert_eq!(thinking_level(&with("off")), None);
+        assert_eq!(thinking_level(&with("OFF")), None);
+        assert_eq!(thinking_level(&with(" low ")), Some(ThinkingLevel::Low));
+        assert_eq!(thinking_level(&with("Minimal")), Some(ThinkingLevel::Minimal));
+        assert_eq!(thinking_level(&with("medium")), Some(ThinkingLevel::Medium));
+        assert_eq!(thinking_level(&with("high")), Some(ThinkingLevel::High));
+        assert_eq!(thinking_level(&with("max")), Some(ThinkingLevel::Max));
+        // 认不出 ⇒ 当没设（只 warn），不能因为是调优旋钮就让进程起不来。
+        assert_eq!(thinking_level(&with("很高")), None);
+    }
+
+    /// 只给 `AgentBuilder` 档位**不够**：rpi 的 chat 层要 `model.reasoning` 与
+    /// `compat.supports_reasoning_effort` 同时为真才发 `reasoning_effort`
+    ///（`Model::new` 给的是 `false` + `None`）。这里钉住「两个标记都被打上」。
+    #[test]
+    fn mark_model_reasoning_enables_chat_compat_flag() {
+        use rpi_ai::model::StreamingProtocolCompat;
+        let mut model = custom_model("m", Api::OpenaiCompletions, "openai", "http://x", 4096, true);
+        assert!(!model.reasoning, "前提：Model::new 默认不给 reasoning");
+        mark_model_reasoning(&mut model);
+        assert!(model.reasoning);
+        match model.compat {
+            Some(StreamingProtocolCompat::OpenaiCompletions(compat)) => {
+                assert_eq!(compat.supports_reasoning_effort, Some(true));
+            }
+            other => panic!("chat 分支应带上 supports_reasoning_effort：{other:?}"),
+        }
+    }
 
     /// 假环境：不碰进程全局 env，故用例之间无竞争、可并行。
     struct FakeEnv(HashMap<String, String>);

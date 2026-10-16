@@ -2123,6 +2123,7 @@ mod tests {
             base_url: "https://sys.example.com/v1".into(),
             api_key: "sk-sys".into(),
             model: "sys-model".into(),
+            thinking: String::new(),
             context_window: 0,
         };
         let mut cfg = Config::default();
@@ -2176,6 +2177,7 @@ mod tests {
             base_url: format!("https://{name}.example.com"),
             api_key: key.into(),
             model: format!("{name}-model"),
+            thinking: String::new(),
             context_window: 0,
         };
         let mut cfg = Config::default();
@@ -2292,6 +2294,7 @@ mod tests {
             base_url: format!("https://{name}.example.com"),
             api_key: key.into(),
             model: String::new(),
+            thinking: String::new(),
             context_window: 0,
         };
         let mk_bot = |name: &str, prov: &str| crate::config::BotConfig {

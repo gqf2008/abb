@@ -11068,6 +11068,7 @@ mod tests {
             base_url: "https://api.deepseek.com".into(),
             api_key: "sk-a".into(),
             model: "deepseek-chat".into(),
+            thinking: String::new(),
             context_window: 0,
         }];
         let s1 = bots_struct_sig(&c);

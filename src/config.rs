@@ -727,6 +727,13 @@ pub struct ProviderConfig {
     /// 模型名（空 = 后端默认模型）。
     #[serde(default)]
     pub model: String,
+    /// 思考档位（owner 2026-10-16 卡）：`""` = **不下发**（执行层用默认 `Off`）。
+    /// 取值 `off|minimal|low|medium|high|xhigh|max`，透传给执行层的
+    /// `ABB_AGENT_THINKING_LEVEL`（见 `agent::abb_provider_env`），由执行层翻成
+    /// rpi 的 `ThinkingLevel` → OpenAI 兼容请求体的 `reasoning_effort`
+    ///（=「思考过程太长」的直接旋钮）。旧 `config.json` 缺这个键照旧按 `""` 读，行为不变。
+    #[serde(default)]
+    pub thinking: String,
     /// 这个模型的上下文窗口（token）。`0` = 没设 ⇒ 走内置兜底表
     /// （`syschat::builtin_context_window`）。
     ///
@@ -745,6 +752,7 @@ impl Default for ProviderConfig {
             base_url: String::new(),
             api_key: String::new(),
             model: String::new(),
+            thinking: String::new(),
             context_window: 0,
         }
     }
@@ -2824,6 +2832,7 @@ mod tests {
             base_url: "https://x".into(),
             api_key: "k".into(),
             model: "m".into(),
+            thinking: String::new(),
             context_window: 0,
         };
         // 全局默认：bot.provider 空 → 跟随 default_provider

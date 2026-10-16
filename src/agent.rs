@@ -434,6 +434,14 @@ pub(crate) fn abb_provider_env(
         "ABB_AGENT_MAX_ROUNDS".into(),
         ABB_AGENT_MAX_ROUNDS.to_string(),
     );
+    // 思考档位（owner 卡，2026-10-16）：空串 = 不下发（执行层默认 `Off`，行为与旧版一致）；
+    // 非空就透传，执行层翻成 rpi 的 `ThinkingLevel`。这是「思考过程太长」的直接旋钮。
+    if !p.thinking.trim().is_empty() {
+        env.insert(
+            "ABB_AGENT_THINKING_LEVEL".into(),
+            p.thinking.trim().to_ascii_lowercase(),
+        );
+    }
     match p.kind.as_str() {
         "anthropic" => {
             env.insert("ABB_AGENT_PROVIDER".into(), "anthropic".into());
@@ -920,6 +928,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: "sk-secret".into(),
             model: "some-model".into(),
+            thinking: String::new(),
             context_window: 0,
         }
     }
@@ -940,6 +949,32 @@ mod tests {
         assert_eq!(env["ANTHROPIC_BASE_URL"], "https://gateway.example.com");
         assert_eq!(env["ANTHROPIC_MODEL"], "some-model");
         assert!(!env.contains_key("OPENAI_COMPAT_API_KEY"));
+    }
+
+    /// 思考档位：**空串不下发**（保持旧行为），非空透传且归一成小写。
+    #[test]
+    fn abb_provider_env_passes_thinking_level_only_when_set() {
+        let base = crate::config::ProviderConfig {
+            kind: "deepseek".into(),
+            api_key: "k".into(),
+            model: "deepseek-flash".into(),
+            ..Default::default()
+        };
+        let env = super::abb_provider_env(Some(&base)).unwrap().unwrap();
+        assert!(
+            !env.contains_key("ABB_AGENT_THINKING_LEVEL"),
+            "没配思考档位就不该下发（执行层保持默认 Off）"
+        );
+        let configured = crate::config::ProviderConfig {
+            thinking: "LOW".into(),
+            ..base
+        };
+        let env = super::abb_provider_env(Some(&configured)).unwrap().unwrap();
+        assert_eq!(
+            env.get("ABB_AGENT_THINKING_LEVEL").map(String::as_str),
+            Some("low"),
+            "配了就要透传（并归一成小写）"
+        );
     }
 
     #[test]

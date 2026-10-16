@@ -5659,6 +5659,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             model: model.into(),
+            thinking: String::new(),
             context_window: cw,
         };
         // `Config` 有私有字段 ⇒ 不能用结构体更新语法，逐项赋值。

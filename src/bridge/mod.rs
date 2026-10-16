@@ -1670,6 +1670,7 @@ mod tests {
             base_url: String::new(),
             api_key: "sk-test".into(),
             model: String::new(),
+            thinking: String::new(),
             context_window: 0,
         }];
         test_cfg.default_provider = "test-prov".into();

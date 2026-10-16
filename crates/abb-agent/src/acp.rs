@@ -723,13 +723,18 @@ impl Server {
         } else {
             format!("{base}\n\n{hints}")
         };
-        AgentBuilder::new()
+        let mut builder = AgentBuilder::new()
             .model(backend.model().clone())
             .system_prompt(system_prompt)
             .session_id(session_id)
             .stream_fn(backend.stream_fn())
             // 工具 = MCP 工具（`{server}__{tool}`）+ 内置工具（`dev__*`，见 `builtin`）。
-            .tools(tools)
+            .tools(tools);
+        // 思考档位（`ABB_AGENT_THINKING_LEVEL`）：abb 没下发就完全不碰（rpi 默认 `Off`）。
+        if let Some(level) = crate::provider::thinking_level(&crate::provider::ProcessEnv) {
+            builder = builder.thinking_level(level);
+        }
+        builder
             .build()
             .map_err(|error| format!("agent 构建失败：{error}"))
     }
