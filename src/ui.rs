@@ -4017,6 +4017,49 @@ pub fn run_gui() -> Result<()> {
         v
     }
     // 打开对话框时把落盘历史灌进 model（跨重启保留的可见证据）。
+    /// 【诊断】流式每拍的滚动状态落盘，用于抓 owner 反复报的**白屏**。
+    ///
+    /// `ABB_SYSCHAT_DEBUG=1` 时写 `<运行目录>/syschat-debug.log`（默认**不写盘**，不污染运行目录）；
+    /// 每行：`内容高(布局相信) / 视口高 / content-y / 行数 / busy / 状态`。
+    /// **白屏的签名 = `content-y` 是个「巨大的负数」**（=`-999999px` 哨兵**没被夹取**，
+    /// 视口落到内容外）——那种行额外带 `!! ` 前缀，`grep '^!! ' syschat-debug.log` 就能定性。
+    /// ⚠️ 注意 Slint 的约定：**向下滚时 `content-y` 本来就是负的**（实测「到底」= `-(内容高-视口高)`，
+    /// 例：内容 1139.4/视口 386 ⇒ -753.4）。所以判据是「大得离谱的负值」而不是「负值」。
+    ///
+    /// ⚠️ 另一条**别做**的事（我试过、已撤）：把滞底从「写 `-999999px` 让 Slint 夹取」改成
+    /// 「直接算真实底部一次性赋值」。看着更稳，实际**更脆**：处理器触发时布局常常还没定高，
+    /// `content-height` 是 0 ⇒ 算出 0 ⇒ **根本不滞底**（无头台实测 0 vs 正确 -753.4），
+    /// 而哨兵靠的是 Slint **内部**在布局变化时反复夹取 ⇒ 最终一定到底。
+    /// 既有守卫 `convo_bottom_not_clipped_by_composer` 就是这么被顶翻的。
+    fn dbg_stream_log(win: &SystemChatWindow, model: &slint::VecModel<SysChatBlockRow>, tag: &str) {
+        if std::env::var_os("ABB_SYSCHAT_DEBUG").is_none() {
+            return;
+        }
+        let y = win.get_dbg_content_y();
+        let content_h = win.get_dbg_content_h();
+        let view_h = win.get_dbg_flick_h();
+        // 哨兵 `-999999px` 未被夹取时才会到这个量级；正常滚动最多 -(内容高) 这种几百到几万。
+        let mark = if y < -100_000.0 { "!! " } else { "" };
+        let line = format!(
+            "{mark}{tag} rows={} content_h={content_h:.1} view_h={view_h:.1} content_y={y:.1}              busy={} status={:?}\n",
+            model.row_count(),
+            win.get_busy(),
+            win.get_status_line(),
+        );
+        use std::io::Write;
+        let path = crate::syschat::dir().join("syschat-debug.log");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
     fn load_syschat_into(win: &SystemChatWindow, model: &slint::VecModel<SysChatBlockRow>) {
         let turns = crate::syschat::load_history();
         let mut rows: Vec<SysChatBlockRow> = Vec::new();
@@ -9307,6 +9350,7 @@ pub fn run_gui() -> Result<()> {
                                 w.set_status_line("已停止。".into());
                             }
                             w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+                            dbg_stream_log(&w, &syschat_model_t, "turn-end");
                             // E3：回合结束 ⇒ 重算用量条（`turn_core` 刚把本轮的
                             // `context_tokens` 落进会话索引；不刷新的话要等下次切会话才更新）。
                             refresh_syschat_usage(&w);
@@ -9361,6 +9405,7 @@ pub fn run_gui() -> Result<()> {
                     // 才跟随」：那样生成看起来不像流式（内容长到视野外就看不见在动了）。
                     if let Some(w) = win_w.upgrade() {
                         w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+                        dbg_stream_log(&w, &syschat_model_t, "tick");
                     }
                 }
             },
