@@ -4204,6 +4204,10 @@ pub fn run_gui() -> Result<()> {
     let sc_stream_start: Rc<Cell<usize>> = Rc::new(Cell::new(usize::MAX));
     let sc_cancel: Rc<RefCell<Option<tokio_util::sync::CancellationToken>>> =
         Rc::new(RefCell::new(None));
+    // 停止看门狗（owner 2026-10-16）：点 ⏹ 的时刻。回合那边的 `Stopped` 事件**不保证会来**
+    //（执行层挂死/取消没被处理时永远不来）⇒ 界面会永久停在「正在输入」、⏹ 看着像坏的。
+    // 帧泵每拍检查，超时即**本地强制收尾**（见 `STOP_WATCHDOG_GRACE`）。
+    let sc_stop_at: Rc<RefCell<Option<std::time::Instant>>> = Rc::new(RefCell::new(None));
     // 卡 `abb-syschat-d10-insert-interrupt`：发送→回合的串行泵 + 生成中插入端点。
     // - `sc_pump`：纯逻辑（`syschat::SendPump`，单测钉住）——插入/排队判定 + 队列串行化；
     // - `sc_inject`：在途回合的注入端（仅能力=Supported 时写入）；
@@ -8294,9 +8298,17 @@ pub fn run_gui() -> Result<()> {
     // ⏹ 停止：取消在途回合（UI 线程直接触发外部取消令牌；回合收尾由 Stopped 事件处理）。
     {
         let cancel_slot = sc_cancel.clone();
+        let stop_at_btn = sc_stop_at.clone();
+        let cw_stop = syschat_win.as_weak();
         syschat_win.on_stop_streaming(move || {
             if let Some(t) = cancel_slot.borrow().as_ref() {
                 t.cancel();
+            }
+            // 立刻给可见反馈（不再只依赖回合那边的 `Stopped`）；超时由帧泵强制收尾。
+            *stop_at_btn.borrow_mut() = Some(std::time::Instant::now());
+            if let Some(w) = cw_stop.upgrade() {
+                w.set_status_is_error(false);
+                w.set_status_line("已请求停止……".into());
             }
         });
     }
@@ -9194,7 +9206,10 @@ pub fn run_gui() -> Result<()> {
         let pump = sc_pump.clone();
         let cap_slot = sc_cap.clone();
         let start_turn = start_sc_turn.clone();
+        let stop_at = sc_stop_at.clone();
         let clock = std::time::Instant::now();
+        /// 点了 ⏹ 之后最多再等这么久：超过就本地强制收尾（不再指望回合那边的结局事件）。
+        const STOP_WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
         let syschat_timer = slint::Timer::default();
         syschat_timer.start(
             slint::TimerMode::Repeated,
@@ -9206,6 +9221,50 @@ pub fn run_gui() -> Result<()> {
                 if let Some(rx) = cap_slot.borrow().as_ref() {
                     let cap = *rx.borrow();
                     pump.borrow_mut().set_support(cap);
+                }
+                // ── 停止看门狗（owner 2026-10-16）───────────────────────────────
+                // ⏹ 只发 `cancel()`，而界面状态**完全依赖回合那边的 `Stopped` 事件**；
+                // 执行层挂死/取消没被处理时那个事件永远不来 ⇒ 永久停在「正在输入」、
+                // ⏹ 看着像坏的（owner 报的现象）。超时即**本地强制收尾**，让界面能继续用。
+                if let Some(w) = win_w.upgrade() {
+                    if !w.get_busy() {
+                        // 回合已正常收尾：清掉陈旧时刻，别让下一次 ⏹ 立刻触发看门狗。
+                        *stop_at.borrow_mut() = None;
+                    } else if let Some(t0) = *stop_at.borrow() {
+                        if t0.elapsed() >= STOP_WATCHDOG_GRACE {
+                            *stop_at.borrow_mut() = None;
+                            // 已生成的正文/思考按「停止」的形态整段重建（打字机里的就是权威）。
+                            let text = tw_text.borrow().shown().to_string();
+                            let thought = tw_think.borrow().shown().to_string();
+                            let rows = stream_rows_w(
+                                &text,
+                                !thought.is_empty(),
+                                &thought,
+                                "",
+                                false,
+                                None,
+                                w.get_convo_text_width(),
+                            );
+                            let start = stream_start.get();
+                            if start != usize::MAX {
+                                sync_stream_rows(&syschat_model_t, start, rows);
+                            } else {
+                                for r in rows {
+                                    syschat_model_t.push(r);
+                                }
+                            }
+                            stream_start.set(usize::MAX);
+                            *stream_end.borrow_mut() = None;
+                            *cancel_slot.borrow_mut() = None;
+                            // 复位泵的在途标记但**保留队列**（不能丢用户排队的话）。
+                            pump.borrow_mut().abort();
+                            w.set_busy(false);
+                            w.set_status_is_error(false);
+                            w.set_status_line("已停止。".into());
+                            w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+                            dbg_stream_log(&w, &syschat_model_t, "stop-watchdog");
+                        }
+                    }
                 }
                 let mut dirty = false;
                 while let Ok(evt) = syschat_rx.try_recv() {

@@ -2927,6 +2927,15 @@ impl SendPump {
     pub fn clear(&mut self) {
         self.pending.clear();
     }
+
+    /// **强制置空闲**但**不动队列**（停止看门狗专用，owner 2026-10-16）。
+    ///
+    /// 为什么不能用 `finish()`：它会顺手弹出队首（那是「回合正常收尾、开下一轮」的语义），
+    /// 而看门狗的场景是「回合那边**已经不会再有结局事件**」——此时既要把 `in_flight` 复位
+    ///（否则之后的发送全被排进队列、永远轮不到），**又不能**丢掉用户已排队的话。
+    pub fn abort(&mut self) {
+        self.in_flight = false;
+    }
 }
 
 /// 构造一条系统对话的入站消息（Prompt 文本 + owner 身份 + syschat 标签）。
