@@ -484,7 +484,7 @@ grep -a "harness 装配" ~/.agent-bridge/logs/service.out | tail -1
 > 用 `LC_ALL=C grep -a` 或按字节数（python `data.count(pat.encode())`）。本轮实测：新构建与已装机两份二进制里
 > `添加附件（可多选，也可拖入窗口或 ⌘V 粘贴）`、`[selfresize] begin dir=`、`agent_thought_chunk`、`_session/steering` **都在（各 1）**。
 >
-> 📦 **最新暂存件**（2026-10-16 13:0x，`main = 71a8d7a`，v15：公式块去底色/思考块默认关闭且 1+10 行/生成贴底/单线分割/左右分栏/音视频去卡片）：`/Volumes/DataExt/tmp/ABB-stage-71a8d7a/ABB.app`（**已装机**；主二进制 sha256 `agent-bridge 08c676c6…`，与装机后逐字节一致；`Info.plist 2.23.117`）。旧 bundle 备份：`ABB.app.prev-20261016-*`。
+> 📦 **最新暂存件**（2026-10-16 14:0x，`main = 3317aca`，v16：音视频内联播放器（ffmpeg 逐帧流 + ffplay）/剪贴板图片/⌫ 删附件）：`/Volumes/DataExt/tmp/ABB-stage-3317aca/ABB.app`（**已装机**；主二进制 sha256 `agent-bridge b32de95d…`，与装机后逐字节一致；`Info.plist 2.23.117`）。旧 bundle 备份：`ABB.app.prev-20261016-*`。
 要用的时候只剩最后三段（quit / `mv` 备份 / `ditto` + `open`）。
 
 ### 7.3 接手第一小时建议
