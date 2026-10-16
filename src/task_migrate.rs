@@ -300,8 +300,8 @@ mod tests {
     use crate::config::SenderRole;
     use crate::schedule::{Job, JobKind, JobTarget};
 
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("abb-migrate-{tag}-{}", uuid::Uuid::new_v4()));
+    fn tmp(tag: &str) -> crate::testtmp::TempPath {
+        let p = crate::testtmp::TempPath::new(&format!("abb-migrate-{tag}"));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

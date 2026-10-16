@@ -3182,7 +3182,7 @@ fn assign_unique_keys_same_name_gets_suffix() {
 #[test]
 fn migrate_keys_renames_dirs_and_replaces_registrations() {
     // #174：旧 key（name）目录/登记 → 新 key（app_id）；幂等（二次调用无变化）
-    let base = std::env::temp_dir().join(format!("abb-migrate-{}", uuid::Uuid::new_v4()));
+    let base = crate::testtmp::TempPath::new("abb-migrate");
     std::fs::create_dir_all(base.join("workspaces/旧名bot")).unwrap();
     std::fs::create_dir_all(base.join("guard/旧名bot")).unwrap();
     std::fs::write(base.join("workspaces/旧名bot/pending.json"), "[]").unwrap();
@@ -3239,7 +3239,7 @@ fn migrate_keys_renames_onto_precreated_empty_target() {
     // 现场：platform::migrate_legacy_state 在 GUI 启动时无条件
     // create_dir_all(workspaces/<新 key>)，抢在 service 的 migrate_keys 之前——
     // 原实现「目标已存在跳过」把旧工作区整目录搁浅（老板真机庆小丰目录）。
-    let base = std::env::temp_dir().join(format!("abb-migrate-empty-{}", uuid::Uuid::new_v4()));
+    let base = crate::testtmp::TempPath::new("abb-migrate-empty");
     std::fs::create_dir_all(base.join("workspaces/旧名bot")).unwrap();
     std::fs::create_dir_all(base.join("guard/旧名bot")).unwrap();
     std::fs::write(base.join("workspaces/旧名bot/pending.json"), "[]").unwrap();
@@ -3275,7 +3275,7 @@ fn migrate_keys_renames_onto_precreated_empty_target() {
 #[test]
 fn migrate_keys_skips_nonempty_target() {
     // #178 反面护栏：非空目标绝不覆盖（可能已有数据，防覆盖）。
-    let base = std::env::temp_dir().join(format!("abb-migrate-nonempty-{}", uuid::Uuid::new_v4()));
+    let base = crate::testtmp::TempPath::new("abb-migrate-nonempty");
     std::fs::create_dir_all(base.join("workspaces/旧名bot")).unwrap();
     std::fs::write(base.join("workspaces/旧名bot/pending.json"), "[]").unwrap();
     std::fs::create_dir_all(base.join("workspaces/cli_newkey123456")).unwrap();
@@ -3310,7 +3310,7 @@ fn migrate_keys_same_name_dual_bot_no_transfer() {
     // bot1 留守（new==old）、bot2 是 mover。旧实现 bot2 会把 bot1 的目录 rename
     // 走、登记全局替换过户；新实现 contested 响亮跳过：目录/登记归留守 bot，
     // mover 以新键全新开始（宁可不迁不可迁错）。
-    let base = std::env::temp_dir().join(format!("abb-migrate-samename-{}", uuid::Uuid::new_v4()));
+    let base = crate::testtmp::TempPath::new("abb-migrate-samename");
     std::fs::create_dir_all(base.join("workspaces/龙虾")).unwrap();
     std::fs::write(base.join("workspaces/龙虾/bot1-data.json"), "bot1").unwrap();
     // 旧方案下双 bot 共用 key「龙虾」的登记（无法按 key 拆分归属）
@@ -3367,7 +3367,7 @@ fn migrate_keys_chain_moves_both_without_transfer() {
     // #186 链式变体回归护栏：bot2.name 恰等于 bot1.app_id——bot1 迁入的名字正是
     // bot2 要迁出的名字。必须 bot2 先搬走、bot1 再搬入（目录与登记替换皆然），
     // 否则 bot1 刚搬入的数据/登记被 bot2 二次搬走。
-    let base = std::env::temp_dir().join(format!("abb-migrate-chain-{}", uuid::Uuid::new_v4()));
+    let base = crate::testtmp::TempPath::new("abb-migrate-chain");
     std::fs::create_dir_all(base.join("workspaces/x2bot")).unwrap();
     std::fs::create_dir_all(base.join("workspaces/app1")).unwrap();
     std::fs::write(base.join("workspaces/x2bot/marker1"), "bot1").unwrap();
@@ -3431,7 +3431,7 @@ fn migrate_keys_swap_cycle_resolves_via_tmp() {
     // #186 环形变体回归护栏：bot1.name==bot2.app_id 且 bot2.name==bot1.app_id——
     // 互指成环（b2→a1 与 a1→b2 互为迁入/迁出）。以临时目录名断环两步搬，最终
     // 各归各位（目录与登记皆不串）。
-    let base = std::env::temp_dir().join(format!("abb-migrate-cycle-{}", uuid::Uuid::new_v4()));
+    let base = crate::testtmp::TempPath::new("abb-migrate-cycle");
     std::fs::create_dir_all(base.join("workspaces/b2")).unwrap();
     std::fs::create_dir_all(base.join("workspaces/a1")).unwrap();
     std::fs::write(base.join("workspaces/b2/marker1"), "bot1").unwrap();

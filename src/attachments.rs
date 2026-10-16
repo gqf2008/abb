@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn save_attachment_writes_file_and_meta() {
-        let dir = std::env::temp_dir().join(format!("abb-att-test-{}", uuid::Uuid::new_v4()));
+        let dir = crate::testtmp::TempPath::new("abb-att-test");
         let ws = dir.join("workspaces").join("bot-x");
         let bytes = b"hello attachment";
         let meta = save_attachment_in(
@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn read_attachment_bytes_reads_saved_file() {
-        let dir = std::env::temp_dir().join(format!("abb-read-{}", uuid::Uuid::new_v4()));
+        let dir = crate::testtmp::TempPath::new("abb-read");
         let ws = dir.join("workspaces").join("bot-x");
         let bytes = b"hello attachment bytes";
         let meta = save_attachment_in(
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn read_attachment_bytes_errors_on_empty_file() {
-        let dir = std::env::temp_dir().join(format!("abb-read-empty-{}", uuid::Uuid::new_v4()));
+        let dir = crate::testtmp::TempPath::new("abb-read-empty");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("empty.bin");
         std::fs::write(&path, b"").unwrap();
@@ -654,7 +654,7 @@ mod tests {
     /// 或吃爆内存，而且错误信息还会误报成「空文件」。
     #[test]
     fn read_attachment_bytes_rejects_non_regular_file() {
-        let dir = std::env::temp_dir().join(format!("abb-read-nonfile-{}", uuid::Uuid::new_v4()));
+        let dir = crate::testtmp::TempPath::new("abb-read-nonfile");
         std::fs::create_dir_all(&dir).unwrap();
         let meta = AttachmentMeta {
             kind: "file".into(),
@@ -690,7 +690,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn check_sendable_size_rejects_over_platform_cap() {
-        let dir = std::env::temp_dir().join(format!("abb-cap-{}", uuid::Uuid::new_v4()));
+        let dir = crate::testtmp::TempPath::new("abb-cap");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("too-big.pdf");
         let f = std::fs::File::create(&path).unwrap();
@@ -719,7 +719,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn read_attachment_bytes_rejects_over_hard_cap() {
-        let dir = std::env::temp_dir().join(format!("abb-read-big-{}", uuid::Uuid::new_v4()));
+        let dir = crate::testtmp::TempPath::new("abb-read-big");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("huge.bin");
         let f = std::fs::File::create(&path).unwrap();
