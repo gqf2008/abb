@@ -3614,6 +3614,37 @@ fn diag_media_player() {
     write_png(&f2, &dir.join("media-player-wide.png"));
 }
 
+/// 【诊断用·临时】逐个块类型量「布局相信的内容高 vs 真实最底墨迹」——找虚报高度的块。
+#[test]
+#[ignore = "诊断用；默认不跑"]
+fn diag_row_heights() {
+    let long: String = (0..20)
+        .map(|i| format!("第 {i} 行：用户要把架构图做成 HTML 页面，需要把图存成文件并配上说明，再套一个自适应模板。"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cases: Vec<(&str, SysChatBlockRow)> = vec![
+        ("role", role_row("怹", true)),
+        ("think-collapsed", think_row(&long, "3.2s", false, false)),
+        ("think-live(生成中)", think_row(&long, "", false, true)),
+        ("think-expanded", think_row(&long, "3.2s", true, false)),
+    ];
+    for (name, r) in cases {
+        let (ui, win, _m) = setup(vec![r], 4000);
+        ui.window().set_size(slint::PhysicalSize::new(520, 4000));
+        apply_syschat_layout(&ui, 520.0);
+        let f = settle_w(&win, 520, 4000);
+        let fy = ui.get_dbg_flick_y().round() as u32;
+        let believed = ui.get_dbg_content_h().round() as u32;
+        let ink = f.lowest_ink_row(0, 4000, 4, 519).unwrap_or(0);
+        println!(
+            "{name:<20} 布局相信={believed:<5} 真实最底={:<5} 差={}",
+            ink,
+            believed as i64 - ink as i64
+        );
+        let _ = fy;
+    }
+}
+
 /// 【诊断用·临时】思考块（折叠 + 展开）下面到底有没有线。
 #[test]
 #[ignore = "诊断用；默认不跑"]
@@ -3627,6 +3658,8 @@ fn diag_think_lines() {
     let long: &str = &long;
     let rows = vec![
         role_row("怹", true),
+        // 生成中（live、未展开）：一行窗口 —— 这条正是「白屏」的嫌疑对象（会不会虚报高）。
+        think_row(long, "", false, true),
         think_row(long, "3.2s", false, false),
         think_row(long, "", true, false),
         row("p", "正文在思考块下面一行。"),
@@ -3643,5 +3676,14 @@ fn diag_think_lines() {
     ui.window().set_size(slint::PhysicalSize::new(520, 700));
     apply_syschat_layout(&ui, 520.0);
     let f = settle_w(&win, 520, 700);
+    // 布局相信的内容高 vs 真实渲染的最底墨迹：差太多就是「虚报高度」⇒ 滞底会落到空白区（白屏）。
+    let fy = ui.get_dbg_flick_y().round() as u32;
+    let fh = ui.get_dbg_flick_h().round() as u32;
+    let believed = ui.get_dbg_content_h().round() as u32;
+    let ink = f.lowest_ink_row(fy, fy + fh, 4, 519).unwrap_or(0);
+    println!(
+        "内容高(布局相信)={believed} 真实最底墨迹偏移={}",
+        ink.saturating_sub(fy)
+    );
     write_png(&f, &dir.join("think-lines.png"));
 }

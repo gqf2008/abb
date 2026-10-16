@@ -4380,16 +4380,30 @@ export component SystemChatWindow inherits Window {
                                 // **不要**引用 `think-flick.height`——那会成绑定环（踩过）。
                                 if b.think-expanded || b.think-live: Rectangle {
                                     width: 100%;
-                                    // 正文行与虚线之间**显式留 5px**（owner：虚线跟文字挨在一起了，
-                                    // 要再往上 5px）——上留白做进容器高、Flickable 下移 5px，
-                                    // 比「再插一个 spacer 子项」可控（spacer 实测被行高吃掉）。
-                                    height: (b.think-expanded
+                                    // 正文行与虚线之间**显式留白**（owner：先要 5px、再说「再上移 10px」
+                                    // ⇒ 合计 15px）。做法是把留白做进容器高 + `Flickable.y`，**不用 spacer
+                                    // 子项**（spacer 会被行高吃掉、实测无效），也不用给布局子项写 `y`
+                                    // （布局会覆盖它）——所以改的是「文字下移多少」。
+                                    // ⚠️ Slint **不许同时写 `height` 与 `max-height`** ⇒ 用
+                                    // `min-height` + `max-height` 同一表达式把高度**钉死**：
+                                    // 这样既定「画多大」，又把布局问的 **preferred** 夹回真实可见高。
+                                    min-height: (b.think-expanded
                                         ? min(think-txt.preferred-height + 2px, 10 * 16px)
-                                        : 16px) + 5px;
+                                        : 16px) + 15px;
+                                    // ⚠️ **必须同时给 `max-height`**：`height` 只定「画多大」，布局问的是
+                                    // **preferred**，而里面那个 `Flickable` 的 preferred 会带上
+                                    // `content-height`（= 整段思考文本的高）⇒ 这个容器会**虚报高度**
+                                    //（实测：布局相信 512px、真实内容只到 450px；思考越长报得越多）。
+                                    // 后果就是 owner 反复报的**白屏**：滞底把 `content-y` 夹到
+                                    // 「虚报出来的底部」，而那里什么都没有 ⇒ 消息区整片空白
+                                    //（状态行还在「正在思考」）。`max-height` 把 preferred 钉回真实可见高。
+                                    max-height: (b.think-expanded
+                                        ? min(think-txt.preferred-height + 2px, 10 * 16px)
+                                        : 16px) + 15px;
                                     clip: true;
                                     background: transparent;
                                     think-flick := Flickable {
-                                        y: 5px;
+                                        y: 15px;
                                         width: 100%;
                                         height: b.think-expanded
                                             ? min(think-txt.preferred-height + 2px, 10 * 16px)
