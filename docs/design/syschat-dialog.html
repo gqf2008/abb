@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABB 系统对话 · 设计稿 v21</title>
+<title>ABB 系统对话 · 设计稿 v21.1</title>
 <style>
   :root{
     --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
@@ -332,7 +332,7 @@
 <!-- /左列 -->
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v21</h1>
+  <h1>ABB 系统对话 · 设计稿 v21.1</h1>
   <div class="sub">本轮：交互细化（面板位置 / 截屏 / 上下文用量条 / 可拉升 / 消息动作 / 归档 / 新建去重）</div>
   <div class="sub" style="color:var(--info)"><b>v11 新增的交互要求</b>（本稿先画示意，walgit 已登记待逐步实现）</div>
   <ol>
@@ -370,6 +370,12 @@
     <li><b>安全与保真两条硬口径</b>：<code>&lt;style&gt;/&lt;script&gt;/&lt;head&gt;</code> 的<b>内容整段丢弃</b>
       （否则 CSS/JS 源码会被当正文画出来）；<b>缺配对的闭合标签时原样显示源码</b>
       ——宁可给人看源码，<b>绝不吞内容</b>。</li>
+    <li><b>内联 <code>data:</code> URI 媒体（v21.1，owner 现场截图后补）</b>：agent 常把「自包含 HTML」
+      里的媒体写成 <code>data:image/png;base64,…</code>／<code>data:video/mp4;base64,…</code>。
+      本仓的媒体解析原先只认**本地路径**与 **http(s)** ⇒ 内联媒体全成死链（截图里的「图片打不开」）。
+      现在 <b>base64 解码 + 落媒体缓存 + 复用既有渲染/播放链路</b>（图片块、音视频卡都不改）；
+      扩展名先按文件头嗅探、再退回 mime（<code>image/svg+xml</code> 这类文本格式嗅不出来）。
+      <b>不做</b>非 base64（百分号编码）的 data URI——那种极少见，遇到就走原路径、绝不猜。</li>
     <li><b>实现</b>：新增 <code>src/htmlmd.rs</code>（HTML → Markdown 文本），<b>复用</b>既有
       <code>mdblocks</code> 管线 ⇒ HTML 得到的排版与 markdown <b>逐字节同源</b>（表格线、公式、媒体、
       代码选择全都一致），不并排写第二套块解析器。</li>

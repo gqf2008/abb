@@ -1361,6 +1361,99 @@ pub fn media_cache_path(url: &str) -> Option<PathBuf> {
 
 /// 下载 http(s) 媒体到本地缓存（已在缓存则直接返回）。
 /// 供 GUI 后台线程调用；失败返回可读原因（GUI 显示为链接回退，不崩）。
+/// `data:` URI（内联 base64 媒体）→ 落进媒体缓存并返回**本地路径**；非 data URI 返回 `None`。
+///
+/// 为什么必须有这条：agent 常把「自包含 HTML」里的图片/视频写成 `data:image/png;base64,…`/
+/// `data:video/mp4;base64,…`（owner 2026-10-16 现场截图：整篇文字骨架 + 「图片打不开」）。
+/// 本仓的媒体解析只认**本地路径**与 **http(s)**，data URI 被当成文件名去找 ⇒ 必然找不到。
+/// 这里把它解码落盘，之后**完全复用**既有渲染/播放链路（图片块、音视频卡都不改）。
+///
+/// 缓存键沿用 [`media_cache_file`]（整个 URI 的 sha256 ⇒ payload 变了键就变）；扩展名先按
+/// **文件头**嗅探、再退回 mime（`data:image/svg+xml` 这类文本格式嗅不出来，只能靠 mime）。
+pub fn data_uri_path(src: &str) -> Option<PathBuf> {
+    let rest = src.strip_prefix("data:")?;
+    if let Some(hit) = media_cache_path(src) {
+        return Some(hit);
+    }
+    let (meta, payload) = rest.split_once(',')?;
+    if !meta.to_ascii_lowercase().contains("base64") {
+        // 非 base64（百分号编码）的 data URI 极少见，**不做**：返回 None 让调用方走原路径。
+        return None;
+    }
+    let mime = meta
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let bytes = base64_decode(payload)?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let ext = sniff_media_ext(&bytes).or_else(|| ext_from_mime(&mime))?;
+    let path = media_cache_file(src).with_extension(ext);
+    if path.is_file() {
+        return Some(path);
+    }
+    let parent = path.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &bytes).ok()?;
+    std::fs::rename(&tmp, &path).ok()?;
+    Some(path)
+}
+
+/// mime → 扩展名（嗅探不出来时的兜底：svg 是文本、容器格式靠 mime 更稳）。
+fn ext_from_mime(mime: &str) -> Option<&'static str> {
+    Some(match mime {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/bmp" => "bmp",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        "video/webm" => "webm",
+        "audio/mpeg" => "mp3",
+        "audio/mp4" | "audio/x-m4a" => "m4a",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/aac" => "aac",
+        "audio/ogg" => "ogg",
+        _ => return None,
+    })
+}
+
+/// 标准字母表 base64 解码（项目原则：零依赖，手写）。容忍换行/空白（data URI 常被折行）。
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &c in s.as_bytes() {
+        if c.is_ascii_whitespace() || c == b'=' {
+            continue;
+        }
+        let v = val(c)?;
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
 pub async fn fetch_media(url: &str) -> Result<PathBuf, String> {
     if let Some(p) = media_cache_path(url) {
         return Ok(p);
@@ -5815,6 +5908,31 @@ mod tests {
     /// `file://` URL 按绝对路径处理（含 `%20` 解码与 `localhost` host 剥离）。
     /// 变异点：删掉 `strip_prefix("file://")` 分支 ⇒ `file:///tmp/a.png` 会被当成
     /// 相对路径拼到基准下，本测红。
+    /// `data:` URI 支持（owner 2026-10-16：自包含 HTML 里的内联媒体全是死链）。
+    ///
+    /// 只测**纯函数**部分（base64 解码与 mime→扩展名）——落盘那半段会写真实运行目录，
+    /// 不适合放进单测（隔离门禁的纪律）。
+    #[test]
+    fn data_uri_base64_decoding_and_mime_ext() {
+        // 1×1 PNG 的标准 base64（含 `=` padding）。
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+        let bytes = super::base64_decode(png).expect("应能解码");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "PNG magic 要对");
+        // 容忍折行/空白（data URI 常被折段）。
+        let folded = format!("{}\n  {}\n", &png[..20], &png[20..]);
+        assert_eq!(super::base64_decode(&folded).unwrap(), bytes);
+        // 非法字符 ⇒ None（不能让坏数据变成「半张图」）。
+        assert!(super::base64_decode("!!!!").is_none());
+        // mime → 扩展名（嗅探不出来时的兜底；svg 是文本、容器格式只能靠 mime）。
+        assert_eq!(super::ext_from_mime("image/svg+xml"), Some("svg"));
+        assert_eq!(super::ext_from_mime("video/mp4"), Some("mp4"));
+        assert_eq!(super::ext_from_mime("audio/mpeg"), Some("mp3"));
+        assert_eq!(super::ext_from_mime("application/zip"), None);
+        // 非 base64 / 非 data 前缀：明确返回 None（调用方走原路径，绝不猜）。
+        assert!(super::data_uri_path("https://a.b/x.png").is_none());
+        assert!(super::data_uri_path("data:text/plain,hello").is_none());
+    }
+
     #[test]
     fn resolve_media_path_handles_file_url() {
         let base = std::path::Path::new("/tmp/abb-ws-probe");

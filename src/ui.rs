@@ -3036,14 +3036,16 @@ fn load_block_image(src: &str) -> (slint::Image, bool, f32) {
     if src.is_empty() {
         return (slint::Image::default(), false, 0.0);
     }
-    let path: Option<std::path::PathBuf> =
-        if src.starts_with("http://") || src.starts_with("https://") {
-            crate::syschat::media_cache_path(src)
-        } else {
-            // 不能用进程 CWD：agent 输出的相对路径是相对它的工作区（= syschat 工作区）
-            let p = crate::syschat::resolve_media_path(src);
-            p.is_file().then_some(p)
-        };
+    let path: Option<std::path::PathBuf> = if let Some(p) = crate::syschat::data_uri_path(src) {
+        // 内联 base64 媒体（`data:image/png;base64,…`）：解码落缓存后走同一条加载路径。
+        Some(p)
+    } else if src.starts_with("http://") || src.starts_with("https://") {
+        crate::syschat::media_cache_path(src)
+    } else {
+        // 不能用进程 CWD：agent 输出的相对路径是相对它的工作区（= syschat 工作区）
+        let p = crate::syschat::resolve_media_path(src);
+        p.is_file().then_some(p)
+    };
     let Some(path) = path else {
         return (slint::Image::default(), false, 0.0);
     };
@@ -3209,7 +3211,10 @@ fn block_row_w(b: crate::mdblocks::MdBlock, flow_w: f32, align_right: bool) -> S
     // ⚠️ 必须**在 `r` 构造之前**算（`b.src` 随后会被 move 进 `r`），并且**在 `r.img_aspect =
     // img_aspect` 之后**才写回（否则会被 `load_block_image` 的结果顶掉——踩过）。
     let media = if b.kind == "audio" || b.kind == "video" {
-        let path = crate::syschat::resolve_media_path(&b.src);
+        // 内联 base64（`data:video/mp4;base64,…`）也要能播——否则「自包含 HTML」里的音视频
+        // 全是死链（owner 现场截图的「🎬 视频（MP4 内联）」）。
+        let path = crate::syschat::data_uri_path(&b.src)
+            .unwrap_or_else(|| crate::syschat::resolve_media_path(&b.src));
         let info = crate::mediaplay::probe_cached(&path);
         let dur = info.as_ref().map(|i| i.duration_ms).unwrap_or(0);
         let aspect = info
@@ -8818,7 +8823,8 @@ pub fn run_gui() -> Result<()> {
                     })
                 });
                 let Some(idx) = idx else { return };
-                let path = crate::syschat::resolve_media_path(&s);
+                let path = crate::syschat::data_uri_path(&s)
+                    .unwrap_or_else(|| crate::syschat::resolve_media_path(&s));
                 let Some(info) = crate::mediaplay::probe_cached(&path) else {
                     return;
                 };
@@ -8904,7 +8910,9 @@ pub fn run_gui() -> Result<()> {
         let cw = syschat_win.as_weak();
         syschat_win.on_copy_image(move |src| {
             let s = src.as_str();
-            let resolved = if s.starts_with("http://") || s.starts_with("https://") {
+            let resolved = if let Some(p) = crate::syschat::data_uri_path(s) {
+                Some(p)
+            } else if s.starts_with("http://") || s.starts_with("https://") {
                 crate::syschat::media_cache_path(s)
             } else {
                 let p = crate::syschat::resolve_media_path(s);
