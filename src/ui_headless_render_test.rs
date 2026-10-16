@@ -613,34 +613,26 @@ fn acts_row_draws_and_its_speak_label_tracks_speaking_turn() {
     let h_without = ui0.get_dbg_content_h();
 
     let (ui, win, _) = setup(with, TALL_H);
-    let f_idle = settle(&ui, &win, TALL_H);
+    let _ = settle(&ui, &win, TALL_H);
     let h_with = ui.get_dbg_content_h();
     assert!(
         h_with > h_without + 20.0,
         "动作行必须真的占位（无动作行 {h_without} vs 有 {h_with}）"
     );
 
-    // 「朗读」态：本行的轮号 = 正在朗读的轮号。
+    // 朗读态的**像素**判据在图标化之后不成立了：v14 起按钮只留字形（`🔊` ⇄ `⏹`），
+    // 而这两个字形都是 emoji——无头台没有 emoji 字体（`§6`：布局可信、字形别下结论），
+    // 两帧逐像素相同。⇒ 改成**源码守卫**：朗读钮的图标必须由 `root.speaking-turn` 决定。
+    let src = include_str!("../ui/app.slint");
+    assert!(
+        src.contains("icon: b.turn == root.speaking-turn"),
+        "朗读钮的图标必须按 `speaking-turn` 切换（否者点朗读后没有停止入口）"
+    );
+    // 反向控制：真的切换轮号时不再断言像素（见上），但至少保证状态设置不 panic。
     ui.set_speaking_turn(ASSISTANT_TURN);
-    let f_speaking = settle(&ui, &win, TALL_H);
-    // 别的轮在朗读 ⇒ 本行仍是「🔊 朗读」（按钮不该全窗一起变）。
-    ui.set_speaking_turn(ASSISTANT_TURN + 1);
-    let f_other = settle(&ui, &win, TALL_H);
+    let _ = settle(&ui, &win, TALL_H);
     ui.set_speaking_turn(-2);
-    let f_back = settle(&ui, &win, TALL_H);
-
-    assert!(
-        f_idle.diff_px(&f_speaking) > 0,
-        "朗读态必须改变这一行的像素（按钮字面变「⏹ 停止朗读」）"
-    );
-    assert!(
-        f_idle.diff_px(&f_other) == 0,
-        "别轮在朗读时本行不该变（否则说明三元没按轮号区分）"
-    );
-    assert!(
-        f_idle.diff_px(&f_back) == 0,
-        "停止朗读后必须回到原样（-2 = 没有朗读在跑）"
-    );
+    let _ = settle(&ui, &win, TALL_H);
 }
 
 /// 三个动作按钮真的**收得到点击**，且把**本行的轮序号**带出来（`copy_turn(1)`）。
@@ -682,8 +674,10 @@ fn acts_buttons_route_clicks_with_their_turn() {
         .expect("正面控制失败：看不到动作行");
     let cols = groups(&f.ink_cols(y_border, 4, W - 4));
     let (bx0, bx1) = cols.first().copied().expect("下边框行应有墨迹列");
+    // 图标钮是 26px 宽 + 6px 圆角 ⇒ **最底一行**的墨迹比整宽窄（约 15px），
+    // 只要求够定位到按钮中心即可（判据是点击路由，不是像素宽度）。
     assert!(
-        bx1 - bx0 > 20,
+        bx1 - bx0 >= 8,
         "判据构造失败：第一个按钮的下边框应有一条横向墨迹（量到 {}px）",
         bx1 - bx0
     );
@@ -3518,4 +3512,24 @@ fn diag_table_rows() {
     apply_syschat_layout(&ui, 420.0);
     let f = settle_w(&win, 420, 400);
     write_png(&f, &dir.join("table-rows.png"));
+}
+
+/// 【诊断用·临时】远程图片管线：下载 → 缓存 → 行里能加载（需要网络）。
+#[test]
+#[ignore = "需要网络；诊断用"]
+fn diag_remote_image_pipeline() {
+    let url = "https://placehold.co/600x240/2f6fed/ffffff?text=Markdown+Image";
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let got = rt.block_on(crate::syschat::fetch_media(url));
+    println!("fetch_media → {got:?}");
+    println!("cache_path → {:?}", crate::syschat::media_cache_path(url));
+    let md = format!("![占位图]({url})");
+    let mut rows: Vec<SysChatBlockRow> = Vec::new();
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(&md), 416.0);
+    for r in &rows {
+        println!(
+            "kind={} img_ok={} aspect={:.3}",
+            r.kind, r.img_ok, r.img_aspect
+        );
+    }
 }

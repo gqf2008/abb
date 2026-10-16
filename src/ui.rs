@@ -3028,14 +3028,19 @@ fn load_block_image(src: &str) -> (slint::Image, bool, f32) {
     let Some(path) = path else {
         return (slint::Image::default(), false, 0.0);
     };
-    // 只读头部拿尺寸（不解码整图）；SVG 走 `svg_aspect`（`image` crate 读不了 SVG）。
-    let aspect = image::image_dimensions(&path)
-        .ok()
-        .and_then(|(w, h)| (w > 0 && h > 0).then(|| h as f32 / w as f32))
-        .or_else(|| svg_aspect(&path))
-        .unwrap_or(0.0);
     match slint::Image::load_from_path(&path) {
-        Ok(img) => (img, true, aspect),
+        Ok(img) => {
+            // 宽高比从**已解码的图**上取（`Image::size()` 是物理像素）：比 `image` crate 的
+            // `image_dimensions` 更全——我们自己的 `image` 只开了 png，JPEG/SVG 都会被它判失败，
+            // 而 Slint 的加载器还带 jpeg + 自带 svg 解码器。`svg_aspect` 只作兜底。
+            let s = img.size();
+            let aspect = if s.width > 0 && s.height > 0 {
+                s.height as f32 / s.width as f32
+            } else {
+                svg_aspect(&path).unwrap_or(0.0)
+            };
+            (img, true, aspect)
+        }
         Err(_) => (slint::Image::default(), false, 0.0),
     }
 }
@@ -8167,16 +8172,14 @@ pub fn run_gui() -> Result<()> {
     // `sync_stream_rows` 注释里写明这个已知边界）。
     {
         let model = syschat_model.clone();
-        let cw = syschat_win.as_weak();
         syschat_win.on_toggle_think(move |idx| {
             let i = idx.max(0) as usize;
             if let Some(mut r) = model.row_data(i) {
                 if r.kind == "think" {
                     r.think_expanded = !r.think_expanded;
                     model.set_row_data(i, r);
-                    if let Some(w) = cw.upgrade() {
-                        w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
-                    }
+                    // **不**碰 `scroll-epoch`：那会强制滞底（owner 反馈「点开思考会显示最底部」）。
+                    // 展开/收起只让这一块在原地长/缩，视图位置保持不动。
                 }
             }
         });
@@ -8601,6 +8604,31 @@ pub fn run_gui() -> Result<()> {
             platform::open_path(&crate::syschat::resolve_media_path(s));
         }
     });
+    // 图片**右键 = 复制到系统剪贴板**（稿 v14；图片不再提供「打开」）。
+    // 路径解析与 `open_media` 同源：远程走本地缓存，本地按工作区基准。
+    {
+        let cw = syschat_win.as_weak();
+        syschat_win.on_copy_image(move |src| {
+            let s = src.as_str();
+            let resolved = if s.starts_with("http://") || s.starts_with("https://") {
+                crate::syschat::media_cache_path(s)
+            } else {
+                let p = crate::syschat::resolve_media_path(s);
+                p.is_file().then_some(p)
+            };
+            let Some(w) = cw.upgrade() else { return };
+            match resolved {
+                Some(p) if crate::platform::copy_image_to_clipboard(&p) => {
+                    w.set_status_is_error(false);
+                    w.set_status_line("已复制图片到剪贴板。".into());
+                }
+                _ => {
+                    w.set_status_is_error(true);
+                    w.set_status_line("复制图片失败：图片还没下载好，或文件已不在。".into());
+                }
+            }
+        });
+    }
     // 普通链接 / 图片回退：http(s)/mailto 等交浏览器；`file://` 与无 scheme 的本地路径
     // 按同一工作区基准解析后用系统「打开」（否则相对路径链接必打不开）。
     syschat_win.on_open_link(|url| {
@@ -9051,8 +9079,12 @@ pub fn run_gui() -> Result<()> {
                     let rows =
                         stream_rows_w(&text, has_thought, &thought, &elapsed, live, None, flow_w);
                     sync_stream_rows(&syschat_model_t, stream_start.get(), rows);
+                    // 流式每拍**只在用户已经贴底时**才强制滞底：否则他往上滚看历史时会被
+                    // 每个分片拽回底部（owner 反馈「生成中滚动会白屏/被打断」）。
                     if let Some(w) = win_w.upgrade() {
-                        w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+                        if w.get_convo_at_bottom() {
+                            w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+                        }
                     }
                 }
             },

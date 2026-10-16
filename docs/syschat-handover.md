@@ -413,7 +413,12 @@ after#2 = 0,231 520×560
 - **设计稿已回写到 v13**（`docs/design/syschat-dialog.html`）：新增「v13：markdown/数学渲染规格」九条（标题字号、代码/引用/图片+说明条/表格/数学/思考块/动作行字形/三条已知未对齐），并把 mock 里过时的 `思考过程 · 3.2s` 与 `⧉`/`⟳` 改成跟实现一致的口径。
 - **表格行间距：根因是「行没给显式高度」**（2026-10-16 owner 反馈「行之间不应该有间距」）。`HorizontalBox` 里各格各自算高 ⇒ 行与行之间露出 ~8–10px。修法：`TableRow.row-h`（Rust 侧 = 本行最高格 + 8px），行与格子都显式给这个高（格子不高会被压成 0 高、文字溢出到下一行——也踩过）。
 - **图片按 markdown 规范**（owner 给的口径，**推翻**上一轮照稿加的边框/说明条/按钮）：只有图本身（无边框、无 caption、无「打开」按钮）；加载不出来时给一行可点的提示（`🖼 alt（图片打不开）`），不做卡片。
-- **「GUI 打开很慢」的根因 = 排版上下文被反复重建**：`inlineflow` 以前**每次排版都 `FontContext::new()`**，而它要建 fontique 字体集、首次还要扫系统字体 ⇒ 每个单元格重来一遍。实测那份「markdown 全能示例」构建行：**4.07s → 0.55s（复用 thread-local `CTX` 后）**；再加两层 memo（`(TeX,字号)` → 公式图；`(文本,公式,宽,字号,对齐)` → 混排结果）与**尺寸 sidecar**（`<hash>-<字号>.svg` 旁边写 `<hash>-<字号>.meta` 存 `w h ascent depth`，热路径只加载图、不再跑 ratex 全流程），同进程重建从 4.07s 降到**冷 ~0.45s / 热 ~0.8ms**。守卫：`font_context_is_reused_not_rebuilt_per_layout`（源码断言不许回到每调用一 new）。**别再把 `FontContext::new()` 写进循环**。
+- **「GUI 打开很慢」的根因 = 排版上下文被反复重建**：`inlineflow` 以前**每次排版都 `FontContext::new()`**，而它要建 fontique 字体集、首次还要扫系统字体 ⇒ 每个单元格重来一遍。实测那份「markdown 全能示例」构建行：**4.07s → 0.55s（复用 thread-local `CTX` 后）**；再加两层 memo（`(TeX,字号)` → 公式图；`(文本,公式,宽,字号,对齐)` → 混排结果）与**尺寸 sidecar**（`<hash>-<字号>.svg` 旁边写 `<hash>-<字号>.meta` 存 `w h ascent depth`，热路径只加载图、不再跑 ratex 全流程），同进程重建从 4.07s 降到**冷 ~0.45s / 热 ~0.8ms**。守卫 `font_context_is_reused_not_rebuilt_per_layout`（源码断言不许回到每调用一 new）。**别再把 `FontContext::new()` 写进循环**。
+- **v14（2026-10-16 owner 口径）**：动作行**只留图标**（`📋`/`↻`/`🔊`，文案走 Tooltip）；**展开思考块不得跳到底**；**远程图片要能显示**；**图片右键 = 复制**（不再「打开」）。
+- **「远程图片一直显示不出来」的根因 = 缓存文件没扩展名**：`fetch_media` 写的是 `<sha256>`（无后缀），而 **Slint 靠扩展名选解码器** ⇒ `load_from_path` 永远失败、`img_ok=false`（验证：`diag_remote_image_pipeline` 里 `fetch_media` 返回 Ok 但行里 `img_ok=false`）。修法：下载后按**文件头** sniff 后缀（png/jpg/gif/webp/bmp/ico/avif/svg）写成 `<sha256>.<ext>`；`media_cache_path` **只认带合法后缀的**（旧的无后缀缓存直接忽略，等下次重下）。另：宽高比改从**已解码的 `slint::Image::size()`** 取——我们自己的 `image` crate 只开了 `png`，JPEG/SVG 都会被 `image_dimensions` 判失败。
+- **图片右键复制**：Slint 1.18 **没有 `right-clicked`**，要用 `TouchArea.pointer-event` 看 `button == right && kind == up`；写剪贴板走 `NSPasteboard`（`[[NSImage alloc] initWithContentsOfFile:]` → `writeObjects:@[img]`），手写 objc_msgSend FFI（与 `pasteboard_file_paths` 同款零依赖）。
+- **展开思考块会跳到最底**：元凶是 `on_toggle_think` 里的 `set_scroll_epoch(+1)`——epoch 会把 `content-y` 设成越界值再由夹取落到**底部**。删掉即好（原地长/缩）。
+- **流式时用户往上滚会被拽回**（owner 报「生成中滚动会白屏/被打断」）：新增只读属性 `convo-at-bottom`，流式每拍**只在已经贴底时**才强制滞底。⚠️ **白屏现象本机未复现**（无头台无真实渲染器），这一条是先把「抢滚动」这个确定的问题收掉；若白屏仍在，需要真机现场信息（什么时机/能不能恢复）。
 
 **其它**
 - 媒体/图片的相对路径基准是 **`~/.agent-bridge/workspaces/syschat/`**（不是进程 CWD）；`file://` 要按绝对路径处理。

@@ -3650,6 +3650,33 @@ component ModelChip inherits Rectangle {
 // 而是作为 tooltip（owner 口径：图标 + 文案作 tooltip）。
 // v10 位置：输入框**内**底部功能区的**一行**（右对齐：😊 📎 ✂ 🗑 ⋯），
 // 不再有框外左竖排图标列（稿 v9 第 2 条）。
+// 消息动作的**图标按钮**（稿 v14 `.acts .a`）：26×22、2px 边框、暖底、图标居中；
+// 文案走 `Tooltip`——owner 口径「按钮上不要文字」。
+component ActsIcon inherits Rectangle {
+    in property <string> icon: "";
+    in property <string> tip: "";
+    callback clicked();
+    width: 26px;
+    height: 22px;
+    background: hit2.has-hover ? PixelTheme.hover : PixelTheme.bg;
+    border-width: 2px;
+    border-color: PixelTheme.edge;
+    border-radius: 6px;
+    Text {
+        width: 100%;
+        height: 100%;
+        text: root.icon;
+        font-size: 12px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    hit2 := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Tooltip { text: @markdown("\{root.tip}"); }
+}
+
 component ComposerIcon inherits Rectangle {
     in property <string> icon: "";
     in property <string> tip: "";
@@ -3956,6 +3983,11 @@ export component SystemChatWindow inherits Window {
     // 「内容高是否小于真实渲染高」在像素上量不出来（溢出部分被裁掉了），只能由窗口自报。
     // 消费者是`cargo test` 里的无头渲染台（`src/ui_headless_render_test.rs`，用软件渲染后端把本窗
     // 画到位图后断言）；**只读、无副作用**，不改生产行为。
+    // 消息区是否已经贴底（Rust 侧决定「流式时要不要强制滞底」）：
+    // 用户在生成中往上滚去看历史时，**不许**每个分片把他拽回底部（owner 2026-10-16：
+    // 生成中滚动会白屏/被打断）。判据带 4px 容差，贴底时的亚像素差不影响。
+    out property <bool> convo-at-bottom: flick.content-y
+        >= flick.content-height - flick.height - 4px;
     out property <length> dbg-flick-y: flick.y;
     out property <length> dbg-flick-h: flick.height;
     out property <length> dbg-content-h: flick.content-height;
@@ -4016,6 +4048,8 @@ export component SystemChatWindow inherits Window {
     // 第二行「模型 · 状态」是否在画（稿 `.status .st2 .l2`）——无头断言用。
     out property <bool> dbg-status-second-line: root.model-index >= 0 && root.model-index < root.model-labels.length;
     callback open-media(string);   // 音视频媒体卡：「用系统播放器打开」
+    // 图片**右键 = 复制到系统剪贴板**（稿 v14：图片不做「打开」，右键才是复制）。
+    callback copy-image(string);
     callback open-link(string);    // 图片 http 失败/普通链接：用浏览器打开
     // slint-pixel 标题栏契约（impl_title_bar_ui! 要求这四个回调存在）
     callback drag-start();
@@ -4516,19 +4550,33 @@ export component SystemChatWindow inherits Window {
                         // 现在高度显式由「视口宽 × 源宽高比」算，夹在 [120, 360]；未知比例回落 200px。
                         // 设计稿 `.media img{width:100%;height:auto}` 的口径 = 按比例、不裁剪（contain）。
                         // 图片（2026-10-16 owner 口径）：**遵守 markdown 规范**——只有图本身，
-                        // **没有边框、没有说明条、没有「打开」按钮、没有卡片**。
-                        // 高度仍按「视口宽 × 源宽高比」显式算（裸容器不会被 `Image` 撑高：
-                        // 以前该块只向布局报 ~30px、图片却实画 ~200px ⇒ 后面文字被盖住）。
-                        if b.kind == "image" && b.img-ok: Image {
+                        // 无边框、无 caption、无「打开」按钮；**右键 = 复制图片**（左键不做事）。
+                        // 高度仍按「视口宽 × 源宽高比」显式算（裸容器不会被 `Image` 撑高）。
+                        if b.kind == "image" && b.img-ok: Rectangle {
                             width: 100%;
                             height: max(
                                 120px,
                                 min(360px, root.convo-text-width * b.img-aspect)
                             );
-                            source: b.img;
-                            image-fit: contain;
+                            background: transparent;
+                            Image {
+                                width: 100%;
+                                height: 100%;
+                                source: b.img;
+                                image-fit: contain;
+                            }
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                pointer-event(e) => {
+                                    // Slint 1.18 没有 `right-clicked`，只能看 `pointer-event` 的 button/kind。
+                                    if e.button == right && e.kind == up {
+                                        root.copy-image(b.src);
+                                    }
+                                }
+                            }
+                            Tooltip { text: @markdown("右键复制图片"); }
                         }
-                        // 加载不出来（路径不存在 / 远程未缓存）：给一行**可点的提示**，不做卡片/按钮。
+                        // 加载不出来（路径不存在 / 远程还没下好）：只给一行**提示**，不可点（不提供「打开」）。
                         if b.kind == "image" && !b.img-ok: Rectangle {
                             width: 100%;
                             height: 20px;
@@ -4537,13 +4585,9 @@ export component SystemChatWindow inherits Window {
                                 text: "🖼 " + b.alt + "（图片打不开）";
                                 width: 100%;
                                 font-size: 12px;
-                                color: UiTokens.info;
+                                color: UiTokens.text-dim;
                                 vertical-alignment: center;
                                 overflow: elide;
-                            }
-                            TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { root.open-media(b.src); }
                             }
                         }
                         if b.kind == "audio" || b.kind == "video": Rectangle {
@@ -4612,28 +4656,26 @@ export component SystemChatWindow inherits Window {
                         }
                         // 助手轮动作行（稿 v11.1 `.acts`，卡 `abb-v11-message-actions`）：
                         // `⧉ 复制` / `⟳ 重新生成` / `🔊 朗读`；朗读进行中该行的按钮变 `⏹ 停止朗读`。
+                        // 消息动作（稿 v14 `.acts`）：**只留图标**，文案走 Tooltip（owner 口径：
+                        // 按钮上不要文字）。图标仍用能渲染的：`📋`/`↻`/`🔊`——原稿 `⧉`(U+29C9)/
+                        // `⟳`(U+27F3) 系统 UI 字体没有，真机会画方框。
                         if b.kind == "acts": HorizontalLayout {
                             width: 100%;
                             spacing: 6px;
                             // 稿 `.acts{margin:6px 0 0}`：上间距 6px（用 padding-top 表达）
                             padding-top: 6px;
                             alignment: start;
-                            // 字形：稿写 `⧉ 复制 / ⟳ 重新生成`，但系统 UI 字体（SF）**没有**
-                            // `⧉`(U+29C9)/`⟳`(U+27F3)（只在 Apple Symbols/STIX 里，Slint 的回退拿不到）
-                            // ⇒ 真机渲染成方框（owner 2026-10-16 截图）。换成能渲染的：copy 用
-                            // emoji `📋`（与已验可行的 `🔊` 同类）、regen 用 `↻`(U+21BB，SF 自带，
-                            // 无头台实测可渲染）。已回写设计稿并注明原因。
-                            PixelButton {
-                                text: "📋 复制";  size: "small";
+                            ActsIcon {
+                                icon: "📋";  tip: "复制整轮正文";
                                 clicked => { root.copy_turn(b.turn); }
                             }
-                            PixelButton {
-                                text: "↻ 重新生成";  size: "small";
+                            ActsIcon {
+                                icon: "↻";  tip: "用该轮的用户提示重跑";
                                 clicked => { root.regen_turn(b.turn); }
                             }
-                            PixelButton {
-                                text: b.turn == root.speaking-turn ? "⏹ 停止朗读" : "🔊 朗读";
-                                size: "small";
+                            ActsIcon {
+                                icon: b.turn == root.speaking-turn ? "⏹" : "🔊";
+                                tip: b.turn == root.speaking-turn ? "停止朗读" : "朗读这一轮";
                                 clicked => { root.speak_turn(b.turn); }
                             }
                         }

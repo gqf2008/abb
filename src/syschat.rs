@@ -1297,19 +1297,74 @@ pub fn media_cache_file(url: &str) -> PathBuf {
     dir().join("media-cache").join(hex)
 }
 
+/// Slint 能按扩展名解码的图片后缀（`i-slint-core` 的 `image` 依赖开了 `png`+`jpeg`，
+/// 另有 `svg`/`gif` 等自身解码器）。**没扩展名的缓存一律不认**——Slint 靠扩展名选解码器，
+/// 这正是「远程图片一直显示不出来」的根因（旧缓存文件名就是纯 hash）。
+const MEDIA_CACHE_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "avif",
+];
+
+/// 从**文件头**猜图片后缀（下载落盘时用；`None` = 不认识的格式，宁可报错也别写个假扩展名）。
+fn sniff_media_ext(bytes: &[u8]) -> Option<&'static str> {
+    let b = bytes;
+    if b.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Some("png");
+    }
+    if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpg");
+    }
+    if b.starts_with(b"GIF8") {
+        return Some("gif");
+    }
+    if b.len() > 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if b.starts_with(b"BM") {
+        return Some("bmp");
+    }
+    if b.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        return Some("ico");
+    }
+    if b.len() > 12 && &b[4..8] == b"ftyp" && (&b[8..12] == b"avif" || &b[8..12] == b"avis") {
+        return Some("avif");
+    }
+    // SVG 是文本：看开头一小段里有没有 `<svg`
+    let head = &b[..b.len().min(512)];
+    if head.windows(4).any(|w| w == b"<svg") {
+        return Some("svg");
+    }
+    None
+}
+
 /// 已缓存的 http(s) 媒体路径（未缓存返回 None）。
 pub fn media_cache_path(url: &str) -> Option<PathBuf> {
-    let p = media_cache_file(url);
-    p.is_file().then_some(p)
+    let base = media_cache_file(url);
+    let hex = base.file_name()?.to_string_lossy().to_string();
+    let parent = base.parent()?;
+    // 缓存文件名 = `<sha256>.<ext>`（见 `MEDIA_CACHE_EXTS` 的原因）。目录里按前缀找
+    // ——**无扩展名的旧文件直接忽略**（Slint 读不了，留着只会让图片永远不显示）。
+    for entry in std::fs::read_dir(parent).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix(&hex) else {
+            continue;
+        };
+        let Some(ext) = rest.strip_prefix('.') else {
+            continue;
+        };
+        if MEDIA_CACHE_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
+            return Some(entry.path());
+        }
+    }
+    None
 }
 
 /// 下载 http(s) 媒体到本地缓存（已在缓存则直接返回）。
 /// 供 GUI 后台线程调用；失败返回可读原因（GUI 显示为链接回退，不崩）。
 pub async fn fetch_media(url: &str) -> Result<PathBuf, String> {
-    let path = media_cache_file(url);
-    if path.is_file() {
-        return Ok(path);
+    if let Some(p) = media_cache_path(url) {
+        return Ok(p);
     }
+    let path = media_cache_file(url);
     let parent = path
         .parent()
         .map(PathBuf::from)
@@ -1325,6 +1380,9 @@ pub async fn fetch_media(url: &str) -> Result<PathBuf, String> {
         .bytes()
         .await
         .map_err(|e| format!("读取响应失败：{e}"))?;
+    // 按**文件头**定扩展名（Slint 靠扩展名选解码器；没有扩展名就永远加载不出来）。
+    let ext = sniff_media_ext(&bytes).ok_or_else(|| "下载回来的不是认识的图片格式".to_string())?;
+    let path = path.with_extension(ext);
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, &bytes).map_err(|e| format!("写入缓存失败：{e}"))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("落盘缓存失败：{e}"))?;

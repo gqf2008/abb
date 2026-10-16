@@ -172,6 +172,87 @@ pub fn copy_to_clipboard(text: &str) -> bool {
     child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
+/// 把一张**图片文件**写进系统剪贴板（图片右键「复制」）。
+///
+/// macOS 走 `NSPasteboard`：`[[NSImage alloc] initWithContentsOfFile:]` → `writeObjects:@[img]`
+/// （`NSImage` 符 `NSPasteboardWriting`，粘贴到其他 App 就是图片本身）。与
+/// [`pasteboard_file_paths`] 同款「手写 objc_msgSend FFI、不引 objc crate」的口径。**主线程**调。
+/// 非 macOS 暂不支持（返回 false，调用方给状态行）。
+#[cfg(target_os = "macos")]
+pub fn copy_image_to_clipboard(path: &std::path::Path) -> bool {
+    use std::ffi::{c_char, c_void};
+    use std::sync::OnceLock;
+
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn objc_msgSend();
+    }
+    let Some(cpath) = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok() else {
+        return false;
+    };
+    type Sels = (usize, usize, usize, usize, usize, usize);
+    static SELS: OnceLock<Sels> = OnceLock::new();
+    let (string_utf8, init_file, general, clear, arr_one, write_objs) =
+        *SELS.get_or_init(|| unsafe {
+            (
+                sel_registerName(c"stringWithUTF8String:".as_ptr()) as usize,
+                sel_registerName(c"initWithContentsOfFile:".as_ptr()) as usize,
+                sel_registerName(c"generalPasteboard".as_ptr()) as usize,
+                sel_registerName(c"clearContents".as_ptr()) as usize,
+                sel_registerName(c"arrayWithObject:".as_ptr()) as usize,
+                sel_registerName(c"writeObjects:".as_ptr()) as usize,
+            )
+        });
+    unsafe {
+        // NSString/NSImage 都是「先 alloc 再 init」两步；这里给 alloc 一个 msg0。
+        let alloc: unsafe extern "C" fn(Id, Sel) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let cstr_msg: unsafe extern "C" fn(Id, Sel, *const c_char) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let msg0: unsafe extern "C" fn(Id, Sel) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let msg1: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let clear_ret: unsafe extern "C" fn(Id, Sel) -> i64 =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let bool_ret: unsafe extern "C" fn(Id, Sel, Id) -> i8 =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+
+        let alloc_sel = sel_registerName(c"alloc".as_ptr());
+        let nsstring = cstr_msg(
+            objc_getClass(c"NSString".as_ptr()),
+            string_utf8 as Sel,
+            cpath.as_ptr(),
+        );
+        if nsstring.is_null() {
+            return false;
+        }
+        let img_cls = objc_getClass(c"NSImage".as_ptr());
+        let img = msg1(alloc(img_cls, alloc_sel), init_file as Sel, nsstring);
+        if img.is_null() {
+            return false;
+        }
+        let pb = msg0(objc_getClass(c"NSPasteboard".as_ptr()), general as Sel);
+        if pb.is_null() {
+            return false;
+        }
+        clear_ret(pb, clear as Sel);
+        let arr = msg1(objc_getClass(c"NSArray".as_ptr()), arr_one as Sel, img);
+        if arr.is_null() {
+            return false;
+        }
+        bool_ret(pb, write_objs as Sel, arr) != 0
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn copy_image_to_clipboard(_path: &std::path::Path) -> bool {
+    false
+}
+
 /// 当前可执行文件路径（GUI 本体）。
 pub fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("拿不到当前可执行文件路径")
