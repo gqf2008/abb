@@ -4380,14 +4380,20 @@ export component SystemChatWindow inherits Window {
                                 // **不要**引用 `think-flick.height`——那会成绑定环（踩过）。
                                 if b.think-expanded || b.think-live: Rectangle {
                                     width: 100%;
-                                    height: b.think-expanded
+                                    // 正文行与虚线之间**显式留 5px**（owner：虚线跟文字挨在一起了，
+                                    // 要再往上 5px）——上留白做进容器高、Flickable 下移 5px，
+                                    // 比「再插一个 spacer 子项」可控（spacer 实测被行高吃掉）。
+                                    height: (b.think-expanded
                                         ? min(think-txt.preferred-height + 2px, 10 * 16px)
-                                        : 16px;
+                                        : 16px) + 5px;
                                     clip: true;
                                     background: transparent;
                                     think-flick := Flickable {
+                                        y: 5px;
                                         width: 100%;
-                                        height: 100%;
+                                        height: b.think-expanded
+                                            ? min(think-txt.preferred-height + 2px, 10 * 16px)
+                                            : 16px;
                                         content-width: self.width;
                                         content-height: think-txt.preferred-height + 2px;
                                         // 没展开时那 1 行窗口不需要用户去滚（它就是看最新一行的）。

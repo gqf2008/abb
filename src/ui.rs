@@ -3985,11 +3985,20 @@ pub fn run_gui() -> Result<()> {
         start: usize,
         rows: Vec<SysChatBlockRow>,
     ) {
-        while model.row_count() > start {
-            model.remove(model.row_count() - 1);
+        // **原地更新**（不是「先把这一段删光再 push」）：后者会经过一个「这一段一行都没有」的
+        // 中间态，配合每 50ms 一拍的重建，实测出现**白屏/闪烁**（owner 2026-10-16 反馈
+        // 「生成时内容渲染会白屏卡顿」）。原地 set 则始终有内容，只是逐字变长。
+        let n = rows.len();
+        for (i, r) in rows.into_iter().enumerate() {
+            let idx = start + i;
+            if idx < model.row_count() {
+                model.set_row_data(idx, r);
+            } else {
+                model.push(r);
+            }
         }
-        for r in rows {
-            model.push(r);
+        while model.row_count() > start + n {
+            model.remove(model.row_count() - 1);
         }
     }
     // 当前会话里还没缓存的 http(s) 媒体（图片/音视频）——交给后台下载。
@@ -8301,8 +8310,12 @@ pub fn run_gui() -> Result<()> {
     {
         let cw = syschat_win.as_weak();
         // 重新生成**复用唯一提交入口** `submit_sc`（同上屏/落点判定/状态行与手动发送完全一致），
-        // 避免两条发送路径漂移。语义：把该轮用过的**用户提问**再发一次（追加在会话末尾）。
+        // 避免两条发送路径漂移。语义（稿 v18）：**原来的不要了，重新来**——先按提示词下标
+        // 丢掉该助手轮及其之后的轮，**同时把对话区按截断后的历史重载**（只改盘上历史不够，
+        // 否则界面里旧的还在 = 看起来像追加生成），再重发那条用户提问。
         let submit = submit_sc.clone();
+        let model_regen = syschat_model.clone();
+        let pump_regen = sc_pump.clone();
         syschat_win.on_regen_turn(move |turn| {
             let Some(w) = cw.upgrade() else { return };
             match crate::syschat::action_target(&crate::syschat::load_history(), turn) {
@@ -8321,6 +8334,10 @@ pub fn run_gui() -> Result<()> {
                         // 再重跑那条用户提示（`submit` 会把用户轮重新追加，最终形态与原来一致）。
                         let from = t.prompt_index.unwrap_or(t.index);
                         let dropped = crate::syschat::drop_turns_from(from).unwrap_or(0);
+                        // ⚠️ 必须**重载对话区**：只截断盘上历史的话，模型里旧的行还在 ⇒
+                        // 用户看到的是「新答复追加在旧的后面」（owner 2026-10-16 反馈）。
+                        pump_regen.borrow_mut().clear();
+                        load_syschat_into(&w, &model_regen);
                         w.set_status_is_error(false);
                         w.set_status_line(
                             format!(

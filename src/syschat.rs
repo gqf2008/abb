@@ -3121,10 +3121,16 @@ impl Typewriter {
         Self::default()
     }
 
-    /// 每拍最多推进的字符数：积压越多推进越快（约减半追赶），已追平取 0。
-    /// `max(1, pending / 2)` ⇒ 小段逐字、大段十来拍收口。
+    /// 每拍推进的字符上限（配合 50ms 的流式定时器 ≈ 80 字/秒）。
+    pub const STEP_CAP: usize = 4;
+
+    /// 每拍最多推进的字符数：`max(1, pending/2)`，再**封顶 [`Self::STEP_CAP`]**。
+    ///
+    /// 为什么封顶（owner 2026-10-16「生成时没有打字机效果」）：后端一次可能吐很大一段，
+    /// 纯「减半追赶」会一拍显示一半 ⇒ 观感是**整段蹦出来**。封顶后即使积压很大也是每拍
+    /// 固定几字（50ms 一拍 ⇒ 约 80 字/秒），既看得见打字机、也不会拖太久。
     pub fn step_for(pending: usize) -> usize {
-        (pending / 2).max(1)
+        (pending / 2).clamp(1, Self::STEP_CAP)
     }
 
     /// 追加已到手的文本（权威侧，只增不减）。空段忽略。
@@ -4203,7 +4209,8 @@ mod tests {
         assert!(!tw.tick(), "收尾后不再变化");
     }
 
-    /// 大段自适应追赶：积压越多每拍推进越多，十来拍收口（不是逐字拖几秒）。
+    /// 大段追赶：积压越多每拍推进越多，但**每拍封顶 `STEP_CAP`**（否则大段一拍蹦出来、
+    /// 看不见打字机——owner 2026-10-16 反馈）。
     #[test]
     fn typewriter_catches_up_big_chunks_within_few_ticks() {
         let mut tw = Typewriter::new();
@@ -4214,7 +4221,10 @@ mod tests {
             ticks += 1;
         }
         assert!(tw.done());
-        assert!(ticks <= 12, "200 字应在 ≤12 拍内追平，实际 {ticks}");
+        assert!(
+            ticks <= 60,
+            "200 字应在 ≤60 拍内追平（每拍封顶 4 字），实际 {ticks}"
+        );
         assert_eq!(tw.shown().chars().count(), 200);
     }
 
