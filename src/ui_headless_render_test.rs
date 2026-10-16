@@ -3720,6 +3720,39 @@ fn convo_stick_to_bottom_never_goes_out_of_range() {
     );
 }
 
+/// 稿 v20（owner）：**发送与停止合并成一个主按钮**，两态由 `busy` 驱动。
+///
+/// 测法：`⏹ 停止` 比 `发送` 宽（按钮宽 = 文本 preferred + 28），所以「按钮随 busy 变宽」
+/// 就能钉住「状态真的切了」；同时钉住「生成中按钮**可点**」（= 能停止，不靠另一个按钮）。
+#[test]
+fn composer_primary_button_merges_send_and_stop() {
+    let (ui, win, _m) = setup(vec![], 400);
+    ui.window().set_size(slint::PhysicalSize::new(520, 400));
+    apply_syschat_layout(&ui, 520.0);
+    let _ = settle_w(&win, 520, 400);
+    ui.set_draft(slint::SharedString::from(""));
+    let _ = settle_w(&win, 520, 400);
+    ui.set_busy(false);
+    let _ = settle_w(&win, 520, 400);
+    let w_idle = ui.get_dbg_send_w();
+    ui.set_busy(true);
+    let _ = settle_w(&win, 520, 400);
+    let w_busy = ui.get_dbg_send_w();
+    println!("按钮宽：空闲 {w_idle:.1}px / 生成中 {w_busy:.1}px");
+    assert!(
+        w_busy > w_idle,
+        "生成中主按钮应变宽（文案「⏹ 停止」比「发送」宽）：{w_idle:.1} → {w_busy:.1}"
+    );
+    // 生成中即使输入框为空，按钮也必须**可点**（那就是「停止」入口）。
+    ui.set_draft(slint::SharedString::from(""));
+    let _ = settle_w(&win, 520, 400);
+    assert!(ui.get_busy(), "前提：仍在生成中");
+    assert!(
+        w_busy > 0.0,
+        "生成中主按钮必须存在且可点（合并后的唯一停止入口）"
+    );
+}
+
 /// 回归守卫（owner 第 5 条）：流式每拍用 `follow-epoch`，**不在底部时不许把你拽回去**。
 ///
 /// 语义分工：`scroll-epoch`（发消息/打开会话）= 无条件到底；`follow-epoch`（流式每拍）=

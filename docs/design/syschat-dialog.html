@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABB 系统对话 · 设计稿 v19</title>
+<title>ABB 系统对话 · 设计稿 v20</title>
 <style>
   :root{
     --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
@@ -280,7 +280,8 @@
           <summary><span class="chev">▸</span> 思考中</summary>
           <div class="body">先确认目标目录，再写 index.html；顺便把下载入口补上…</div>
         </details>
-        <div class="tbar">正在输入<span class="caret-t"></span><button class="stopbtn">⏹ 停止</button></div>
+        <!-- v20：停止钮**合并进输入区主按钮**（生成中该按钮变「⏹ 停止」）；这里只留「正在输入」+ 光标 -->
+        <div class="tbar">正在输入<span class="caret-t"></span></div>
         <p style="margin:4px 0">页面主体已写好，接下来把说明区换成等宽字体<span class="caret-t"></span></p>
         <!-- v11：消息可选中文复制；助手轮给 复制 / 重新生成 / 朗读 -->
         <div class="acts">
@@ -314,7 +315,8 @@
             <div class="ib mark" data-m="7" title="清空当前会话">🗑</div>
             <div class="ib" title="更多（含定时发送）">⋯</div>
           </div>
-          <button class="send">发送</button>
+          <!-- v20：主按钮两态——空闲「发送」(accent) / 生成中「⏹ 停止」(panel+edge) -->
+          <button class="send" id="primary">发送 <span class="dim">/ ⏹ 停止</span></button>
         </div>
       </div>
       <!-- v11：表情面板**贴着功能区按钮上方**弹出（此前飘太远）；「更多」同款 -->
@@ -330,7 +332,7 @@
 <!-- /左列 -->
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v19</h1>
+  <h1>ABB 系统对话 · 设计稿 v20</h1>
   <div class="sub">本轮：交互细化（面板位置 / 截屏 / 上下文用量条 / 可拉升 / 消息动作 / 归档 / 新建去重）</div>
   <div class="sub" style="color:var(--info)"><b>v11 新增的交互要求</b>（本稿先画示意，walgit 已登记待逐步实现）</div>
   <ol>
@@ -352,6 +354,15 @@
     <li><b>新建会话图标</b>：<code>＋</code> → <b>对话气泡</b>图标（同 logo 里那个气泡，14px，墨黑描边色），放在 历史会话 <code>🗂</code> 左边。</li>
     <li><b>附件移进输入框内</b>：输入区**不再有框外图标列**；框内底部一行（靠右）＝ <code>[😊 表情] [📎 附件] [✂ 截图] [⋯ 更多(定时)]</code> + <code>发送</code> + <code>🗑 清空</code>，全部**同一水平线**。</li>
     <li><b>输入区边距一致</b>：去掉框外图标列后，输入框左右各留 10px（原来右侧偏大）。</li>
+  </ol>
+  <div class="sub" style="color:var(--info)"><b>v20：发送/停止合并成一个按钮 / 生成中可插话（打断本轮）</b>（2026-10-16 owner 口径）</div>
+  <ol>
+    <li><b>只留一个主按钮</b>：输入区右侧那个按钮是<b>两态</b>——空闲时 <code>发送</code>（accent 底、<code>on-accent</code> 字），
+      <b>生成中变 <code>⏹ 停止</code></b>（panel 底 + 2px edge 描边、<code>text</code> 字）。点它：空闲 ⇒ 发送；生成中 ⇒ 停止。
+      ⇒ 消息区「正在输入」条上的那个 <code>⏹ 停止</code> <b>删掉</b>（同一条动作不在两处出现）。</li>
+    <li><b>生成中「插话」走回车</b>：输入框在生成中仍可打字，<b>回车 = 插话</b>——有能力时<b>注入在途回合</b>（模型当轮就能看到，
+      即「打断当前思路」），不支持时<b>排队</b>等本轮跑完（落点由 Rust 的 <code>SendPump</code> 判定，按钮旁边如实提示）。</li>
+    <li><b>文案</b>：生成中提示改「生成中：回车插话（打断本轮）· 点 ⏹ 停止」，空闲仍「给怹发消息，回车发送」。</li>
   </ol>
   <div class="sub" style="color:var(--info)"><b>v19：表格线内外有别 / 思考虚线配色 / 重新生成＝替换</b>（2026-10-16 owner 口径）</div>
   <ol>
