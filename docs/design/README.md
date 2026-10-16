@@ -66,3 +66,113 @@ open docs/design/syschat-dialog.html
 
 复制/选择/拖入的文件**先落盘**到 `~/.agent-bridge/workspaces/syschat/`（沿用现有「bot 工作区」约定），
 再把**文件路径**随消息文本一起进 prompt（agent 自己按需读取），不把二进制塞进 prompt。
+
+---
+
+## 第三方参考稿（非 ABB 设计稿）
+
+### [`chatwoot-inbox-ui.html`](chatwoot-inbox-ui.html) — Chatwoot 交互原型
+
+配合 `docs/research-chatwoot-omnichannel-inbox.md` / `docs/research-chatwoot-voip.md` 阅读。
+**单文件、零外链、零构建、零依赖**，浏览器直接打开（`open docs/design/chatwoot-inbox-ui.html`）。
+
+**不是静态截图**——hash 路由的 18 个页面 + 8 类弹层，带真实状态与交互。
+
+#### 坐席端
+
+| 页面 | 路由 | 交互 |
+|---|---|---|
+| 登录 | `#/login` | 登录进工作区（带其他 hash 打开会自动登录，便于深链） |
+| 收件箱 | `#/inbox` | 未读 / 分配给我 / 待处理 + 概览卡片 |
+| 会话（三栏） | `#/conversations/:id` | 发消息 · 私密备注 · 引用回复 · 通话气泡 · **解决 / 重开 / Pending / 催办** · 分配 · **宏** · 筛选 / 搜索 · **批量操作** · 联系人面板三 Tab |
+| 联系人 | `#/contacts` · `#/contacts/:id` | 搜索、详情、历史会话跳转、**合并联系人** |
+| 报表 | `#/reports?tab=overview\|conversations\|agents\|csat` | 折线图、CSAT 环形/分布/趋势、按坐席表、最新反馈 |
+| 帮助中心 | `#/portals` | 门户切换、文章表 |
+| Captain（AI） | `#/captain` | 总开关、Assistants / Tools、解决趋势 |
+| 通话 | `#/calls` · `#/calls/:id` | 通话表 + 「模拟来电」；详情含录音波形与转写 |
+| 设置 | `#/settings/:tab` | **22 个 Tab**（见下） |
+| 客户端挂件 | `#/widget` | Northwind 演示站上的 Chatwoot Widget（6 个屏） |
+
+#### 保存视图（Folders）+ 筛选构建器
+
+- 侧边栏「保存的视图」树：5 个内置视图 + 「新建视图」，带未读角标。
+- 点视图 → `#/conversations?folder=:id` → 列表按其条件过滤，标题显示名称与命中数。
+- **筛选构建器**（列表筛选图标 / 新建视图）：名称 + **AND/OR** + 条件行（`属性 ▾ 运算符 ▾ 值`），
+  实时预览「当前命中 N 条」；可**仅应用**（临时筛选，标题带"未保存"角标）或**保存为视图**（可再编辑 / 删除）。
+- 条件属性：会话状态 / 优先级 / 收件箱 / 负责坐席 / 负责团队 / 标签 / SLA / 未读 / 联系人姓名。
+
+#### 状态流转与批量操作
+
+- 四个状态 **open / pending / snoozed / resolved** 全可走；催办写 `snoozeUntil` 并出黄条横幅；列表 8 个筛选 Tab。
+- **批量模式**：全选 / 分配 / 加标签 / 催办 / 解决 / 删除 / 退出。
+
+#### 设置页（22 个 Tab）
+
+| 分组 | Tab |
+|---|---|
+| Account | 个人资料 · 坐席 · 团队 · 标签 · 自定义属性 · **角色与权限** |
+| Channels | 收件箱（含 inbox 详情）· 集成 · 看板应用 |
+| Automation | 自动化规则 · 宏 · 快捷回复 · SLA 策略 · 分配策略 |
+| Personal | **通知设置** |
+| Security | SAML SSO · **审计日志** · 计费 |
+
+其中完整可交互的：
+
+- **自动化规则编辑器**：名称 / 描述 / 触发事件 + **条件构建器** + **动作构建器**（12 种动作，各带参数控件）+ **试运行**。
+- **宏**：同样的动作构建器，会话头部 `⚡` 点一下即执行（真的改状态、打标签、发消息）。
+- **快捷回复**：增 / 改 / 删；回复框 `/` 弹窗读同一份数据。
+- **SLA 策略**：FRT / NRT / RT + 适用收件箱 + 启用开关 + 超时计数。
+- **分配策略**：每收件箱策略 + 容量上限 + 负载进度条 + 坐席负载表。
+- **角色与权限**：4 个角色卡片 + **6 资源 × 4 动作的权限矩阵**（点击方格切换；内置角色锁定），新建 / 删除角色。
+- **审计日志**：按类型（会话/联系人/成员/渠道/设置）+ 关键词筛选，导出 CSV；合并联系人与改角色会自动写入。
+- **通知设置**：7 个事件 × 3 个渠道（邮件/桌面/推送）的开关矩阵 + 免打扰。
+
+#### 联系人合并
+
+联系人详情「合并到…」→ 选目标 → **逐字段选保留哪一列**（姓名/邮箱/电话/公司/地点）→ 合并：
+会话迁移到会话更多的一方、标签取并集、另一方删除、写审计日志、跳转到存活记录。
+
+#### VoIP 弹层
+
+来电响铃卡（接听青 / 拒接红）+ 通话中悬浮窗（计时 / REC / 静音 / 挂断 / **实时转写**）+ 通话详情（录音波形 + 说话人分离转写）。
+挂断会真的往线程插一条 `voice_call` 消息并写进通话记录。
+
+#### 全局交互与深链参数
+
+- `⌘K` 命令面板 · 明暗主题 · 密度切换 · Toast · 下拉菜单 · 弹窗 · **通知中心（🔔）** · **快捷键面板（`?`）**
+- 快捷键 `c` `i` `k` `d` `r` `e` `?`
+- URL 参数（供截图 / 深链）：`?theme=dark` · `?wg=` · `?call=ringing|active` · `?bulk=1` · `?bell=1` · `?sc=1`
+  · `?snoozed=1` · `?folder=:id` · `?adhoc=1` · `?filters=1` · `?merge=1` · `?tab=csat` · `?role=r3`
+
+#### 忠实度
+
+- 配色令牌逐条取自 `app/javascript/dashboard/assets/scss/_next-colors.scss`（Radix 色阶，明暗两套完整搬入），
+  通话卡另取 `--call-widget-*` 四色；
+- 消息气泡语义对齐 `components-next/message/bubbles/Base.vue`；通话卡对齐 `components-next/call/CallCard.vue`；
+  侧边栏对齐 `components-next/sidebar/Sidebar.vue`；
+- 自动化 / 宏 / 权限 / 保存视图的字段与概念对齐 Chatwoot（简化了运算符与参数集）。
+
+#### 自测
+
+打开 `#/selftest` 跑 **131 条断言**，输出 `ALL PASS`。覆盖：路由 · 消息 · 备注 · 解决/重开/催办/Pending ·
+状态筛选 · 分配 · 搜索 · 命令面板 · 批量 · **保存视图与筛选求值（含 AND/OR、命中预览、保存/删除、临时筛选）** ·
+**联系人合并（会话迁移 / 标签并集 / 字段选择 / 审计）** · 18 个页面渲染 · 自动化规则（增删条件动作 / 求值 / 试运行 / 保存） ·
+宏执行 · 快捷回复 CRUD · SLA / 分配 · **CSAT 报表** · **审计筛选** · **权限矩阵（含内置锁定 / 新角色 / 计数）** ·
+**通知偏好** · 主题/密度 · 挂件 6 屏 · 来电卡 / 通话中 / 计时 / 实时转写 / 挂断落库 / 通话详情 · 数据完整性。
+
+#### 预览截图（1728×1050，本机 headless 实渲）
+
+| | |
+|---|---|
+| [会话·明色](chatwoot-inbox-ui-light.png) | [会话·暗色](chatwoot-inbox-ui-dark.png) |
+| [保存的视图](chatwoot-inbox-ui-folders.png) | [筛选构建器](chatwoot-inbox-ui-filter-builder.png) |
+| [批量操作 + 催办](chatwoot-inbox-ui-bulk.png) | [自动化规则编辑器](chatwoot-inbox-ui-automations.png) |
+| [角色与权限矩阵](chatwoot-inbox-ui-roles.png) | [CSAT 报表](chatwoot-inbox-ui-csat.png) |
+| [联系人合并](chatwoot-inbox-ui-merge.png) | [通知中心](chatwoot-inbox-ui-notifications.png) |
+| [客服挂件（客户端）](chatwoot-inbox-ui-widget.png) | [来电响铃卡](chatwoot-inbox-ui-incoming.png) |
+| [通话中 + 实时转写](chatwoot-inbox-ui-active.png) | [通话详情](chatwoot-inbox-ui-calldetail.png) |
+| [报表](chatwoot-inbox-ui-reports.png) | [联系人](chatwoot-inbox-ui-contacts.png) |
+| [设置](chatwoot-inbox-ui-settings.png) | [Captain](chatwoot-inbox-ui-captain.png) |
+
+> ⚠️ 仅用于界面参考，非官方产物、非 ABB 设计稿。数据是内置演示数据（Acme Inc / Northwind），
+> 全部在内存里，刷新即重置，不连任何后端；少量按钮（表情、附件、导入导出）是占位，点了只弹 Toast。
