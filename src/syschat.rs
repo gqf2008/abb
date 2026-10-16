@@ -78,6 +78,9 @@ pub struct ActionTarget {
     /// `⟳ 重新生成` 要重跑的**用户提示词**：该轮之前最近的一条用户轮。
     /// 该轮之前没有用户轮（异常历史）⇒ `None`，调用方给可见提示而不是发空消息。
     pub prompt: Option<String>,
+    /// 上面那条用户轮在历史里的下标（`⟳ 重新生成` 要从这里**丢弃到末尾**再重跑）。
+    /// 与 `prompt` 同生共死（`prompt.is_none()` ⇔ 这里为 `None`）。
+    pub prompt_index: Option<usize>,
 }
 
 /// 解析助手轮动作行的目标（纯函数，单测钉住）。
@@ -95,15 +98,13 @@ pub fn action_target(turns: &[Turn], turn: i32) -> Option<ActionTarget> {
         return None;
     }
     let text = turns[index].text.clone();
-    let prompt = turns[..index]
-        .iter()
-        .rev()
-        .find(|t| t.role == "user")
-        .map(|t| t.text.clone());
+    let prompt_index = turns[..index].iter().rposition(|t| t.role == "user");
+    let prompt = prompt_index.map(|i| turns[i].text.clone());
     Some(ActionTarget {
         index,
         text,
         prompt,
+        prompt_index,
     })
 }
 
@@ -2682,6 +2683,46 @@ fn clear_session_locked(store: &SessionStore, id: &str) -> std::io::Result<()> {
             .map_err(|e| std::io::Error::other(format!("写入会话索引失败：{e}")))?;
     }
     Ok(())
+}
+
+/// 丢弃**从 `from` 起（含）到末尾**的全部历史轮，返回丢掉的条数。
+///
+/// 用途：`⟳ 重新生成` 的口径是「**原来的不要了、重新来**」——先把该轮（及其之后，因为后面
+/// 那些是基于旧答复产生的）删掉，再重跑那条用户提示。**不删任何其它会话**。
+///
+/// 实现：历史是追加式 JSONL ⇒ 截断要**重写文件**（先写 `.tmp` 再 rename，与 `save` 同款原子性）。
+/// `from >= len` 时不做任何事；`from == 0` 是**合法**的（重新生成第一轮时就是要从第 0 条
+/// 开始丢——随后 `submit` 会把那条用户轮重新追加回来，不是「清空」语义）。
+pub fn drop_turns_from(from: usize) -> Result<usize, String> {
+    let store = SessionStore::production();
+    let _g = store.lock()?;
+    drop_turns_from_locked(&store, from)
+}
+
+/// [`drop_turns_from`] 的实现：**调用方必须已持历史锁**（单测用临时 base 直接驱动）。
+fn drop_turns_from_locked(store: &SessionStore, from: usize) -> Result<usize, String> {
+    let mut state = store.load();
+    store.ensure_current(&mut state);
+    let id = state.current.clone();
+    let turns = store.read_history(&id);
+    if from >= turns.len() {
+        return Ok(0);
+    }
+    let dropped = turns.len() - from;
+    let keep = &turns[..from];
+    let path = store.history_path(&id);
+    let mut buf = String::new();
+    for t in keep {
+        buf.push_str(&serde_json::to_string(t).unwrap_or_default());
+        buf.push('\n');
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建目录失败：{e}"))?;
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, buf.as_bytes()).map_err(|e| format!("写入历史失败：{e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("落盘历史失败：{e}"))?;
+    Ok(dropped)
 }
 
 /// 截断单条文本到 [`MAX_HISTORY_CHARS`] 字符（按 char，避免切断 UTF-8）。

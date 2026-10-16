@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABB 系统对话 · 设计稿 v17</title>
+<title>ABB 系统对话 · 设计稿 v19</title>
 <style>
   :root{
     --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
@@ -330,7 +330,7 @@
 <!-- /左列 -->
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v17</h1>
+  <h1>ABB 系统对话 · 设计稿 v19</h1>
   <div class="sub">本轮：交互细化（面板位置 / 截屏 / 上下文用量条 / 可拉升 / 消息动作 / 归档 / 新建去重）</div>
   <div class="sub" style="color:var(--info)"><b>v11 新增的交互要求</b>（本稿先画示意，walgit 已登记待逐步实现）</div>
   <ol>
@@ -352,6 +352,18 @@
     <li><b>新建会话图标</b>：<code>＋</code> → <b>对话气泡</b>图标（同 logo 里那个气泡，14px，墨黑描边色），放在 历史会话 <code>🗂</code> 左边。</li>
     <li><b>附件移进输入框内</b>：输入区**不再有框外图标列**；框内底部一行（靠右）＝ <code>[😊 表情] [📎 附件] [✂ 截图] [⋯ 更多(定时)]</code> + <code>发送</code> + <code>🗑 清空</code>，全部**同一水平线**。</li>
     <li><b>输入区边距一致</b>：去掉框外图标列后，输入框左右各留 10px（原来右侧偏大）。</li>
+  </ol>
+  <div class="sub" style="color:var(--info)"><b>v19：表格线内外有别 / 思考虚线配色 / 重新生成＝替换</b>（2026-10-16 owner 口径）</div>
+  <ol>
+    <li><b>表格外框粗、内线细</b>（原来<b>颠倒了</b>）：每格四周都画 1px 时，相邻两格叠出内侧 2px、外沿反而 1px。口径改成<b>每条边界只画一次</b>——格子只画「右边 + 下边」各 1px，四个外沿按行列位置叠 <b>2px</b>。</li>
+    <li><b>思考块展开的虚线不能用稿里那个色</b>：<code>#e2d7bf</code> 与思考卡暖底几乎同色（<b>真机上看不见</b>）⇒ 用卡片描边同色 <code>#d9cdb4</code>（本稿此处口径随之更正）。</li>
+    <li><b><code>⟳ 重新生成</code> ＝ 原来的不要了，重新来</b>：执行时先<b>丢弃该助手轮及其之后的全部轮</b>（后面的内容是旧答复的下文），再重跑那条用户提示；状态行如实报「已丢弃旧的 N 条」。</li>
+  </ol>
+  <div class="sub" style="color:var(--info)"><b>v18：音频 = 正方形方块</b>（2026-10-16 owner 口径）</div>
+  <ol>
+    <li><b>音频不是长条，是正方形</b>：音频块就是一个 <b>56×56 的方块</b>（2px 描边、圆角 6、暖底），
+      居中一个 <b>▶/⏸</b>；名称走 <code>Tooltip</code>（不占版面）。方块跟着「用户靠右 / 怹靠左」对齐。</li>
+    <li>视频仍是「封面 + 控件 + 说明条」的卡片（不动）。</li>
   </ol>
   <div class="sub" style="color:var(--info)"><b>v17：播放器细节（音频极简 / 宽度自适应 / 思考虚线）</b>（2026-10-16 owner 口径）</div>
   <ol>

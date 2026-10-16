@@ -4342,9 +4342,11 @@ export component SystemChatWindow inherits Window {
                                         clicked => { root.toggle-think(i); }
                                     }
                                 }
-                                // 稿 `details.think .body{border-top:2px dashed #e2d7bf}`：展开态标题与
-                                // 正文之间那条**虚线**。Slint 没有 dashed 边框（§6），用一排小块拼：
+                                // 稿 `details.think .body{border-top:2px dashed …}`：展开态标题与正文
+                                // 之间那条**虚线**。Slint 没有 dashed 边框（§6），用一排小块拼：
                                 // 每块 `horizontal-stretch: 1` ⇒ 无论块多宽都铺满，缝宽固定 4px。
+                                // ⚠️ 颜色不能照抄稿的 `#e2d7bf`：它和卡片暖底几乎同色，**真机上看不见**
+                                //（owner 2026-10-16 反馈「思考下面没有虚线」）⇒ 用卡片描边同色 `#d9cdb4`。
                                 if b.think-expanded: HorizontalBox {
                                     width: 100%;
                                     height: 2px;
@@ -4353,7 +4355,7 @@ export component SystemChatWindow inherits Window {
                                     for _i in 20: Rectangle {
                                         horizontal-stretch: 1;
                                         height: 2px;
-                                        background: #e2d7bf;
+                                        background: #d9cdb4;
                                     }
                                 }
                                 // 正文窗口：展开（最多 10 行）或生成中（一行滚动的打字机窗口）。
@@ -4533,20 +4535,57 @@ export component SystemChatWindow inherits Window {
                             tbl-grid := VerticalBox {
                                 spacing: 0px;
                                 alignment: start;
-                                for trow in b.table-rows: HorizontalBox {
+                                // 表格线（稿 v19）：**外框粗、内部细**（owner：「现在颠倒了」——
+                                // 每格四周都画 1px 时，相邻两格叠出内侧 2px，外沿反而只有 1px）。
+                                // 口径：**每条边界只画一次**——格子只画「右边 + 下边」（1px），
+                                // 四个外沿另按行列位置叠 2px。
+                                for trow[ri] in b.table-rows: HorizontalBox {
                                     spacing: 0px;
-                                    // 行高显式：各格靠 HorizontalBox 的 cross-axis `stretch` 填满。
                                     height: trow.row-h;
                                     for cell[ci] in trow.cells: Rectangle {
                                         width: b.col-ws[ci];
-                                        // 格子高 = 行高（两者都由 Rust 算）：显式给才不会被压成 0 高，
-                                        // 也不会因「各自算高」在行间露缝。
                                         height: trow.row-h;
                                         background: trow.header ? PixelTheme.bg : transparent;
-                                        border-width: 1px;
-                                        border-color: PixelTheme.edge;
-                                        // 单元格内容 = Rust 侧 `inlineflow` 排好的片段（文本 + 公式图）：
-                                        // 绝对定位。列对齐已在 Rust 侧排进 x（parley 的 `align`）⇒ 这里不判。
+                                        // 内线：右边（末列加粗成外框 2px）
+                                        if ci == b.col-ws.length - 1: Rectangle {
+                                            x: parent.width - 2px;
+                                            width: 2px;
+                                            height: 100%;
+                                            background: PixelTheme.edge;
+                                        }
+                                        if ci < b.col-ws.length - 1: Rectangle {
+                                            x: parent.width - 1px;
+                                            width: 1px;
+                                            height: 100%;
+                                            background: PixelTheme.edge;
+                                        }
+                                        // 内线：下边（末行加粗成外框 2px）
+                                        if ri == b.table-rows.length - 1: Rectangle {
+                                            y: parent.height - 2px;
+                                            width: 100%;
+                                            height: 2px;
+                                            background: PixelTheme.edge;
+                                        }
+                                        if ri < b.table-rows.length - 1: Rectangle {
+                                            y: parent.height - 1px;
+                                            width: 100%;
+                                            height: 1px;
+                                            background: PixelTheme.edge;
+                                        }
+                                        // 外框：首行上边 / 首列左边（2px）
+                                        if ri == 0: Rectangle {
+                                            y: 0px;
+                                            width: 100%;
+                                            height: 2px;
+                                            background: PixelTheme.edge;
+                                        }
+                                        if ci == 0: Rectangle {
+                                            x: 0px;
+                                            width: 2px;
+                                            height: 100%;
+                                            background: PixelTheme.edge;
+                                        }
+                                        // 单元格内容（Rust 侧 `inlineflow` 排好的片段，绝对定位）
                                         for p in trow.flows[ci]: Rectangle {
                                             x: 5px + p.x;
                                             y: 4px + p.y;
@@ -4789,37 +4828,36 @@ export component SystemChatWindow inherits Window {
                                 }
                             }
                         }
-                        // 音频：**一个播放/暂停钮 + 名称**（owner 口径），不做进度条。
+                        // 音频（稿 v18）：**正方形方块**（owner 口径「音频用正方形就可以了，为啥要长条」）
+                        // —— 56×56、2px 描边、圆角 6、暖底，居中 ▶/⏸；名称走 Tooltip 不占版面。
+                        // 方块跟着左右分栏走（用户靠右 / 怹靠左）。
                         if b.kind == "audio": Rectangle {
                             width: 100%;
-                            height: 34px;
-                            border-width: 2px;
-                            border-color: PixelTheme.edge;
-                            border-radius: 6px;
-                            background: PixelTheme.bg;
-                            HorizontalBox {
-                                padding-left: 8px;
-                                padding-right: 8px;
-                                spacing: 8px;
+                            height: 56px;
+                            background: transparent;
+                            audio-tile := Rectangle {
+                                width: 56px;
+                                height: 56px;
+                                x: b.align-right ? parent.width - self.width : 0px;
+                                border-width: 2px;
+                                border-color: PixelTheme.edge;
+                                border-radius: 6px;
+                                background: PixelTheme.bg;
                                 Text {
+                                    width: 100%;
+                                    height: 100%;
                                     text: b.media-playing ? "⏸" : "▶";
-                                    font-size: 13px;
+                                    font-size: 18px;
                                     color: PixelTheme.text;
+                                    horizontal-alignment: center;
                                     vertical-alignment: center;
-                                }
-                                Text {
-                                    horizontal-stretch: 1;
-                                    text: "audio · " + b.alt;
-                                    font-size: 12px;
-                                    color: PixelTheme.text;
-                                    vertical-alignment: center;
-                                    overflow: elide;
                                 }
                             }
                             TouchArea {
                                 mouse-cursor: pointer;
                                 clicked => { root.media-toggle(b.src); }
                             }
+                            Tooltip { text: @markdown("audio · \{b.alt}"); }
                         }
                         if b.kind == "p" && b.selectable: ConvoSelectableText {
                             align-right: b.align-right;

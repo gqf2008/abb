@@ -8316,8 +8316,18 @@ pub fn run_gui() -> Result<()> {
                         w.set_status_line("重新生成失败：这一轮之前没有用户消息。".into());
                     }
                     Some(prompt) => {
+                        // 稿 v18：`⟳ 重新生成` 的口径是「**原来的不要了，重新来**」——
+                        // 先把该助手轮**及其之后**的轮丢掉（后面那些是基于旧答复产生的），
+                        // 再重跑那条用户提示（`submit` 会把用户轮重新追加，最终形态与原来一致）。
+                        let from = t.prompt_index.unwrap_or(t.index);
+                        let dropped = crate::syschat::drop_turns_from(from).unwrap_or(0);
                         w.set_status_is_error(false);
-                        w.set_status_line("重新生成中：把这一轮的提问再发一次。".into());
+                        w.set_status_line(
+                            format!(
+                                "重新生成中：已丢弃旧的 {dropped} 条（含这一轮），重新来一遍。"
+                            )
+                            .into(),
+                        );
                         submit(prompt);
                     }
                 },
