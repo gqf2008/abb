@@ -3446,3 +3446,38 @@ fn svg_aspect_reads_viewbox_and_wh() {
     assert!(svg_aspect(&c).is_none(), "非 SVG 应返回 None");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 【诊断用·临时】按设计稿 v12 的消息样例渲染一段，供与 `DESIGN-v12.png` 对比。
+#[test]
+#[ignore = "诊断用；默认不跑"]
+fn diag_design_body() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    let _ = std::fs::create_dir_all(dir);
+    let rows = vec![
+        role_row("怹", true),
+        think_row(
+            "用户要把架构图做成 HTML 页面。需要：① 把图存成文件 ② 配说明。",
+            "3.2s",
+            false,
+            false,
+        ),
+        row("h2", "好的，已生成页面"),
+        row("p", "要点："),
+        row("list", "图片走 `figure`、自适应宽度"),
+        row("list", "说明区用**等宽字体**"),
+        row("quote", "单文件即开即用。"),
+    ];
+    let (ui, win, _m) = setup(rows, 520);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("m"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(520, 520));
+    apply_syschat_layout(&ui, 520.0);
+    let f = settle_w(&win, 520, 520);
+    write_png(&f, &dir.join("APP-body.png"));
+}

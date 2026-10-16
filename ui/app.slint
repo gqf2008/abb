@@ -4256,8 +4256,10 @@ export component SystemChatWindow inherits Window {
                         if b.kind == "think": Rectangle {
                             width: 100%;
                             background: PixelTheme.bg;
-                            border-width: 1px;
-                            border-color: PixelTheme.edge;
+                            // 稿 `details.think{border:2px solid #d9cdb4}`：**浅暖灰** 2px，不是墨黑边。
+                            // （展开态的 `border-top:2px dashed #e2d7bf` 做不了：Slint 无 dashed 边框，见 §6）
+                            border-width: 2px;
+                            border-color: #d9cdb4;
                             border-radius: 6px;
                             VerticalBox {
                                 padding: 6px;
@@ -4276,6 +4278,9 @@ export component SystemChatWindow inherits Window {
                                         font-weight: 600;
                                         color: UiTokens.text-dim;
                                         vertical-alignment: center;
+                                        // 稿的 `summary{display:flex;gap:6px}` = **左对齐**（实测不写会居中）。
+                                        horizontal-alignment: left;
+                                        width: 100%;
                                     }
                                     TouchArea {
                                         mouse-cursor: pointer;
@@ -4309,13 +4314,14 @@ export component SystemChatWindow inherits Window {
                             link-color: UiTokens.info;
                             link-clicked(link) => { root.open-link(link); }
                         }
+                        // 字号按稿 `.md h2{font-size:15px}`（旧值 16px）。
                         if b.kind == "h2" && b.selectable: ConvoSelectableText {
-                            body: b.plain;  avail: root.convo-text-width;  size: 16px;
+                            body: b.plain;  avail: root.convo-text-width;  size: 15px;
                         }
                         if b.kind == "h2" && !b.selectable: StyledText {
                             width: root.convo-text-width;   // 见本区顶部注释
                             text: b.styled;
-                            default-font-size: 16px;
+                            default-font-size: 15px;
                             default-color: PixelTheme.text;
                             link-color: UiTokens.info;
                             link-clicked(link) => { root.open-link(link); }
