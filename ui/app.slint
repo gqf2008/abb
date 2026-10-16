@@ -3183,6 +3183,8 @@ export struct SysChatBlockRow {
     // `selectable` 为 false 时继续走 `styled`（有行内样式，`TextInput` 渲染不了 ⇒ 不做视觉回退）。
     selectable: bool,
     plain: string,
+    // 稿 v15：**用户输入靠右、怹的输出靠左**。Rust 侧按轮次角色置位（`rows_for_w`）。
+    align-right: bool,
     // 动作行（`kind == "acts"`）对应的助手轮在**历史里的真实下标**（由 Rust 在收尾时定位，
     // 见 `syschat::last_assistant_index`）；其它 kind 恒 `-1`（无意义）。**不许**用负值当
     //「最后一条助手轮」的哨兵：两条同值哨兵会一起解析到同一轮（独立评审判 Critical）。
@@ -3206,6 +3208,9 @@ component ConvoSelectableText inherits TextInput {
     in property <length> avail: 100px;
     in property <length> size: 13px;
     in property <brush> tone: PixelTheme.text;
+    // 稿 v15：用户消息靠右、怹的输出靠左（Rust 侧按轮次角色给）。
+    in property <bool> align-right: false;
+    horizontal-alignment: root.align-right ? right : left;
     read-only: true;
     // `single-line` 在 Slint 里**不管换行**（换行由下面的 `wrap` 决定）：它只改
     // 「多行文本按单行做垂直对齐」的 `baseline_y` 与省略号的判据
@@ -4287,9 +4292,14 @@ export component SystemChatWindow inherits Window {
                             font-size: 11px;
                             font-weight: 700;
                             color: b.role-assistant ? UiTokens.info : PixelTheme.text.with-alpha(0.5);
+                            width: 100%;
+                            horizontal-alignment: b.align-right ? right : left;
                         }
                         // 思考块（E2 需求 #11）：独立成块、默认折叠，标题显示耗时；展开看推理
                         //（等宽、保留换行）。进行中的思考块自动展开（让打字机可见）。
+                        // 思考块（稿 v15）：**默认关闭**（生成中也不自动展开）；关闭态只有标题一行，
+                        // 生成中在标题下方给一个**一行高的滚动窗口**看最新思考；展开后正文**最多 10 行**，
+                        // 超出块内滚动并贴底。
                         if b.kind == "think": Rectangle {
                             width: 100%;
                             background: PixelTheme.bg;
@@ -4324,27 +4334,49 @@ export component SystemChatWindow inherits Window {
                                         clicked => { root.toggle-think(i); }
                                     }
                                 }
-                                // 思考文本是纯文本（不是 markdown）⇒ 恒可选中。
-                                // 可用宽 = 块内 416 − 内层 VerticalBox 的左右 padding 12
-                                if b.think-expanded && b.selectable: ConvoSelectableMonoText {
-                                    body: b.plain;  avail: root.convo-text-width - 12px;
-                                    size: 12px;  tone: UiTokens.text-dim;
-                                }
-                                if b.think-expanded && !b.selectable: Text {
-                                    text: b.text;
-                                    font-size: 12px;
-                                    color: UiTokens.text-dim;
-                                    font-family: "ui-monospace, Menlo, Consolas, monospace";
-                                    wrap: word-wrap;
-                                    width: root.convo-text-width - 12px;
+                                // 正文窗口：展开（最多 10 行）或生成中（一行滚动的打字机窗口）。
+                                // 用 `Text`（不是 `TextInput`）：要放进 Flickable 做块内滚动，
+                                // 代价是思考文字不再可拖选（正文与整轮的复制不受影响）。
+                                if b.think-expanded || b.think-live: Rectangle {
+                                    width: 100%;
+                                    height: b.think-expanded
+                                        ? min(think-txt.preferred-height + 2px, 10 * 16px)
+                                        : 16px;
+                                    background: transparent;
+                                    think-flick := Flickable {
+                                        width: 100%;
+                                        height: 100%;
+                                        content-width: self.width;
+                                        content-height: think-txt.preferred-height + 2px;
+                                        // 没展开时那 1 行窗口不需要用户去滚（它就是看最新一行的）。
+                                        interactive: b.think-expanded;
+                                        // 生成中贴底：行每次重建都会新实例化，`init` 里要求滞底，
+                                        // Flickable 的越界夹取会落到真实底部。
+                                        init => {
+                                            if b.think-live {
+                                                self.content-y = -999999px;
+                                            }
+                                        }
+                                        think-txt := Text {
+                                            x: 0px;
+                                            width: parent.width;
+                                            text: b.text;
+                                            font-size: 12px;
+                                            color: UiTokens.text-dim;
+                                            font-family: "ui-monospace, Menlo, Consolas, monospace";
+                                            wrap: word-wrap;
+                                        }
+                                    }
                                 }
                             }
                         }
                         if b.kind == "h1" && b.selectable: ConvoSelectableText {
+                            align-right: b.align-right;
                             body: b.plain;  avail: root.convo-text-width;  size: 18px;
                         }
                         if b.kind == "h1" && !b.selectable: StyledText {
                             width: root.convo-text-width;   // 见本区顶部注释
+                            horizontal-alignment: b.align-right ? right : left;
                             text: b.styled;
                             default-font-size: 18px;
                             default-color: PixelTheme.text;
@@ -4353,10 +4385,12 @@ export component SystemChatWindow inherits Window {
                         }
                         // 字号按稿 `.md h2{font-size:15px}`（旧值 16px）。
                         if b.kind == "h2" && b.selectable: ConvoSelectableText {
+                            align-right: b.align-right;
                             body: b.plain;  avail: root.convo-text-width;  size: 15px;
                         }
                         if b.kind == "h2" && !b.selectable: StyledText {
                             width: root.convo-text-width;   // 见本区顶部注释
+                            horizontal-alignment: b.align-right ? right : left;
                             text: b.styled;
                             default-font-size: 15px;
                             default-color: PixelTheme.text;
@@ -4364,10 +4398,12 @@ export component SystemChatWindow inherits Window {
                             link-clicked(link) => { root.open-link(link); }
                         }
                         if b.kind == "h3" && b.selectable: ConvoSelectableText {
+                            align-right: b.align-right;
                             body: b.plain;  avail: root.convo-text-width;  size: 14px;
                         }
                         if b.kind == "h3" && !b.selectable: StyledText {
                             width: root.convo-text-width;   // 见本区顶部注释
+                            horizontal-alignment: b.align-right ? right : left;
                             text: b.styled;
                             default-font-size: 14px;
                             default-color: PixelTheme.text;
@@ -4388,6 +4424,7 @@ export component SystemChatWindow inherits Window {
                                 // 代码块永远是纯文本（没有行内样式）⇒ 恒可选中。
                                 // 可用宽 = 块内 416 − 代码框内层 VerticalBox 的左右 padding 16
                                 if b.selectable: ConvoSelectableMonoText {
+                                    align-right: b.align-right;
                                     body: b.plain;  avail: root.convo-text-width - 16px;
                                     size: 12px;  tone: #f6efe1;
                                 }
@@ -4395,6 +4432,7 @@ export component SystemChatWindow inherits Window {
                                     text: b.text;
                                     font-size: 12px;
                                     color: #f6efe1;
+                                    horizontal-alignment: b.align-right ? right : left;
                                     font-family: "ui-monospace, Menlo, Consolas, monospace";
                                     wrap: word-wrap;
                                     width: root.convo-text-width - 16px;
@@ -4415,11 +4453,13 @@ export component SystemChatWindow inherits Window {
                                 Rectangle { width: 4px; background: PixelTheme.accent; }
                                 // 可用宽 = 块内 416 − 左 padding 10 − 强调条 4 − 右 padding 8
                                 if b.selectable: ConvoSelectableText {
+                                    align-right: b.align-right;
                                     body: b.plain;  avail: root.convo-text-width - 22px;
                                     size: 13px;  tone: UiTokens.text-dim;
                                 }
                                 if !b.selectable: StyledText {
                                     width: root.convo-text-width - 22px;
+                                    horizontal-alignment: b.align-right ? right : left;
                                     text: b.styled;
                                     default-font-size: 13px;
                                     default-color: UiTokens.text-dim;
@@ -4438,12 +4478,14 @@ export component SystemChatWindow inherits Window {
                             }
                             // 可用宽 = 块内 416 − 缩进 level×16 − 间距 6 − 右 padding 8 − 标记位（≤20，取保守）
                             if b.selectable: ConvoSelectableText {
+                                align-right: b.align-right;
                                 body: b.plain;
                                 avail: root.convo-text-width - b.level * 16px - 34px;
                                 size: 13px;
                             }
                             if !b.selectable: StyledText {
                                 width: root.convo-text-width - b.level * 16px - 34px;
+                                horizontal-alignment: b.align-right ? right : left;
                                 text: b.styled;
                                 default-font-size: 13px;
                                 default-color: PixelTheme.text;
@@ -4517,7 +4559,8 @@ export component SystemChatWindow inherits Window {
                             width: 100%;
                             // 自然尺寸显示；过宽时等比缩到气泡内（`img-aspect` = 高/宽）。
                             height: math-img.height + 12px;
-                            background: PixelTheme.bg;
+                            // 稿 v15：公式块**不要独立底色**（与消息区一致）——以前是暖黄，看起来发黄。
+                            background: transparent;
                             border-radius: 6px;
                             math-img := Image {
                                 source: b.img;
@@ -4532,7 +4575,7 @@ export component SystemChatWindow inherits Window {
                         if b.kind == "math" && !b.img-ok: Rectangle {
                             width: 100%;
                             height: math-txt.preferred-height + 16px;
-                            background: PixelTheme.bg;
+                            background: transparent;
                             border-radius: 6px;
                             math-txt := Text {
                                 x: 8px;
@@ -4590,36 +4633,28 @@ export component SystemChatWindow inherits Window {
                                 overflow: elide;
                             }
                         }
+                        // 音视频（稿 v15）：**不做卡片、不做按钮**——只给一行可点的提示，
+                        // 点击用系统播放器打开。Slint 没有 `audio`/`video` 元素（§6），
+                        // 内联播放做不到；但「带边框的卡片 + 按钮」显然与 markdown/设计稿不符。
                         if b.kind == "audio" || b.kind == "video": Rectangle {
                             width: 100%;
-                            border-width: 2px;
-                            border-color: PixelTheme.edge;
-                            border-radius: 6px;
-                            background: PixelTheme.bg;
-                            HorizontalBox {
-                                padding: 8px;
-                                spacing: 8px;
-                                Text {
-                                    text: b.kind == "video" ? "🎬" : "🎵";
-                                    font-size: 15px;
-                                    vertical-alignment: center;
-                                }
-                                Text {
-                                    horizontal-stretch: 1;
-                                    text: b.alt + "（" + b.src + "）";
-                                    font-size: 12px;
-                                    color: PixelTheme.text;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
-                                PixelButton {
-                                    text: "用播放器打开";
-                                    size: "small";
-                                    clicked => { root.open-media(b.src); }
-                                }
+                            height: 20px;
+                            background: transparent;
+                            Text {
+                                text: (b.kind == "video" ? "🎬 " : "🎵 ") + b.alt;
+                                width: 100%;
+                                font-size: 12px;
+                                color: UiTokens.info;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.open-media(b.src); }
                             }
                         }
                         if b.kind == "p" && b.selectable: ConvoSelectableText {
+                            align-right: b.align-right;
                             body: b.plain;  avail: root.convo-text-width;  size: 13px;
                         }
                         // 含行内公式的段落（`mathp`）：坐标由 Rust 用 parley 混排（见 inlineflow.rs），
@@ -4648,6 +4683,7 @@ export component SystemChatWindow inherits Window {
                         }
                         if b.kind == "p" && !b.selectable: StyledText {
                             width: root.convo-text-width;   // 见本区顶部注释
+                            horizontal-alignment: b.align-right ? right : left;
                             text: b.styled;
                             default-font-size: 13px;
                             default-color: PixelTheme.text;
@@ -4739,7 +4775,9 @@ export component SystemChatWindow inherits Window {
             split-bar := Rectangle {
                 height: root.split-h;
                 vertical-stretch: 0;
-                background: (split-hit.has-hover || root.split-dragging) ? PixelTheme.hover : PixelTheme.panel;
+                // 稿 v15：分割区**只留一根线**——底色与下侧输入区同色（`bg`），
+                // 否则白底 + 输入区暖底会造出“第二条线”的观感。
+                background: (split-hit.has-hover || root.split-dragging) ? PixelTheme.hover : PixelTheme.bg;
                 // 稿 `.split{border-top:2px}`：把分割条与消息区隔开的那条线。
                 // v11c（owner 真机复查）：「内容区 ↔ 输入区」那条把手原来看起来有**三**条线——
                 // ①这条顶边 ②中间的 38×2 抓手 ③输入区自己的顶边（下面那条已删）。口径改成

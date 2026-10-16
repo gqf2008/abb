@@ -2930,6 +2930,7 @@ fn blank_row(kind: &str) -> SysChatBlockRow {
         think_elapsed: "".into(),
         selectable: false,
         plain: "".into(),
+        align_right: false,
         turn: -1,
     }
 }
@@ -2991,6 +2992,7 @@ fn relayout_flow_rows(model: &slint::VecModel<SysChatBlockRow>, width: f32) {
             width,
             FLOW_FONT_PX,
             &crate::mathrender::cache_dir(),
+            if row.align_right { 2 } else { 0 },
         ) {
             let (flow, h) = flow_model(&l);
             row.flow = flow;
@@ -3111,11 +3113,11 @@ fn load_thumb(path: &std::path::Path) -> (slint::Image, bool) {
 }
 #[cfg(test)]
 fn block_row(b: crate::mdblocks::MdBlock) -> SysChatBlockRow {
-    block_row_w(b, default_flow_w())
+    block_row_w(b, default_flow_w(), false)
 }
 
 /// [`block_row`] 的可注入宽度版：含行内公式的普通段落走 `mathp`（parley 混排）。
-fn block_row_w(b: crate::mdblocks::MdBlock, flow_w: f32) -> SysChatBlockRow {
+fn block_row_w(b: crate::mdblocks::MdBlock, flow_w: f32, align_right: bool) -> SysChatBlockRow {
     // 含行内公式的**普通段落**：整段交给 `inlineflow` 混排（文字 + 公式图）。
     //   - 排不出来（非法 TeX）⇒ 不进这个分支，落到下面常规渲染：`text` 里的等宽行内码是退路；
     //   - 其它 kind（标题/列表/引用）**不混排**（保持行内码）；`mathp` 只针对最简单的段落，
@@ -3127,6 +3129,7 @@ fn block_row_w(b: crate::mdblocks::MdBlock, flow_w: f32) -> SysChatBlockRow {
             flow_w,
             FLOW_FONT_PX,
             &crate::mathrender::cache_dir(),
+            if align_right { 2 } else { 0 },
         ) {
             let mut r = blank_row("mathp");
             let (flow, h) = flow_model(&l);
@@ -3144,6 +3147,7 @@ fn block_row_w(b: crate::mdblocks::MdBlock, flow_w: f32) -> SysChatBlockRow {
             )));
             r.plain = b.plain.into();
             r.text = b.text.into();
+            r.align_right = align_right;
             return r;
         }
     }
@@ -3214,6 +3218,7 @@ fn block_row_w(b: crate::mdblocks::MdBlock, flow_w: f32) -> SysChatBlockRow {
     }
     r.selectable = selectable;
     r.plain = plain.into();
+    r.align_right = align_right;
     r
 }
 /// 助手轮动作行（卡 `abb-v11-message-actions`，稿 v11.1 `.acts`）。
@@ -3347,7 +3352,7 @@ fn table_row(rows: &[crate::mdblocks::MdBlock]) -> SysChatBlockRow {
 /// 分组只在这里做一次（`rows_for` 与 `stream_rows` 共用），两处口径不会漂。
 #[cfg(test)]
 fn push_block_rows(rows: &mut Vec<SysChatBlockRow>, blocks: Vec<crate::mdblocks::MdBlock>) {
-    push_block_rows_w(rows, blocks, default_flow_w())
+    push_block_rows_w(rows, blocks, default_flow_w(), false)
 }
 
 /// [`push_block_rows`] 的可注入宽度版（含行内公式的段落会用到宽度）。
@@ -3355,6 +3360,7 @@ fn push_block_rows_w(
     rows: &mut Vec<SysChatBlockRow>,
     blocks: Vec<crate::mdblocks::MdBlock>,
     flow_w: f32,
+    align_right: bool,
 ) {
     let mut i = 0usize;
     while i < blocks.len() {
@@ -3366,7 +3372,7 @@ fn push_block_rows_w(
             rows.push(table_row(&blocks[i..j]));
             i = j;
         } else {
-            rows.push(block_row_w(blocks[i].clone(), flow_w));
+            rows.push(block_row_w(blocks[i].clone(), flow_w, align_right));
             i += 1;
         }
     }
@@ -3380,8 +3386,12 @@ fn rows_for(role: &str, text: &str) -> Vec<SysChatBlockRow> {
 fn rows_for_w(role: &str, text: &str, flow_w: f32) -> Vec<SysChatBlockRow> {
     let assistant = role == "assistant";
     let label = if assistant { "怹" } else { "你" };
+    // 稿 v15：**用户输入靠右、怹的输出靠左**（角色名与正文一起）。
+    let align_right = !assistant;
     let mut rows = vec![role_row(label, assistant)];
-    push_block_rows_w(&mut rows, crate::mdblocks::parse(text), flow_w);
+    // 角色名跟着这一轮一起靠边（用户靠右、怹靠左）。
+    rows[0].align_right = align_right;
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(text), flow_w, align_right);
     rows
 }
 /// 一轮历史 → 渲染行：角色行 +（有思考则）思考块 + 正文 markdown 块 +
@@ -3443,9 +3453,16 @@ fn stream_rows_w(
 ) -> Vec<SysChatBlockRow> {
     let mut rows = vec![role_row("怹", true)];
     if has_thought {
-        rows.push(think_row(thought_text, elapsed, live, live));
+        // 稿 v15：思考块**默认关闭**（生成中也不自动展开）；生成中由 `.slint` 的一行窗口
+        // 展示最新思考（`think-live` 驱动），用户点标题才展开（最多 10 行）。
+        rows.push(think_row(thought_text, elapsed, false, live));
     }
-    push_block_rows_w(&mut rows, crate::mdblocks::parse(revealed_text), flow_w);
+    push_block_rows_w(
+        &mut rows,
+        crate::mdblocks::parse(revealed_text),
+        flow_w,
+        false,
+    );
     if let Some(turn) = acts_turn {
         // 空回合（无正文也无思考）不挂：那会指向一条不存在的答复。
         if !revealed_text.is_empty() || has_thought {
@@ -9079,12 +9096,10 @@ pub fn run_gui() -> Result<()> {
                     let rows =
                         stream_rows_w(&text, has_thought, &thought, &elapsed, live, None, flow_w);
                     sync_stream_rows(&syschat_model_t, stream_start.get(), rows);
-                    // 流式每拍**只在用户已经贴底时**才强制滞底：否则他往上滚看历史时会被
-                    // 每个分片拽回底部（owner 反馈「生成中滚动会白屏/被打断」）。
+                    // 稿 v15：**生成中始终贴底**（包括思考部分）——推翻 v14 那条「只有已贴底
+                    // 才跟随」：那样生成看起来不像流式（内容长到视野外就看不见在动了）。
                     if let Some(w) = win_w.upgrade() {
-                        if w.get_convo_at_bottom() {
-                            w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
-                        }
+                        w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
                     }
                 }
             },

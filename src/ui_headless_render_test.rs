@@ -160,6 +160,7 @@ fn row(kind: &str, text: &str) -> SysChatBlockRow {
         think_elapsed: "".into(),
         selectable: plain.is_some(),
         plain: plain.unwrap_or_default().into(),
+        align_right: false,
         turn: -1,
     }
 }
@@ -3305,7 +3306,7 @@ $\\sqrt{x^2+y^2}$、$\\sum_{i=1}^{n} i$ 等等，这几个应当能和文字排�
 普通段落（对照，不受影响）：这里的文字走 Slint 原生排版，**粗体** 与 `代码` 都在。\n\n\
 块级公式（对照）：\n\n$$\n\\int_0^1 x^2 \\, dx = \\frac{1}{3}\n$$";
     let mut rows = vec![row("role", "怹")];
-    push_block_rows_w(&mut rows, crate::mdblocks::parse(md), 416.0);
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(md), 416.0, false);
     let (ui, win, _m) = setup(rows, 900);
     ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
         slint::SharedString::from("新会话"),
@@ -3398,11 +3399,11 @@ fn diag_demo_doc() {
     let blocks = crate::mdblocks::parse(&md);
     let t0 = std::time::Instant::now();
     let mut rows = vec![row("role", "怹")];
-    push_block_rows_w(&mut rows, blocks.clone(), 416.0);
+    push_block_rows_w(&mut rows, blocks.clone(), 416.0, false);
     let cold = t0.elapsed();
     let t1 = std::time::Instant::now();
     let mut rows2 = vec![row("role", "怹")];
-    push_block_rows_w(&mut rows2, blocks, 416.0);
+    push_block_rows_w(&mut rows2, blocks, 416.0, false);
     let warm = t1.elapsed();
     println!("build rows: cold={cold:?} warm={warm:?}（warm 命中 memo 应显著更快）");
     let (ui, win, _m) = setup(rows, 8200);
@@ -3470,7 +3471,7 @@ fn diag_design_body() {
         row("quote", "单文件即开即用。"),
     ];
     for b in img {
-        rows.push(block_row_w(b, 416.0));
+        rows.push(block_row_w(b, 416.0, false));
     }
     // 字形核对：设计稿的 `⧉`/`⟳` vs 备选 `❐`/`↻`（Menlo 有）vs emoji
     rows.push(row("p", "字形：❏▣⊞▤⇉⇄⇅⎘⧉⿻⿰◰▢▥⧫⬚⬛⊟⊞↻✂⧉ ⏹ ⟳ ▸ ▾ ⧉ ❐ 📋"));
@@ -3498,7 +3499,7 @@ fn diag_table_rows() {
     let _ = std::fs::create_dir_all(dir);
     let md = "| 键 | 值 |\n|---|---|\n| a | 1 |\n| b | 2 |\n| c | 3 |\n";
     let mut rows = vec![row("role", "怹")];
-    push_block_rows_w(&mut rows, crate::mdblocks::parse(md), 416.0);
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(md), 416.0, false);
     let (ui, win, _m) = setup(rows, 400);
     ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
         slint::SharedString::from("新会话"),
@@ -3525,11 +3526,51 @@ fn diag_remote_image_pipeline() {
     println!("cache_path → {:?}", crate::syschat::media_cache_path(url));
     let md = format!("![占位图]({url})");
     let mut rows: Vec<SysChatBlockRow> = Vec::new();
-    push_block_rows_w(&mut rows, crate::mdblocks::parse(&md), 416.0);
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(&md), 416.0, false);
     for r in &rows {
         println!(
             "kind={} img_ok={} aspect={:.3}",
             r.kind, r.img_ok, r.img_aspect
         );
     }
+}
+
+/// 【诊断用·临时】左右分栏：用户靠右、怹靠左。
+#[test]
+#[ignore = "诊断用；默认不跑"]
+fn diag_align_lr() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    let _ = std::fs::create_dir_all(dir);
+    let mut rows = Vec::new();
+    rows.extend(rows_for_w(
+        "user",
+        "帮我把这张图存成文件，再配上说明。",
+        416.0,
+    ));
+    rows.extend(rows_for_w(
+        "assistant",
+        "好的，已生成页面。要点见下。",
+        416.0,
+    ));
+    rows.extend(rows_for_w(
+        "user",
+        "带 **粗体** 与 `代码` 的一句，看看对齐。",
+        416.0,
+    ));
+    for r in &rows {
+        println!("row kind={} align_right={}", r.kind, r.align_right);
+    }
+    let (ui, win, _m) = setup(rows, 520);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("m"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(520, 520));
+    apply_syschat_layout(&ui, 520.0);
+    let f = settle_w(&win, 520, 520);
+    write_png(&f, &dir.join("align-lr.png"));
 }
