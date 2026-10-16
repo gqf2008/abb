@@ -253,6 +253,112 @@ pub fn copy_image_to_clipboard(_path: &std::path::Path) -> bool {
     false
 }
 
+/// 剪贴板里的**图片**（截图工具如 PixPin 放的是图片数据，不是文件 URL）⇒ 落成临时 PNG，
+/// 返回路径供上层走与 📎/✂ 同一条待发路径。没有图片返回 `None`。
+///
+/// 取 `public.png`；没有就取 `public.tiff` 再用系统 `sips` 转成 PNG（Slint 的图片解码器
+/// 只有 png/jpeg/svg 等，**不认 tiff**，不转的话粘进来也是打不开）。**主线程**调。
+#[cfg(target_os = "macos")]
+pub fn pasteboard_image_path() -> Option<std::path::PathBuf> {
+    use std::ffi::{c_char, c_void};
+    use std::sync::OnceLock;
+
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn objc_msgSend();
+    }
+    type Sels = (usize, usize, usize);
+    static SELS: OnceLock<Sels> = OnceLock::new();
+    let (general, data_for_type, string_utf8) = *SELS.get_or_init(|| unsafe {
+        (
+            sel_registerName(c"generalPasteboard".as_ptr()) as usize,
+            sel_registerName(c"dataForType:".as_ptr()) as usize,
+            sel_registerName(c"stringWithUTF8String:".as_ptr()) as usize,
+        )
+    });
+    unsafe {
+        let msg0: unsafe extern "C" fn(Id, Sel) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let msg1: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let msg_len: unsafe extern "C" fn(Id, Sel) -> u64 =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let msg_ptr: unsafe extern "C" fn(Id, Sel) -> *const u8 =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let cstr_msg: unsafe extern "C" fn(Id, Sel, *const c_char) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+
+        let pb = msg0(objc_getClass(c"NSPasteboard".as_ptr()), general as Sel);
+        if pb.is_null() {
+            return None;
+        }
+        let (data, ext) = {
+            let png_type = cstr_msg(
+                objc_getClass(c"NSString".as_ptr()),
+                string_utf8 as Sel,
+                c"public.png".as_ptr(),
+            );
+            let d = msg1(pb, data_for_type as Sel, png_type);
+            if !d.is_null() {
+                (d, "png")
+            } else {
+                let tiff_type = cstr_msg(
+                    objc_getClass(c"NSString".as_ptr()),
+                    string_utf8 as Sel,
+                    c"public.tiff".as_ptr(),
+                );
+                let d = msg1(pb, data_for_type as Sel, tiff_type);
+                if d.is_null() {
+                    return None;
+                }
+                (d, "tiff")
+            }
+        };
+        let len = msg_len(data, sel_registerName(c"length".as_ptr())) as usize;
+        let ptr = msg_ptr(data, sel_registerName(c"bytes".as_ptr()));
+        if len == 0 || ptr.is_null() {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir();
+        let raw = dir.join(format!("abb-paste-{}-{stamp}.{ext}", std::process::id()));
+        std::fs::write(&raw, &bytes).ok()?;
+        if ext == "png" {
+            return Some(raw);
+        }
+        // TIFF → PNG（`sips` 是 macOS 自带工具；失败就把 tiff 路径还回去，上层会走「打不开」）。
+        let png = raw.with_extension("png");
+        let ok = std::process::Command::new("/usr/bin/sips")
+            .args(["-s", "format", "png"])
+            .arg(&raw)
+            .arg("--out")
+            .arg(&png)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok && png.is_file() {
+            let _ = std::fs::remove_file(&raw);
+            Some(png)
+        } else {
+            Some(raw)
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn pasteboard_image_path() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// 当前可执行文件路径（GUI 本体）。
 pub fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("拿不到当前可执行文件路径")

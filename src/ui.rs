@@ -3472,6 +3472,15 @@ fn stream_rows_w(
     rows
 }
 
+/// ⌫（Backspace）在什么情况下该删「最后一个待发附件」（稿 v16）。纯函数，判据在单测里。
+///
+/// 两条同时成立才删：**输入框为空**（有字就照旧删字）、**确实还有附件**。
+/// **不看 `busy`**——与 ⌘V 同口径：「待发列表与有没有在生成」无关（C 批 O3）。
+/// 不许把「输入框里还有字」也当成删除附件的触发条件。
+pub fn del_attachment_on_backspace(draft_empty: bool, n: usize) -> bool {
+    draft_empty && n > 0
+}
+
 /// ⌘V（macOS `/` Ctrl+V）在**已经确认按下 ⌘+V**时的落点（纯函数，判据在单测里）。
 ///
 /// 为什么要单独一支：剪贴板里有**文件**时绝不能把这次按键交给 `TextInput`——它会把
@@ -8697,6 +8706,10 @@ pub fn run_gui() -> Result<()> {
         let blur_timer = slint::Timer::default();
         let land_paste = land_into_pending.clone();
         let land_drop = land_into_pending.clone();
+        // ⌫ 删待发附件（稿 v16）要用到这三个：待发列表 / 折叠态 / 分割条比例。
+        let atts_bs = sc_atts.clone();
+        let pending_bs = sc_pending.clone();
+        let split_bs = sc_split.clone();
         let drop_ev = drop_tracker.clone();
         // C2-B：一次拖放 = winit 逐文件发事件。攒一个短窗再整批落地，状态行才能报对个数
         //（否则每条事件各写一次「已附加 1 个」，📎 却显示 N）。80ms 只等「同一轮事件循环里
@@ -8802,12 +8815,47 @@ pub fn run_gui() -> Result<()> {
                 super_held.set(m.state().super_key());
             }
             if let WindowEvent::KeyboardInput { event, .. } = ev {
+                // 稿 v16：输入框**为空**时按 ⌫ ⇒ 删掉**最后一个**待发附件（再按继续往前删）。
+                // 输入框里有字时不动它（照旧交给 TextInput 删字符）。判据是纯函数（可单测）。
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && matches!(
+                        event.logical_key,
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace)
+                    )
+                {
+                    let n = atts_bs.borrow().len();
+                    if n > 0 {
+                        if let Some(win) = cw2.upgrade() {
+                            if del_attachment_on_backspace(win.get_draft().as_str().is_empty(), n) {
+                                crate::syschat::remove_pending_at(&mut atts_bs.borrow_mut(), n - 1);
+                                refresh_syschat_atts(&win, &atts_bs, &pending_bs, &split_bs);
+                                win.set_status_is_error(false);
+                                win.set_status_line(
+                                    format!(
+                                        "已移出 1 个待发附件（现 {} 个；已落盘文件保留）",
+                                        n - 1
+                                    )
+                                    .into(),
+                                );
+                                return EventResult::PreventDefault;
+                            }
+                        }
+                    }
+                }
                 let is_v =
                     matches!(&event.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("v"));
                 let pressed = event.state == ElementState::Pressed;
                 // 只在「可能被我们接管的键」上探剪贴板（探一次是一次 ObjC 往返）。
                 if super_held.get() && pressed && is_v {
-                    let paths = platform::pasteboard_file_paths();
+                    let mut paths = platform::pasteboard_file_paths();
+                    // 稿 v16：截图工具（PixPin 等）把**图片**放进剪贴板而不是文件 ⇒ 无文件时
+                    // 再探一次图片数据，落成临时 PNG 后走与 📎/✂ 同一条待发路径。
+                    if paths.is_empty() {
+                        if let Some(img) = platform::pasteboard_image_path() {
+                            paths.push(img);
+                        }
+                    }
                     match cmd_v_action(true, pressed, event.repeat, is_v, !paths.is_empty()) {
                         CmdVAction::Land => {
                             // 落地在 UI 线程同步完成（否则待发列表要跨线程共享）；典型附件很小，
@@ -9952,6 +10000,19 @@ mod tests {
         // 有文件：首拍落地；长按 repeat 只吞不落（否则重复附件 + 路径漏成文本）
         assert_eq!(cmd_v_action(true, true, false, true, true), Land);
         assert_eq!(cmd_v_action(true, true, true, true, true), Swallow);
+    }
+
+    /// 稿 v16：⌫ 删待发附件的判据——**只在输入框为空且确实有附件**时删。
+    ///
+    /// 判别力：把任一条子句去掉（或返回恒真/恒假）⇒ 本用例必红。
+    #[test]
+    fn backspace_removes_attachment_only_when_input_empty() {
+        assert!(del_attachment_on_backspace(true, 1), "空输入 + 有附件 ⇒ 删");
+        assert!(
+            !del_attachment_on_backspace(false, 1),
+            "输入框有字 ⇒ 不删附件（要删字）"
+        );
+        assert!(!del_attachment_on_backspace(true, 0), "没附件 ⇒ 不删");
     }
 
     /// C 批 O3：拦截条件不得再被 `busy` 关掉（关掉 ⇒ busy 期间 ⌘V 把文件路径粘成文本）。
