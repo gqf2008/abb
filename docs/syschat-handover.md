@@ -476,8 +476,8 @@ grep -a "harness 装配" ~/.agent-bridge/logs/service.out | tail -1
 > 用 `LC_ALL=C grep -a` 或按字节数（python `data.count(pat.encode())`）。本轮实测：新构建与已装机两份二进制里
 > `添加附件（可多选，也可拖入窗口或 ⌘V 粘贴）`、`[selfresize] begin dir=`、`agent_thought_chunk`、`_session/steering` **都在（各 1）**。
 >
-> 📦 **最新暂存件**（2026-10-16 03:3x，`main = 9749a10`，含表格/图片/行内公式/空会话归档/清空幽灵 + 对齐「markdown 全能示例」的四修）：`/Volumes/DataExt/tmp/ABB-stage-9749a10/ABB.app`（**已装机**；主二进制 sha256 `agent-bridge bf71cb0f…` / `abb-agent 4203fc20…`，与装机后逐字节一致；`Info.plist` 版本 `2.23.117`——本次起 §7.2 的配方补上了版本号 sed）。更早的 `ABB-stage-a2cab99` / `ABB-stage-0057811` / `ABB-stage-5978f34` 仍在盘上作历史。旧 bundle 备份：`ABB.app.prev-20261015-*`（多份）。
-> 要用的时候只剩最后三段（quit / `mv` 备份 / `ditto` + `open`）。
+> 📦 **最新暂存件**（2026-10-16 10:0x，`main = b9245f6`，含：表格/图片/行内+块级数学/空会话归档/清空幽灵/「markdown 全能示例」四修/设计稿 v12 对齐（思考块·h2·图片说明条·引用圆角·动作行字形））：`/Volumes/DataExt/tmp/ABB-stage-b9245f6/ABB.app`（**已装机**；主二进制 sha256 `agent-bridge 3330b19b…`，与装机后逐字节一致；`Info.plist` 版本 `2.23.117`）。更早的 `ABB-stage-b1f5733` / `9749a10` / `a2cab99` / `0057811` / `5978f34` 仍在盘上作历史。旧 bundle 备份：`ABB.app.prev-20261016-*` / `…-20261015-*`（多份）。
+要用的时候只剩最后三段（quit / `mv` 备份 / `ditto` + `open`）。
 
 ### 7.3 接手第一小时建议
 1. 读 §1，自己开窗抓一张图，建立「我能自己验收」的闭环（这一步能省掉后面所有「让用户截图」的往返）。
