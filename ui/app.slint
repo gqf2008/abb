@@ -4317,11 +4317,19 @@ export component SystemChatWindow inherits Window {
                             border-color: #d9cdb4;
                             border-radius: 6px;
                             VerticalBox {
-                                padding: 6px;
-                                spacing: 4px;
+                                // 几何口径（owner 2026-10-16）：**标题带自己带高与内边距**，外层不再给
+                                // padding/spacing——`padding 6 + 标题 18 + spacing 4 + 虚线 2` 那种拼法
+                                // 一旦布局多摊一点空间就把标题行拉高、虚线整体下沉（「虚线与顶部的高度太大」）。
+                                // 现在：标题带 26px（= 折叠态卡片的内高，上下描边各 2px ⇒ 卡片总高 30px），
+                                // 「思考」垂直居中；虚线紧随其后（spacing 0）⇒ 它的位置**正好落在折叠态的下边缘**。
+                                padding-left: 6px;
+                                padding-right: 6px;
+                                padding-bottom: 6px;
+                                spacing: 0px;
+                                alignment: start;
                                 Rectangle {
                                     width: 100%;
-                                    height: 18px;
+                                    height: 26px;
                                     background: transparent;
                                     Text {
                                         // 文案按设计稿（唯一视觉事实源）：`思考 · 用时 3.2s`；
@@ -4361,35 +4369,33 @@ export component SystemChatWindow inherits Window {
                                 // 正文窗口：展开（最多 10 行）或生成中（一行滚动的打字机窗口）。
                                 // 用 `Text`（不是 `TextInput`）：要放进 Flickable 做块内滚动，
                                 // 代价是思考文字不再可拖选（正文与整轮的复制不受影响）。
-                                if b.think-expanded || b.think-live: Rectangle {
+                                // ⚠️ 不要再套一层 `Rectangle` 去引用 Flickable 的 height —— 那会形成
+                                // `width → layoutinfo-h → …` 绑定环（编译器警告「可能 panic」）。直接
+                                // 把 Flickable 当块，文本宽用 **px**（`convo-text-width`，见消息区顶部注释）。
+                                if b.think-expanded || b.think-live: Flickable {
                                     width: 100%;
                                     height: b.think-expanded
                                         ? min(think-txt.preferred-height + 2px, 10 * 16px)
                                         : 16px;
-                                    background: transparent;
-                                    think-flick := Flickable {
-                                        width: 100%;
-                                        height: 100%;
-                                        content-width: self.width;
-                                        content-height: think-txt.preferred-height + 2px;
-                                        // 没展开时那 1 行窗口不需要用户去滚（它就是看最新一行的）。
-                                        interactive: b.think-expanded;
-                                        // 生成中贴底：行每次重建都会新实例化，`init` 里要求滞底，
-                                        // Flickable 的越界夹取会落到真实底部。
-                                        init => {
-                                            if b.think-live {
-                                                self.content-y = -999999px;
-                                            }
+                                    content-width: self.width;
+                                    content-height: think-txt.preferred-height + 2px;
+                                    // 没展开时那 1 行窗口不需要用户去滚（它就是看最新一行的）。
+                                    interactive: b.think-expanded;
+                                    // 生成中贴底：行每次重建都会新实例化，`init` 里要求滞底，
+                                    // Flickable 的越界夹取会落到真实底部。
+                                    init => {
+                                        if b.think-live {
+                                            self.content-y = -999999px;
                                         }
-                                        think-txt := Text {
-                                            x: 0px;
-                                            width: parent.width;
-                                            text: b.text;
-                                            font-size: 12px;
-                                            color: UiTokens.text-dim;
-                                            font-family: "ui-monospace, Menlo, Consolas, monospace";
-                                            wrap: word-wrap;
-                                        }
+                                    }
+                                    think-txt := Text {
+                                        x: 0px;
+                                        width: root.convo-text-width - 12px;
+                                        text: b.text;
+                                        font-size: 12px;
+                                        color: UiTokens.text-dim;
+                                        font-family: "ui-monospace, Menlo, Consolas, monospace";
+                                        wrap: word-wrap;
                                     }
                                 }
                             }
