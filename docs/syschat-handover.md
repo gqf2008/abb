@@ -511,7 +511,24 @@ grep -a "harness 装配" ~/.agent-bridge/logs/service.out | tail -1
    **两处都要改**（只改前者会让 `cargo build --locked` 红）。`crates/abb-agent` / `crates/abb-chart`
    是**独立包**，各自 `0.1.0`，不跟产品版本走。`Info.plist` 的版本由装机流程按根 `Cargo.toml` sed
    （§7.2 第 3 步）——**不要**手工在 plist 里编版本。
-2. **发正式版 = 推 tag**：`git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z`。
+2. **发正式版 = 推 tag，而且 GitHub 那一份要「手工推」**（2026-10-17 踩过，v3.0.0 因此白等了一场）：
+   - `walgit → GitHub` 的镜像**不是常驻循环**（`~/.agents/skills/walgit/SKILL.md` §8 明说：
+     a release **hand-pushes** `main` **and its tag**）；只推 `origin` 的话 GitHub 上
+     main 会一直停在旧提交、**tag 根本不存在** ⇒ `release.yml`（`tags: ["v*"]`）**不会触发**，
+     于是「Release 里没有 Windows 安装包」——不是流水线坏了，是没跑。
+   ```sh
+   git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z      # walgit（协作真相源）
+   git push github main && git push github vX.Y.Z           # GitHub（发版产物靠它触发）
+   ```
+   - 推之前先核「能不能快进」：`git merge-base --is-ancestor <github/main> main`（是祖先 ⇒
+     普通 push 即可，**不需要 `-f`**；不是 ⇒ 先处理分叉再谈发版）。
+   - **凭据要求**（本机实测）：`gh` 当前登录的账号必须**对该仓库有写权限**。`aerodesk-io`
+     对 `gqf2008/abb` 是 403；SSH 未配置时报 `Permission denied (publickey)`。可用任一条：
+     把该账号加成**协作者（写）** / `gh auth switch` 到有权限账号 / `gh auth login --with-token`
+     给一个 `repo` scope 的 PAT / 把 `~/.ssh/id_ed25519.pub` 加到那个账号（走 SSH 推）。
+   - **产物形态**（`v2.9.0` 实测）：Release 里应同时有 `ABB-<版本>.dmg`（macOS）与
+     `ABB-Setup-<版本>.exe`（Windows，`release.yml` 的 windows job 出 `windows-dist`）。
+     **两个都出现**才算发版完成；macOS job 正常约 60 分钟。
    `release.yml` 的触发就是 `tags: ["v*"]`（macOS runner 上构建 + 签名 + 公证 + 出 release 产物），
    **不需要**本机 target 目录。tag 是**不可撤回的对外承诺** ⇒ 打之前先确认 `main` 门禁全绿。
 3. **本机装机**：照 §7.2 的配方（构建 → 组 stage → **改版本 → 再签名** → entitlements 守卫 →
