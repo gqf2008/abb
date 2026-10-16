@@ -4433,7 +4433,8 @@ export component SystemChatWindow inherits Window {
                                         // （Slint 约定：往下为**负**，到底 = height − content-height）：
                                         // - 生成中思考一直在长 ⇒ 每次变高都重新贴底 ⇒ 一行窗里滚动的就是**最新一行**
                                         //   （要能看到「正在打」的效果）；
-                                        // - 展开/折叠（`changed height`）也落到底部 —— owner 第 3 条：点开是想看**最新**的思考。
+                                        // - **展开/折叠不主动滚**（owner 2026-10-16 修正：点开就是「自然展开」，
+                                        //   不要顺手跳到底部；展开后用户自己滚）。
                                         init => {
                                             if b.think-live {
                                                 self.content-y = min(0px, self.height - self.content-height);
@@ -4445,9 +4446,6 @@ export component SystemChatWindow inherits Window {
                                             if b.think-live {
                                                 self.content-y = min(0px, self.height - self.content-height);
                                             }
-                                        }
-                                        changed height => {
-                                            self.content-y = min(0px, self.height - self.content-height);
                                         }
                                         think-txt := Text {
                                             x: 0px;
