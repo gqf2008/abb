@@ -3720,6 +3720,48 @@ fn convo_stick_to_bottom_never_goes_out_of_range() {
     );
 }
 
+/// 回归守卫（owner 第 5 条）：流式每拍用 `follow-epoch`，**不在底部时不许把你拽回去**。
+///
+/// 语义分工：`scroll-epoch`（发消息/打开会话）= 无条件到底；`follow-epoch`（流式每拍）=
+/// 只在已经贴底时跟随。生成中用户往上翻看已生成内容，位置必须**保持不动**；
+/// 滚回底部后下一拍自动恢复跟随（真机验收）。
+#[test]
+fn convo_follow_epoch_does_not_yank_when_not_at_bottom() {
+    let long: String = (0..12)
+        .map(|i| format!("第 {i} 段：把架构图做成 HTML 页面，需要把图存成文件并配上说明，再套一个自适应模板。"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut rows = vec![row("role", "你")];
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(&long), 416.0, false);
+    let (ui, win, _m) = setup(rows, 400);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("m"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(520, 400));
+    apply_syschat_layout(&ui, 520.0);
+    let _ = settle_w(&win, 520, 400);
+    // 初始在顶部（内容比视口长 ⇒ 这就是「没贴底」），流式每拍都不该动它。
+    assert!(
+        ui.get_dbg_content_h() > ui.get_dbg_flick_h(),
+        "样例要长到超出视口"
+    );
+    for _ in 0..3 {
+        ui.set_follow_epoch(ui.get_follow_epoch().wrapping_add(1));
+        let _ = settle_w(&win, 520, 400);
+    }
+    let y = ui.get_dbg_content_y();
+    println!("不在底部时 follow-epoch 之后 content_y={y:.1}（应保持 0 = 没被拽）");
+    assert!(
+        y.abs() <= 0.5,
+        "没贴底时流式跟随不该改变滚动位置（用户在看历史，被拽回底部）：y={y:.1}"
+    );
+}
+
 /// 【诊断用·临时】思考块（折叠 + 展开）下面到底有没有线。
 #[test]
 #[ignore = "诊断用；默认不跑"]

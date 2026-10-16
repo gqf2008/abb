@@ -9404,7 +9404,9 @@ pub fn run_gui() -> Result<()> {
                     // 稿 v15：**生成中始终贴底**（包括思考部分）——推翻 v14 那条「只有已贴底
                     // 才跟随」：那样生成看起来不像流式（内容长到视野外就看不见在动了）。
                     if let Some(w) = win_w.upgrade() {
-                        w.set_scroll_epoch(w.get_scroll_epoch().wrapping_add(1));
+                        // 流式**每拍**用 `follow-epoch`（已贴底才跟随）——`scroll-epoch` 是
+                        // 「显式跳转」，用它会把正在往上翻的用户每一拍拽回底部（owner 第 5 条）。
+                        w.set_follow_epoch(w.get_follow_epoch().wrapping_add(1));
                         dbg_stream_log(&w, &syschat_model_t, "tick");
                     }
                 }

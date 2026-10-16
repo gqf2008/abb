@@ -3805,6 +3805,8 @@ export component SystemChatWindow inherits Window {
     // **不能**改成给 content-y 绑一个「超大值」属性：绑了值后 Slint 就不再夹取
     //（flickable.rs:113-119 带 `!y.has_binding()`），越界值原样生效 ⇒ 消息区空白。
     in-out property <int> scroll-epoch: 0;
+    // 流式每拍：**已贴底才跟随**（见文件末尾两个 changed 处理器的分工）。
+    in-out property <int> follow-epoch: 0;
     // 「有新内容就贴底」（见 `scroll-epoch` 处理器）：请求过滞底就不再清零 —— v15 口径
     // 「生成中始终贴底」。用于 `content-height` 迟到（处理器先跑、布局后定高）时补跟。
     property <bool> stick-latch: false;
@@ -4277,6 +4279,9 @@ export component SystemChatWindow inherits Window {
                 changed content-height => {
                     if (root.stick-latch) {
                         self.content-y = min(0px, self.height - self.content-height);
+                        // 一次性：稳态跟随交给 `scroll-epoch`（生成中每分片都来一次），
+                        // 免得你正往上翻的时候被「内容长高」拽回去。
+                        root.stick-latch = false;
                     }
                 }
                 // 消息区高由 Rust 按分割条比例写（`syschat::split_convo_h`）；**不**用
@@ -4422,12 +4427,27 @@ export component SystemChatWindow inherits Window {
                                         content-height: think-txt.preferred-height + 2px;
                                         // 没展开时那 1 行窗口不需要用户去滚（它就是看最新一行的）。
                                         interactive: b.think-expanded;
-                                        // 生成中贴底：行每次重建都会新实例化，`init` 里要求滞底，
-                                        // Flickable 的越界夹取会落到真实底部。
+                                        // ⚠️ 这里以前也是「写 `-999999px` 让 Slint 夹取」——**同一个失效模式**
+                                        // （夹取不发生 ⇒ content-y 停在越界值 ⇒ 窗口里什么都不显示）。owner 第 2 条
+                                        // 「思考过程没有打字机效果 / 没滚到底部」就是这么来的。直接给真实底部
+                                        // （Slint 约定：往下为**负**，到底 = height − content-height）：
+                                        // - 生成中思考一直在长 ⇒ 每次变高都重新贴底 ⇒ 一行窗里滚动的就是**最新一行**
+                                        //   （要能看到「正在打」的效果）；
+                                        // - 展开/折叠（`changed height`）也落到底部 —— owner 第 3 条：点开是想看**最新**的思考。
                                         init => {
                                             if b.think-live {
-                                                self.content-y = -999999px;
+                                                self.content-y = min(0px, self.height - self.content-height);
+                                            } else {
+                                                self.content-y = 0px;
                                             }
+                                        }
+                                        changed content-height => {
+                                            if b.think-live {
+                                                self.content-y = min(0px, self.height - self.content-height);
+                                            }
+                                        }
+                                        changed height => {
+                                            self.content-y = min(0px, self.height - self.content-height);
                                         }
                                         think-txt := Text {
                                             x: 0px;
@@ -5772,6 +5792,11 @@ export component SystemChatWindow inherits Window {
     // 且该 tracker 依赖 content-height：内容随后变高时会再夹一次，故新消息总能滚进视野。
     // ⚠️ content-y 必须保持**无绑定**（本组件不绑它，也不用 ScrollView/ScrollBar——
     //    它们会给 content-y 加绑定）。一旦有绑定，`!y.has_binding()` 为假 ⇒ 夹取被跳过。
+    // 两个信号要分开（owner 第 5 条踩出来的）：
+    // - `scroll-epoch`：**显式**跳转（发消息 / 打开会话 / 追加历史）⇒ **无条件**到底，
+    //   并给 latch 让「布局还没定高」的情况随后补上。
+    // - `follow-epoch`：**流式每拍**⇒ 只在「已经贴底」时跟随。生成中你往上翻看已生成的内容，
+    //   不该每一拍把你拽回去；你手动滚回底部，下一拍自动恢复跟随（容差 8px）。
     changed scroll-epoch => {
         // ⚠️ **不要**写 `-999999px` 让 Slint「延迟夹取」落到底——**实测夹取根本不发生**：
         // `ABB_SYSCHAT_DEBUG=1` 的现场日志（1135/1135 行）显示，生成中每 50ms 重写一次越界值，
@@ -5781,9 +5806,13 @@ export component SystemChatWindow inherits Window {
         //
         // ⚠️ Slint 的约定（踩过）：**往下滚 `content-y` 是负值**，到底 = `height - content-height`
         // （实测 326−1460 = −1134）。写成正数会被夹回 0 = 等于没滚（上一版就是这么错的一次）。
-        flick.content-y = min(0px, flick.height - flick.content-height);
-        // 布局尚未定高时上面算出来是 0（`content-height` 还是 0）——挂 latch 等它长起来再补
-        //（`Flickable.changed content-height`）。latch 不清零 = 「有新内容就贴底」= v15 口径。
         root.stick-latch = true;
+        flick.content-y = min(0px, flick.height - flick.content-height);
+    }
+    changed follow-epoch => {
+        root.stick-latch = flick.content-y <= flick.height - flick.content-height + 8px;
+        if (root.stick-latch) {
+            flick.content-y = min(0px, flick.height - flick.content-height);
+        }
     }
 }
