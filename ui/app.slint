@@ -4367,7 +4367,11 @@ export component SystemChatWindow inherits Window {
                         if b.kind == "quote": Rectangle {
                             width: 100%;
                             background: PixelTheme.bg;
+                            // 稿 `.md blockquote{border-left:4px solid var(--accent);
+                            // border-radius:0 6px 6px 0}`：**只圆右侧两角**（左侧贴着强调条）。
                             border-radius: 6px;
+                            border-top-left-radius: 0px;
+                            border-bottom-left-radius: 0px;
                             HorizontalBox {
                                 padding-left: 10px;
                                 spacing: 0px;
@@ -4507,21 +4511,41 @@ export component SystemChatWindow inherits Window {
                         // 布局报 ~30px，图片却实画 ~200px ⇒ 后面的文字被图片盖住、滞底也算不到底）。
                         // 现在高度显式由「视口宽 × 源宽高比」算，夹在 [120, 360]；未知比例回落 200px。
                         // 设计稿 `.media img{width:100%;height:auto}` 的口径 = 按比例、不裁剪（contain）。
+                        // 稿 `.media .cap`：图片下方还有一条 **说明条**（11px dim，上边 2px 描边）⇒
+                        // 块高 = 图高 + 2px 线 + 20px 说明。
                         if b.kind == "image" && b.img-ok: Rectangle {
                             width: 100%;
-                            height: max(
-                                120px,
-                                min(360px, root.convo-text-width * b.img-aspect)
-                            );
+                            height: img-el.height + 22px;
                             border-width: 2px;
                             border-color: PixelTheme.edge;
                             border-radius: 6px;
                             background: PixelTheme.bg;
-                            Image {
-                                source: b.img;
-                                width: 100%;
-                                height: 100%;
-                                image-fit: contain;
+                            VerticalBox {
+                                spacing: 0px;
+                                img-el := Image {
+                                    source: b.img;
+                                    width: 100%;
+                                    height: max(
+                                        120px,
+                                        min(360px, root.convo-text-width * b.img-aspect)
+                                    );
+                                    image-fit: contain;
+                                }
+                                Rectangle { width: 100%; height: 2px; background: PixelTheme.edge; }
+                                Rectangle {
+                                    width: 100%;
+                                    height: 20px;
+                                    background: PixelTheme.panel;
+                                    img-cap := Text {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        text: b.alt;
+                                        font-size: 11px;
+                                        color: UiTokens.text-dim;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
                             }
                         }
                         if b.kind == "image" && !b.img-ok: Rectangle {
@@ -4621,12 +4645,17 @@ export component SystemChatWindow inherits Window {
                             // 稿 `.acts{margin:6px 0 0}`：上间距 6px（用 padding-top 表达）
                             padding-top: 6px;
                             alignment: start;
+                            // 字形：稿写 `⧉ 复制 / ⟳ 重新生成`，但系统 UI 字体（SF）**没有**
+                            // `⧉`(U+29C9)/`⟳`(U+27F3)（只在 Apple Symbols/STIX 里，Slint 的回退拿不到）
+                            // ⇒ 真机渲染成方框（owner 2026-10-16 截图）。换成能渲染的：copy 用
+                            // emoji `📋`（与已验可行的 `🔊` 同类）、regen 用 `↻`(U+21BB，SF 自带，
+                            // 无头台实测可渲染）。已回写设计稿并注明原因。
                             PixelButton {
-                                text: "⧉ 复制";  size: "small";
+                                text: "📋 复制";  size: "small";
                                 clicked => { root.copy_turn(b.turn); }
                             }
                             PixelButton {
-                                text: "⟳ 重新生成";  size: "small";
+                                text: "↻ 重新生成";  size: "small";
                                 clicked => { root.regen_turn(b.turn); }
                             }
                             PixelButton {

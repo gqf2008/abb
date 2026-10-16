@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABB 系统对话 · 设计稿 v12</title>
+<title>ABB 系统对话 · 设计稿 v13</title>
 <style>
   :root{
     --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
@@ -283,8 +283,8 @@
         <p style="margin:4px 0">页面主体已写好，接下来把说明区换成等宽字体<span class="caret-t"></span></p>
         <!-- v11：消息可选中文复制；助手轮给 复制 / 重新生成 / 朗读 -->
         <div class="acts">
-          <span class="a">⧉ 复制</span>
-          <span class="a">⟳ 重新生成</span>
+          <span class="a">📋 复制</span>
+          <span class="a">↻ 重新生成</span>
           <span class="a">🔊 朗读</span>
         </div>
       </div>
@@ -329,7 +329,7 @@
 <!-- /左列 -->
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v12</h1>
+  <h1>ABB 系统对话 · 设计稿 v13</h1>
   <div class="sub">本轮：交互细化（面板位置 / 截屏 / 上下文用量条 / 可拉升 / 消息动作 / 归档 / 新建去重）</div>
   <div class="sub" style="color:var(--info)"><b>v11 新增的交互要求</b>（本稿先画示意，walgit 已登记待逐步实现）</div>
   <ol>
@@ -351,6 +351,18 @@
     <li><b>新建会话图标</b>：<code>＋</code> → <b>对话气泡</b>图标（同 logo 里那个气泡，14px，墨黑描边色），放在 历史会话 <code>🗂</code> 左边。</li>
     <li><b>附件移进输入框内</b>：输入区**不再有框外图标列**；框内底部一行（靠右）＝ <code>[😊 表情] [📎 附件] [✂ 截图] [⋯ 更多(定时)]</code> + <code>发送</code> + <code>🗑 清空</code>，全部**同一水平线**。</li>
     <li><b>输入区边距一致</b>：去掉框外图标列后，输入框左右各留 10px（原来右侧偏大）。</li>
+  </ol>
+  <div class="sub" style="color:var(--info)"><b>v13：markdown / 数学渲染规格</b>（2026-10-16 回写，实现已交付）</div>
+  <ol>
+    <li><b>标题</b>：h1 <b>18px</b> / h2 <b>15px</b> / h3 14px；段落 13px、行高随字体默认。</li>
+    <li><b>代码</b>：块级＝深底 <code>#1c1a17</code> + 浅字 <code>#f6efe1</code>、圆角 6、可选语言标注；行内＝暖底等宽等（由 Slint <code>StyledText</code> 渲染，<b>没有稿里那条 1px 描边</b>——该样式 Slint 不暴露，要一致只能自绘行内码）。</li>
+    <li><b>引用</b>：左侧 4px 暖黄强调条 + 暖底，<b>只圆右侧两角</b>（<code>0 6px 6px 0</code>）。</li>
+    <li><b>图片</b>：按源宽高比自适应（<code>contain</code>，高夹 120–360px；SVG 读 <code>viewBox</code> 拿比例）；下方带 <code>.cap</code> <b>说明条</b>（11px dim、上边 2px 描边、底 <code>panel</code>）。加载不出来时退化成「打开」卡片。</li>
+    <li><b>表格</b>：整表一个块（列宽按内容估、一个横向滚动条、行高取该行最高格）；<b>列对齐</b>按 <code>|:---|:--:|--:|</code>；<b>单元格里的公式也真排版</b>（与段落同一套混排）。</li>
+    <li><b>数学</b>：块级 <code>$$…$$</code> 由 KaTeX 的 Rust 移植（ratex）出 SVG；<b>行内</b> <code>$…$</code> 与文字同一套 parley 混排（文字仍由 Slint 画、公式是图）；排不出来一律回落等宽源码，<b>绝不吞字</b>。<b>含行内公式的段落不可拖选</b>（整段是定位好的片段），宽度变化会重排。</li>
+    <li><b>思考块</b>：浅暖灰 2px 边框 <code>#d9cdb4</code>、标题<b>左对齐</b> <code>▸ 思考 · 用时 3.2s</code>（进行中 <code>思考中</code>）；展开态的<b>虚线分隔做不了</b>（Slint 无 dashed 边框）。</li>
+    <li><b>动作行字形</b>：<code>📋 复制</code> / <code>↻ 重新生成</code> / <code>🔊 朗读</code>。原稿的 <code>⧉</code>(U+29C9)/<code>⟳</code>(U+27F3) <b>系统 UI 字体没有</b>（真机渲染成方框，2026-10-16 owner 截图），故替换为能渲染的等价字形。</li>
+    <li><b>已知未对齐</b>：① 单元格内的 <code>&lt;br&gt;</code> 不换行（仍是字面量）；② 远程图片需联网 + 缓存，离线走「打开」卡片；③ 表格列宽按<b>字符</b>估算（且看的是含 TeX 源码的单元格）⇒ 公式列可能偏宽。</li>
   </ol>
   <div class="sub" style="color:var(--info)"><b>v12 相对 v11 的改动</b>（实现以本稿为准）</div>
   <ol>
