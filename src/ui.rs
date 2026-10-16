@@ -2931,9 +2931,26 @@ fn blank_row(kind: &str) -> SysChatBlockRow {
         selectable: false,
         plain: "".into(),
         align_right: false,
+        media_playing: false,
+        media_progress: 0.0,
+        media_time: "".into(),
         turn: -1,
     }
 }
+
+/// 音视频播放器里显示的时长/位置（`m:ss`，超 1 小时 `h:mm:ss`）。纯函数（判据在单测里）。
+fn fmt_media_time(ms: u64) -> String {
+    let total = ms / 1000;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// 视频播放/海报的目标宽度（px）——与图片块的夹取口径一致。
+const MEDIA_PLAY_W: u32 = 480;
 
 /// 行内公式段落的字号（px）：与正文段落（`.slint` 里 `p` 的 13px）一致，否则含公式的段落
 /// 字比邻居大一号。
@@ -3188,6 +3205,33 @@ fn block_row_w(b: crate::mdblocks::MdBlock, flow_w: f32, align_right: bool) -> S
     } else {
         slint::StyledText::default()
     };
+    // 稿 v16：音视频 = **内联播放器**的「静态部分」：探测（memo 过）拿时长/尺寸、视频抽首帧当封面。
+    // ⚠️ 必须**在 `r` 构造之前**算（`b.src` 随后会被 move 进 `r`），并且**在 `r.img_aspect =
+    // img_aspect` 之后**才写回（否则会被 `load_block_image` 的结果顶掉——踩过）。
+    let media = if b.kind == "audio" || b.kind == "video" {
+        let path = crate::syschat::resolve_media_path(&b.src);
+        let info = crate::mediaplay::probe_cached(&path);
+        let dur = info.as_ref().map(|i| i.duration_ms).unwrap_or(0);
+        let aspect = info
+            .as_ref()
+            .and_then(|i| i.video)
+            .map(|(w, h)| h as f32 / w as f32)
+            .unwrap_or(0.0);
+        let poster_img = if b.kind == "video" {
+            crate::mediaplay::poster(&path, MEDIA_PLAY_W)
+                .and_then(|p| slint::Image::load_from_path(&p).ok())
+        } else {
+            None
+        };
+        Some((
+            aspect,
+            format!("0:00 / {}", fmt_media_time(dur)),
+            poster_img,
+        ))
+    } else {
+        None
+    };
+
     let mut r = blank_row(&b.kind);
     r.styled = styled;
     r.text = b.text.into();
@@ -3208,6 +3252,18 @@ fn block_row_w(b: crate::mdblocks::MdBlock, flow_w: f32, align_right: bool) -> S
     r.img = img;
     r.img_ok = img_ok;
     r.img_aspect = img_aspect;
+    // 音视频的静态部分（探测结果 + 视频封面）——放在 `img_aspect` 赋值之后写回。
+    if let Some((aspect, time, poster_img)) = media {
+        r.img_aspect = aspect;
+        r.media_time = time.into();
+        if let Some(img) = poster_img {
+            let size = img.size();
+            r.img_w = size.width as f32;
+            r.img_h = size.height as f32;
+            r.img = img;
+            r.img_ok = true;
+        }
+    }
     // 公式排版成功 ⇒ 用真图（自然尺寸入 `img-w/img-h`；`img-aspect` = 高/宽 供等比缩放）。
     if let Some(m) = math {
         r.img = m.image;
@@ -8630,6 +8686,136 @@ pub fn run_gui() -> Result<()> {
             platform::open_path(&crate::syschat::resolve_media_path(s));
         }
     });
+    // 稿 v16：**音视频内联播放**（A 方案）。同一时刻只播一条：换一条就把旧的停掉。
+    // 状态在 `playing` 里；帧由 33ms 定时器从 `mediaplay::Player` 取「最新一帧」推进行里。
+    {
+        struct Playing {
+            src: String,
+            row: usize,
+            player: crate::mediaplay::Player,
+            info: crate::mediaplay::MediaInfo,
+        }
+        let playing: Rc<RefCell<Option<Playing>>> = Rc::new(RefCell::new(None));
+        // 行内改字段后写回（行可能已被重建 ⇒ 下标失效就当没这回事）。
+        fn patch_row(
+            model: &slint::VecModel<SysChatBlockRow>,
+            idx: usize,
+            f: impl FnOnce(&mut SysChatBlockRow),
+        ) {
+            if let Some(mut r) = model.row_data(idx) {
+                f(&mut r);
+                model.set_row_data(idx, r);
+            }
+        }
+        // 停当前这条，并把那一行的播放态复位（进度归零、时间回起点）。
+        {
+            let model = syschat_model.clone();
+            let playing = playing.clone();
+            syschat_win.on_media_toggle(move |src| {
+                let s = src.to_string();
+                if let Some(mut cur) = playing.borrow_mut().take() {
+                    cur.player.stop();
+                    let row = cur.row;
+                    if row < model.row_count() {
+                        patch_row(&model, row, |r| {
+                            r.media_playing = false;
+                            r.media_progress = 0.0;
+                            r.media_time =
+                                format!("0:00 / {}", fmt_media_time(cur.info.duration_ms)).into();
+                        });
+                    }
+                    if cur.src == s {
+                        return; // 再点一次 = 停止
+                    }
+                }
+                // 起播：找到这一条所在的行（`src` 是行的唯一标识）。
+                let idx = (0..model.row_count()).find(|i| {
+                    model.row_data(*i).is_some_and(|r| {
+                        (r.kind.as_str() == "audio" || r.kind.as_str() == "video")
+                            && r.src.as_str() == s
+                    })
+                });
+                let Some(idx) = idx else { return };
+                let path = crate::syschat::resolve_media_path(&s);
+                let Some(info) = crate::mediaplay::probe_cached(&path) else {
+                    return;
+                };
+                let Some(player) = crate::mediaplay::Player::start(&path, 0, MEDIA_PLAY_W, &info)
+                else {
+                    // 起不来（缺 ffmpeg / 解码失败）：退回「用系统播放器打开」，别静默。
+                    crate::platform::open_path(&path);
+                    return;
+                };
+                patch_row(&model, idx, |r| {
+                    r.media_playing = true;
+                    r.media_time = format!("0:00 / {}", fmt_media_time(info.duration_ms)).into();
+                });
+                *playing.borrow_mut() = Some(Playing {
+                    src: s,
+                    row: idx,
+                    player,
+                    info,
+                });
+            });
+        }
+        // 帧泵：33ms（≈30fps）。取「最新一帧」⇒ 落帧、推进度、到片尾就收。
+        {
+            let model = syschat_model.clone();
+            let playing = playing.clone();
+            let pump = slint::Timer::default();
+            pump.start(
+                slint::TimerMode::Repeated,
+                Duration::from_millis(33),
+                move || {
+                    let mut cur = playing.borrow_mut();
+                    let Some(p) = cur.as_mut() else { return };
+                    // 行被重建（切会话 / 流式重建）⇒ 下标可能已失效，直接收摊。
+                    let Some(row_now) = model.row_data(p.row) else {
+                        p.player.stop();
+                        *cur = None;
+                        return;
+                    };
+                    if row_now.src.as_str() != p.src {
+                        p.player.stop();
+                        *cur = None;
+                        return;
+                    }
+                    let mut new_img = None;
+                    if let Some(f) = p.player.next_frame() {
+                        let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                            &f.rgba, f.w, f.h,
+                        );
+                        new_img = Some(slint::Image::from_rgba8(buf));
+                    }
+                    let pos = p.player.position_ms();
+                    let dur = p.info.duration_ms;
+                    let ended = dur > 0 && pos + 250 >= dur;
+                    let progress = if dur > 0 {
+                        (pos as f32 / dur as f32).min(1.0)
+                    } else {
+                        0.0
+                    };
+                    let time = format!("{} / {}", fmt_media_time(pos), fmt_media_time(dur));
+                    let idx = p.row;
+                    patch_row(&model, idx, |r| {
+                        if let Some(img) = new_img {
+                            r.img = img;
+                            r.img_ok = true;
+                        }
+                        r.media_progress = progress;
+                        r.media_time = time.clone().into();
+                        r.media_playing = !ended;
+                    });
+                    if ended {
+                        p.player.stop();
+                        *cur = None;
+                    }
+                },
+            );
+            // 定时器保活到事件循环结束（与仓库其它定时器同款）。
+            std::mem::forget(pump);
+        }
+    }
     // 图片**右键 = 复制到系统剪贴板**（稿 v14；图片不再提供「打开」）。
     // 路径解析与 `open_media` 同源：远程走本地缓存，本地按工作区基准。
     {

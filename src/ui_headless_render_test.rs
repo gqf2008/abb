@@ -161,6 +161,9 @@ fn row(kind: &str, text: &str) -> SysChatBlockRow {
         selectable: plain.is_some(),
         plain: plain.unwrap_or_default().into(),
         align_right: false,
+        media_playing: false,
+        media_progress: 0.0,
+        media_time: "".into(),
         turn: -1,
     }
 }
@@ -3573,4 +3576,34 @@ fn diag_align_lr() {
     apply_syschat_layout(&ui, 520.0);
     let f = settle_w(&win, 520, 520);
     write_png(&f, &dir.join("align-lr.png"));
+}
+
+/// 【诊断用·临时】音视频内联播放器的静态形态（封面 + 控件 + 说明条）。
+#[test]
+#[ignore = "诊断用；默认不跑"]
+fn diag_media_player() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    let _ = std::fs::create_dir_all(dir);
+    let md = "![演示视频](media-demo/video.mp4)\n\n![演示音频](media-demo/audio.mp3)\n";
+    let mut rows = vec![row("role", "怹")];
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(md), 416.0, false);
+    for r in &rows {
+        println!(
+            "kind={} img_ok={} aspect={:.3} time={}",
+            r.kind, r.img_ok, r.img_aspect, r.media_time
+        );
+    }
+    let (ui, win, _m) = setup(rows, 900);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("m"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(520, 900));
+    apply_syschat_layout(&ui, 520.0);
+    let f = settle_w(&win, 520, 900);
+    write_png(&f, &dir.join("media-player.png"));
 }

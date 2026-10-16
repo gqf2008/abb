@@ -34,6 +34,7 @@ mod lark_user;
 mod larkskills;
 mod mathrender;
 mod mdblocks;
+mod mediaplay;
 mod messenger;
 mod msgstore;
 mod outbox;

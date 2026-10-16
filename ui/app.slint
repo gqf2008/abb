@@ -3185,6 +3185,11 @@ export struct SysChatBlockRow {
     plain: string,
     // 稿 v15：**用户输入靠右、怹的输出靠左**。Rust 侧按轮次角色置位（`rows_for_w`）。
     align-right: bool,
+    // 稿 v16：音视频内联播放器的状态（`kind == "video" | "audio"`；见 `src/mediaplay.rs`）。
+    //   `media-playing` = 正在播；`media-progress` = 0..1；`media-time` = `0:03 / 0:12`。
+    media-playing: bool,
+    media-progress: float,
+    media-time: string,
     // 动作行（`kind == "acts"`）对应的助手轮在**历史里的真实下标**（由 Rust 在收尾时定位，
     // 见 `syschat::last_assistant_index`）；其它 kind 恒 `-1`（无意义）。**不许**用负值当
     //「最后一条助手轮」的哨兵：两条同值哨兵会一起解析到同一轮（独立评审判 Critical）。
@@ -4052,7 +4057,10 @@ export component SystemChatWindow inherits Window {
     out property <length> dbg-usage-fill-w: usage-fill.width;
     // 第二行「模型 · 状态」是否在画（稿 `.status .st2 .l2`）——无头断言用。
     out property <bool> dbg-status-second-line: root.model-index >= 0 && root.model-index < root.model-labels.length;
-    callback open-media(string);   // 音视频媒体卡：「用系统播放器打开」
+    callback open-media(string);   // 音视频媒体卡：「用系统播放器打开」（保留给未知格式兜底）
+    // 稿 v16：内联播放器的控制（播放/暂停、拖动进度）。参数 = 媒体地址（= 行里的 `src`）。
+    callback media-toggle(string);
+    callback media-seek(string, float);
     // 图片**右键 = 复制到系统剪贴板**（稿 v14：图片不做「打开」，右键才是复制）。
     callback copy-image(string);
     callback open-link(string);    // 图片 http 失败/普通链接：用浏览器打开
@@ -4636,21 +4644,127 @@ export component SystemChatWindow inherits Window {
                         // 音视频（稿 v15）：**不做卡片、不做按钮**——只给一行可点的提示，
                         // 点击用系统播放器打开。Slint 没有 `audio`/`video` 元素（§6），
                         // 内联播放做不到；但「带边框的卡片 + 按钮」显然与 markdown/设计稿不符。
+                        // 音视频（稿 v16）：**内联播放器卡片**——封面/画面 + 控件 + 说明条。
+                        // Slint 没有 audio/video 元素（§6）：播放由 `src/mediaplay.rs` 用本机
+                        // ffmpeg（视频逐帧流）与 ffplay/afplay（音频）驱动，帧以 RGBA 交给这里。
                         if b.kind == "audio" || b.kind == "video": Rectangle {
                             width: 100%;
-                            height: 20px;
-                            background: transparent;
-                            Text {
-                                text: (b.kind == "video" ? "🎬 " : "🎵 ") + b.alt;
-                                width: 100%;
-                                font-size: 12px;
-                                color: UiTokens.info;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-                            TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { root.open-media(b.src); }
+                            height: media-col.preferred-height;
+                            border-width: 2px;
+                            border-color: PixelTheme.edge;
+                            border-radius: 6px;
+                            background: PixelTheme.bg;
+                            media-col := VerticalBox {
+                                spacing: 0px;
+                                // 画面：视频放封面/当前帧；音频没有画面，只留一条窄标题带。
+                                if b.kind == "video": Rectangle {
+                                    width: 100%;
+                                    height: b.img-ok
+                                        ? max(120px, min(320px, root.convo-text-width * b.img-aspect))
+                                        : 120px;
+                                    background: #1c1a17;
+                                    if b.img-ok: Image {
+                                        width: 100%;
+                                        height: 100%;
+                                        source: b.img;
+                                        image-fit: contain;
+                                    }
+                                    if !b.img-ok: Text {
+                                        width: 100%;
+                                        height: 100%;
+                                        text: "🎬";
+                                        font-size: 26px;
+                                        color: #f6efe1;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    // 未播放时的中央 ▶（点了就开始播）。
+                                    if !b.media-playing: Rectangle {
+                                        width: 46px;
+                                        height: 46px;
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: self.width / 2;
+                                        background: #ffc61ad9;
+                                        border-width: 2px;
+                                        border-color: PixelTheme.edge;
+                                        Text {
+                                            width: 100%;
+                                            height: 100%;
+                                            text: "▶";
+                                            font-size: 20px;
+                                            color: PixelTheme.text;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.media-toggle(b.src); }
+                                    }
+                                }
+                                // 控件条：▶/⏸ + 进度条 + 时间。
+                                HorizontalBox {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    padding-top: 6px;
+                                    padding-bottom: 6px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: b.media-playing ? "⏸" : "▶";
+                                        font-size: 13px;
+                                        color: PixelTheme.text;
+                                        vertical-alignment: center;
+                                    }
+                                    media-bar := Rectangle {
+                                        height: 8px;
+                                        horizontal-stretch: 1;
+                                        vertical-stretch: 0;
+                                        background: PixelTheme.panel;
+                                        border-width: 2px;
+                                        border-color: PixelTheme.edge;
+                                        border-radius: 3px;
+                                        Rectangle {
+                                            x: 0px;
+                                            y: 0px;
+                                            height: 100%;
+                                            width: parent.width * b.media-progress;
+                                            background: PixelTheme.accent;
+                                        }
+                                        TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                root.media-seek(b.src, self.mouse-x / self.width);
+                                            }
+                                        }
+                                    }
+                                    Text {
+                                        text: b.media-time;
+                                        font-size: 11px;
+                                        color: UiTokens.text-dim;
+                                        vertical-alignment: center;
+                                    }
+                                    TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.media-toggle(b.src); }
+                                    }
+                                }
+                                // 稿 `.cap`：说明条（11px dim + 上边 2px 描边 + 底 panel）。
+                                Rectangle { width: 100%; height: 2px; background: PixelTheme.edge; }
+                                Rectangle {
+                                    width: 100%;
+                                    height: 18px;
+                                    background: PixelTheme.panel;
+                                    Text {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        text: (b.kind == "video" ? "video · " : "audio · ") + b.alt;
+                                        font-size: 11px;
+                                        color: UiTokens.text-dim;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
                             }
                         }
                         if b.kind == "p" && b.selectable: ConvoSelectableText {
