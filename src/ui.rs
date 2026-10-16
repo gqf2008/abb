@@ -9227,10 +9227,16 @@ pub fn run_gui() -> Result<()> {
                 // 执行层挂死/取消没被处理时那个事件永远不来 ⇒ 永久停在「正在输入」、
                 // ⏹ 看着像坏的（owner 报的现象）。超时即**本地强制收尾**，让界面能继续用。
                 if let Some(w) = win_w.upgrade() {
+                    // ⚠️ **必须先把值 copy 出来**（`Instant` 是 `Copy`）：写成
+                    // `if let Some(t0) = *stop_at.borrow() { … *stop_at.borrow_mut() = … }` 会
+                    // 让 `borrow()` 借到**整个分支体结束**，里面再 `borrow_mut()` 同一 RefCell
+                    // ⇒ `already mutably borrowed` **panic**——发生在 Slint 定时器回调里 =
+                    // 界面当场冻住（owner 2026-10-16：「点停止后程序挂了」，就是这一处）。
+                    let pending = *stop_at.borrow();
                     if !w.get_busy() {
                         // 回合已正常收尾：清掉陈旧时刻，别让下一次 ⏹ 立刻触发看门狗。
                         *stop_at.borrow_mut() = None;
-                    } else if let Some(t0) = *stop_at.borrow() {
+                    } else if let Some(t0) = pending {
                         if t0.elapsed() >= STOP_WATCHDOG_GRACE {
                             *stop_at.borrow_mut() = None;
                             // 已生成的正文/思考按「停止」的形态整段重建（打字机里的就是权威）。
