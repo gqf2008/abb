@@ -3128,6 +3128,9 @@ export struct TableRow {
     // 嵌套模型（`[[ConvoFlowPiece]]`）—— 一格里既有文字又有公式时必须能分别定位。
     flows: [[ConvoFlowPiece]],
     flow-hs: [length],
+    // 该行的高（Rust 侧 = 本行最高格的 flow-h + 8px）——**行高必须显式给**，
+    // 否则 `HorizontalBox` 里各格各自算高、行间会露出空隙（实测约 8–10px）。
+    row-h: length,
 }
 
 export struct SysChatBlockRow {
@@ -4431,15 +4434,16 @@ export component SystemChatWindow inherits Window {
                             interactive: true;
                             tbl-grid := VerticalBox {
                                 spacing: 0px;
+                                alignment: start;
                                 for trow in b.table-rows: HorizontalBox {
                                     spacing: 0px;
+                                    // 行高显式：各格靠 HorizontalBox 的 cross-axis `stretch` 填满。
+                                    height: trow.row-h;
                                     for cell[ci] in trow.cells: Rectangle {
                                         width: b.col-ws[ci];
-                                        // 撑到该行最高格（否则短格边框短一截，格子看起来错位）。
-                                        vertical-stretch: 1;
-                                        // 行高由 Rust 排好的内容报来（`flow-hs`；含公式的格子也是它）——
-                                        // 再用 `+8px` 给上下留白。
-                                        height: trow.flow-hs[ci] + 8px;
+                                        // 格子高 = 行高（两者都由 Rust 算）：显式给才不会被压成 0 高，
+                                        // 也不会因「各自算高」在行间露缝。
+                                        height: trow.row-h;
                                         background: trow.header ? PixelTheme.bg : transparent;
                                         border-width: 1px;
                                         border-color: PixelTheme.edge;
@@ -4511,66 +4515,35 @@ export component SystemChatWindow inherits Window {
                         // 布局报 ~30px，图片却实画 ~200px ⇒ 后面的文字被图片盖住、滞底也算不到底）。
                         // 现在高度显式由「视口宽 × 源宽高比」算，夹在 [120, 360]；未知比例回落 200px。
                         // 设计稿 `.media img{width:100%;height:auto}` 的口径 = 按比例、不裁剪（contain）。
-                        // 稿 `.media .cap`：图片下方还有一条 **说明条**（11px dim，上边 2px 描边）⇒
-                        // 块高 = 图高 + 2px 线 + 20px 说明。
-                        if b.kind == "image" && b.img-ok: Rectangle {
+                        // 图片（2026-10-16 owner 口径）：**遵守 markdown 规范**——只有图本身，
+                        // **没有边框、没有说明条、没有「打开」按钮、没有卡片**。
+                        // 高度仍按「视口宽 × 源宽高比」显式算（裸容器不会被 `Image` 撑高：
+                        // 以前该块只向布局报 ~30px、图片却实画 ~200px ⇒ 后面文字被盖住）。
+                        if b.kind == "image" && b.img-ok: Image {
                             width: 100%;
-                            height: img-el.height + 22px;
-                            border-width: 2px;
-                            border-color: PixelTheme.edge;
-                            border-radius: 6px;
-                            background: PixelTheme.bg;
-                            VerticalBox {
-                                spacing: 0px;
-                                img-el := Image {
-                                    source: b.img;
-                                    width: 100%;
-                                    height: max(
-                                        120px,
-                                        min(360px, root.convo-text-width * b.img-aspect)
-                                    );
-                                    image-fit: contain;
-                                }
-                                Rectangle { width: 100%; height: 2px; background: PixelTheme.edge; }
-                                Rectangle {
-                                    width: 100%;
-                                    height: 20px;
-                                    background: PixelTheme.panel;
-                                    img-cap := Text {
-                                        x: 8px;
-                                        width: parent.width - 16px;
-                                        text: b.alt;
-                                        font-size: 11px;
-                                        color: UiTokens.text-dim;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                    }
-                                }
-                            }
+                            height: max(
+                                120px,
+                                min(360px, root.convo-text-width * b.img-aspect)
+                            );
+                            source: b.img;
+                            image-fit: contain;
                         }
+                        // 加载不出来（路径不存在 / 远程未缓存）：给一行**可点的提示**，不做卡片/按钮。
                         if b.kind == "image" && !b.img-ok: Rectangle {
                             width: 100%;
-                            border-width: 2px;
-                            border-color: PixelTheme.edge;
-                            border-radius: 6px;
-                            background: PixelTheme.bg;
-                            HorizontalBox {
-                                padding: 8px;
-                                spacing: 8px;
-                                Text {
-                                    horizontal-stretch: 1;
-                                    text: "🖼 " + b.alt + "（" + b.src + "）";
-                                    font-size: 12px;
-                                    color: UiTokens.text-dim;
-                                    wrap: word-wrap;
-                                    // 可用宽 = 块内 416 − 行内 padding 16 − 间距 8 − 「打开」按钮（≤90，取保守）
-                                    width: root.convo-text-width - 90px;
-                                }
-                                PixelButton {
-                                    text: "打开";
-                                    size: "small";
-                                    clicked => { root.open-media(b.src); }
-                                }
+                            height: 20px;
+                            background: transparent;
+                            Text {
+                                text: "🖼 " + b.alt + "（图片打不开）";
+                                width: 100%;
+                                font-size: 12px;
+                                color: UiTokens.info;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.open-media(b.src); }
                             }
                         }
                         if b.kind == "audio" || b.kind == "video": Rectangle {

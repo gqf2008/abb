@@ -781,6 +781,30 @@ fn find_by_suffix(base: &std::path::Path, rel: &str) -> Option<PathBuf> {
     if want.is_empty() {
         return None;
     }
+    // memo：**同一段历史每次重建行都会问一遍**，而 miss 的成本是遍历工作区子树
+    //（owner 反馈的「GUI 打开很慢」里也有这份开销）。miss 也缓存。
+    let key = (base.to_path_buf(), rel.to_string());
+    if let Some(hit) = SUFFIX_MEMO.with(|m| m.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let found = find_by_suffix_uncached(base, &want);
+    SUFFIX_MEMO.with(|m| {
+        let mut g = m.borrow_mut();
+        if g.len() > 256 {
+            g.clear();
+        }
+        g.insert(key, found.clone());
+    });
+    found
+}
+
+thread_local! {
+    static SUFFIX_MEMO: std::cell::RefCell<
+        std::collections::HashMap<(std::path::PathBuf, String), Option<std::path::PathBuf>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn find_by_suffix_uncached(base: &std::path::Path, want: &[&str]) -> Option<PathBuf> {
     let mut found: Option<PathBuf> = None;
     let mut budget = 20_000usize;
     let mut stack = vec![(base.to_path_buf(), 0usize)];
@@ -818,7 +842,7 @@ fn find_by_suffix(base: &std::path::Path, rel: &str) -> Option<PathBuf> {
             if tail.len() >= want.len()
                 && tail[tail.len() - want.len()..]
                     .iter()
-                    .zip(&want)
+                    .zip(want)
                     .all(|(a, b)| a == b)
             {
                 if found.is_some() {
@@ -7062,14 +7086,29 @@ mod tests {
             Some(base.join("md-demo/assets/demo.svg")),
             "唯一候选应被采用"
         );
+        // 逻辑判据用 `_uncached`（`find_by_suffix` 带 memo，同一 key 不会重算）
+        let w: Vec<&str> = vec!["assets", "demo.svg"];
+        assert_eq!(
+            find_by_suffix_uncached(&base, &w),
+            Some(base.join("md-demo/assets/demo.svg"))
+        );
         // 多个候选 ⇒ 不猜
         std::fs::create_dir_all(base.join("other/assets")).unwrap();
         std::fs::write(base.join("other/assets/demo.svg"), b"x").unwrap();
-        assert_eq!(find_by_suffix(&base, "assets/demo.svg"), None);
+        assert_eq!(find_by_suffix_uncached(&base, &w), None);
         // 隐藏目录不参与（`.git` 之类不该被当素材源）
         std::fs::create_dir_all(base.join(".hidden/assets")).unwrap();
         std::fs::write(base.join(".hidden/assets/only.svg"), b"x").unwrap();
-        assert_eq!(find_by_suffix(&base, "assets/only.svg"), None);
+        assert_eq!(
+            find_by_suffix_uncached(&base, &["assets", "only.svg"]),
+            None
+        );
+        // memo：同一 key 第二次直接命中（即使此刻磁盘上已是「多候选」也返回首次结果——
+        // 行重建时反复问的就是同一个 key，这里钉住「不重复遍历」）
+        assert_eq!(
+            find_by_suffix(&base, "assets/demo.svg"),
+            Some(base.join("md-demo/assets/demo.svg"))
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

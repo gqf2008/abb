@@ -34,6 +34,7 @@ use parley::style::StyleProperty;
 use parley::{FontContext, InlineBox, InlineBoxKind, LayoutContext};
 
 /// 行内混排的一段（与 `.slint` 的 `ConvoFlowPiece` 一一对应）。
+#[derive(Clone)]
 pub struct FlowPiece {
     pub is_math: bool,
     /// 非公式：这一段的文字（一段 = 同一行内同一字体的连续文字）。
@@ -47,6 +48,7 @@ pub struct FlowPiece {
 }
 
 /// 一段话的混排结果。
+#[derive(Clone)]
 pub struct FlowLayout {
     pub pieces: Vec<FlowPiece>,
     /// 整段高（px）——调用方必须把它报给外层布局（裸容器不会被绝对定位的子项撑高）。
@@ -122,6 +124,56 @@ fn layout_common(
     if text.trim().is_empty() && math.is_empty() {
         return None;
     }
+    // 进程内 memo：**流式每个分片都重建整段**，表格更是每格一次 ⇒ 不缓存就是每个 tick 重排一遍
+    // （owner 反馈的「GUI 打开很慢」）。键含宽度/字号/对齐——换个宽度就是要重排。
+    let key = FlowKey {
+        text: text.to_string(),
+        math: math.to_vec(),
+        width: width.to_bits(),
+        font: font_size.to_bits(),
+        align,
+    };
+    if let Some(hit) = MEMO.with(|m| m.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let v = layout_uncached(text, math, width, font_size, cache, align);
+    MEMO.with(|m| {
+        let mut g = m.borrow_mut();
+        if g.len() > 512 {
+            g.clear();
+        }
+        g.insert(key, v.clone());
+    });
+    v
+}
+
+/// [`layout_common`] 的缓存键（宽度/字号按位比较 ⇒ 精确命中，不会因浮点近似而错配）。
+#[derive(PartialEq, Eq, Hash, Clone)]
+struct FlowKey {
+    text: String,
+    math: Vec<(usize, String)>,
+    width: u32,
+    font: u32,
+    align: u8,
+}
+
+thread_local! {
+    /// 复用的 parley 上下文（**不要在每次排版里 new**，见 `layout_uncached` 的注释）。
+    static CTX: std::cell::RefCell<Option<(FontContext, LayoutContext<()>)>> =
+        const { std::cell::RefCell::new(None) };
+
+    static MEMO: std::cell::RefCell<std::collections::HashMap<FlowKey, Option<FlowLayout>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn layout_uncached(
+    text: &str,
+    math: &[(usize, String)],
+    width: f32,
+    font_size: f32,
+    cache: &Path,
+    align: u8,
+) -> Option<FlowLayout> {
     let width = width.max(1.0);
     let font_size = font_size.max(1.0);
 
@@ -137,23 +189,29 @@ fn layout_common(
     }
 
     // 2) parley 排版：整段文字 + 每个公式一个 in-flow inline box。
-    let mut fcx = FontContext::new();
-    let mut lcx: LayoutContext<()> = LayoutContext::new();
-    let mut builder = lcx.ranged_builder(&mut fcx, text, 1.0, true);
-    builder.push_default(StyleProperty::FontSize(font_size));
-    for (i, (off, _)) in math.iter().enumerate() {
-        let m = &boxes[i];
-        builder.push_inline_box(InlineBox {
-            id: i as u64,
-            kind: InlineBoxKind::InFlow,
-            index: (*off).min(text.len()),
-            width: m.w,
-            // 只报「基线以上」：parley 把 box 底边贴上基线（`y = baseline - height`），
-            // 报整个高度会让行高多留一个下落部；下落部由我们下面按 `depth` 补。
-            height: m.ascent,
-        });
-    }
-    let mut pl = builder.build(text);
+    //
+    // ⚠️ **`FontContext`/`LayoutContext` 必须复用**（thread-local）：`FontContext::new()` 要建
+    // fontique 的字体集合、首次还要扫系统字体——**每次调用都 new 一次就等于「每个单元格
+    // 重扫一遍字体库」**，实测那是「GUI 打开很慢」的主因（表格 4 张 ≈ 3.9s）。
+    let mut pl = CTX.with(|c| {
+        let mut g = c.borrow_mut();
+        let (fcx, lcx) = g.get_or_insert_with(|| (FontContext::new(), LayoutContext::<()>::new()));
+        let mut builder = lcx.ranged_builder(fcx, text, 1.0, true);
+        builder.push_default(StyleProperty::FontSize(font_size));
+        for (i, (off, _)) in math.iter().enumerate() {
+            let m = &boxes[i];
+            builder.push_inline_box(InlineBox {
+                id: i as u64,
+                kind: InlineBoxKind::InFlow,
+                index: (*off).min(text.len()),
+                width: m.w,
+                // 只报「基线以上」：parley 把 box 底边贴上基线（`y = baseline - height`），
+                // 报整个高度会让行高多留一个下落部；下落部由我们下面按 `depth` 补。
+                height: m.ascent,
+            });
+        }
+        builder.build(text)
+    });
     pl.break_all_lines(Some(width));
     // 列对齐（平文单元格靠它居中/右对齐；左对齐时是 no-op）。
     pl.align(
@@ -437,5 +495,24 @@ mod tests {
             .unwrap_or_default();
         assert!(txt3.contains("frac"), "回落必须保留源码：{txt3:?}");
         let _ = std::fs::remove_dir_all(&cache);
+    }
+    /// 守卫：`FontContext` 必须**复用**（thread-local `CTX`），不许每次排版都 new。
+    ///
+    /// 为什么值得钉：`FontContext::new()` 会建 fontique 字体集、首次扫系统字体 ⇒ 每个单元格
+    /// 重来一遍。实测 4 张表 3.9s → 复用后 0.5s（`diag_build_breakdown` 的读数），是
+    /// owner 反馈「GUI 打开很慢」的主因。这条守卫让「改回每次 new」立刻红。
+    #[test]
+    fn font_context_is_reused_not_rebuilt_per_layout() {
+        let src = include_str!("inlineflow.rs");
+        // 拼接出「旧写法」再查，避免这条断言把自己的字面量也数进去。
+        let legacy = ["let mut fcx = ", "Font", "Context::new();"].concat();
+        assert!(
+            !src.contains(&legacy),
+            "不许在每次排版里新建 `FontContext`（要复用 thread-local CTX）"
+        );
+        assert!(
+            src.contains("(FontContext::new(), LayoutContext::<()>::new())"),
+            "必须走 thread-local `CTX` 的复用路径"
+        );
     }
 }

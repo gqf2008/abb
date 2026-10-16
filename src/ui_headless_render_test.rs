@@ -3401,8 +3401,16 @@ fn diag_demo_doc() {
         "/Users/sqb/.agent-bridge/workspaces/syschat/md-demo/markdown-demo.md",
     )
     .expect("读示例文档失败");
+    let blocks = crate::mdblocks::parse(&md);
+    let t0 = std::time::Instant::now();
     let mut rows = vec![row("role", "怹")];
-    push_block_rows_w(&mut rows, crate::mdblocks::parse(&md), 416.0);
+    push_block_rows_w(&mut rows, blocks.clone(), 416.0);
+    let cold = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let mut rows2 = vec![row("role", "怹")];
+    push_block_rows_w(&mut rows2, blocks, 416.0);
+    let warm = t1.elapsed();
+    println!("build rows: cold={cold:?} warm={warm:?}（warm 命中 memo 应显著更快）");
     let (ui, win, _m) = setup(rows, 8200);
     ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
         slint::SharedString::from("新会话"),
@@ -3486,4 +3494,28 @@ fn diag_design_body() {
     apply_syschat_layout(&ui, 520.0);
     let f = settle_w(&win, 520, 1200);
     write_png(&f, &dir.join("APP-body.png"));
+}
+
+/// 【诊断用·临时】只看表格行间距。
+#[test]
+#[ignore = "诊断用；默认不跑"]
+fn diag_table_rows() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    let _ = std::fs::create_dir_all(dir);
+    let md = "| 键 | 值 |\n|---|---|\n| a | 1 |\n| b | 2 |\n| c | 3 |\n";
+    let mut rows = vec![row("role", "怹")];
+    push_block_rows_w(&mut rows, crate::mdblocks::parse(md), 416.0);
+    let (ui, win, _m) = setup(rows, 400);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("m"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(420, 400));
+    apply_syschat_layout(&ui, 420.0);
+    let f = settle_w(&win, 420, 400);
+    write_png(&f, &dir.join("table-rows.png"));
 }

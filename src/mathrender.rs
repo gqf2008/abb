@@ -18,6 +18,7 @@
 use std::path::{Path, PathBuf};
 
 /// 排版结果：Slint 图片 + **自然显示尺寸**（逻辑 px，未缩放）+ 基线拆分。
+#[derive(Clone)]
 pub struct MathImage {
     pub image: slint::Image,
     /// 自然宽（px）。过宽时由 `.slint` 等比缩到气泡内（见 `app.slint` 的 `math` 分支）。
@@ -60,6 +61,43 @@ pub fn typeset_sized_in(tex: &str, cache: &Path, font_px: f64) -> Option<MathIma
     if tex.is_empty() {
         return None;
     }
+    // 进程内 memo：**流式每个分片都会重建整段**，同一公式会被反复请求 ⇒ 不缓存就要反复
+    // 跑 ratex 全流程（解析→布局→出 SVG），这是 owner 反馈的「GUI 打开很慢」的主要来源之一。
+    let key = (tex.to_string(), (font_px * 100.0).round() as i64);
+    if let Some(hit) = MEMO.with(|m| m.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let v = typeset_uncached(&key.0, cache, font_px);
+    MEMO.with(|m| {
+        let mut g = m.borrow_mut();
+        if g.len() > 512 {
+            g.clear();
+        }
+        g.insert(key, v.clone());
+    });
+    v
+}
+
+thread_local! {
+    /// `(TeX, 字号×100) → 结果`。`None` 也缓存（非法 TeX 反复请求时不必反复试）。
+    static MEMO: std::cell::RefCell<
+        std::collections::HashMap<(String, i64), Option<MathImage>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn typeset_uncached(tex: &str, cache: &Path, font_px: f64) -> Option<MathImage> {
+    // 缓存键 = 源码 **+ 字号**：行内（13px）与块级（15px）同公式必须分开存，否则互相覆盖。
+    let stamp = (font_px * 100.0).round() as i64;
+    let path = cache.join(format!("{}-{stamp}.svg", hash_hex(tex)));
+    let meta = cache.join(format!("{}-{stamp}.meta", hash_hex(tex)));
+
+    // **热路径**：SVG 与尺寸 sidecar 都在 ⇒ 只加载图，不再跑 ratex 全流程。
+    if path.is_file() {
+        if let (Some(m), Ok(image)) = (read_meta(&meta), slint::Image::load_from_path(&path)) {
+            return Some(MathImage { image, ..m });
+        }
+    }
+
     // 解析失败（非法 TeX）⇒ None，调用方回落成等宽文本。
     let ast = ratex_parser::parser::parse(tex).ok()?;
     let lbox = ratex_layout::layout(&ast, &ratex_layout::LayoutOptions::default());
@@ -78,18 +116,19 @@ pub fn typeset_sized_in(tex: &str, cache: &Path, font_px: f64) -> Option<MathIma
     let w = (dl.width * font_px + 2.0 * PAD_PX).max(1.0) as f32;
     let h = ascent + depth;
 
-    // 缓存键 = 源码 **+ 字号**：行内（13px）与块级（15px）同公式必须分开存，否则互相覆盖。
-    let path = cache.join(format!(
-        "{}-{}.svg",
-        hash_hex(tex),
-        (font_px * 100.0).round() as i64
-    ));
     if !path.is_file() {
         std::fs::create_dir_all(cache).ok()?;
         // 先写临时文件再 rename：并发/中断时不会留下半截 SVG 被 Slint 缓存成坏图。
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, svg.as_bytes()).ok()?;
         std::fs::rename(&tmp, &path).ok()?;
+    }
+    // 尺寸 sidecar（`w h ascent depth`）：热路径靠它免掉 ratex 全流程。
+    // **与 SVG 分开判**：老缓存里可能只有 SVG（本次改动之前写的），补上 meta 下次就走热路径。
+    if !meta.is_file() {
+        let mt = meta.with_extension("meta.tmp");
+        let _ = std::fs::write(&mt, format!("{w} {h} {ascent} {depth}"));
+        let _ = std::fs::rename(&mt, &meta);
     }
     let image = slint::Image::load_from_path(&path).ok()?;
     Some(MathImage {
@@ -98,6 +137,25 @@ pub fn typeset_sized_in(tex: &str, cache: &Path, font_px: f64) -> Option<MathIma
         h,
         ascent,
         depth,
+    })
+}
+
+/// 读尺寸 sidecar（`w h ascent depth`）；缺/坏都返回 `None`（调用方走冷路径重算）。
+fn read_meta(path: &Path) -> Option<MathImage> {
+    let t = std::fs::read_to_string(path).ok()?;
+    let v: Vec<f32> = t
+        .split_whitespace()
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    if v.len() != 4 {
+        return None;
+    }
+    Some(MathImage {
+        image: slint::Image::default(),
+        w: v[0],
+        h: v[1],
+        ascent: v[2],
+        depth: v[3],
     })
 }
 
@@ -129,19 +187,26 @@ mod tests {
             let m = typeset_in(tex, &dir).unwrap_or_else(|| panic!("公式排版失败：{tex}"));
             assert!(m.w > 0.0 && m.h > 0.0, "尺寸非法：{tex} → {}×{}", m.w, m.h);
         }
-        // 第二次调用命中磁盘缓存（同源码 ⇒ 同文件），不重复写
-        let files: Vec<_> = std::fs::read_dir(&dir)
+        // 磁盘缓存：每个公式一个 `.svg` + 一个 `.meta`（尺寸 sidecar，热路径靠它免跑 ratex）
+        let count_ext = |ext: &str| {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == ext))
+                .count()
+        };
+        assert_eq!(count_ext("svg"), 5, "每个公式一个 SVG");
+        assert_eq!(count_ext("meta"), 5, "每个公式一个尺寸 sidecar");
+        // 第二次调用命中缓存：不新增文件
+        let before = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
-            .collect();
-        assert_eq!(files.len(), 5, "每个公式一个缓存文件：{:?}", files.len());
-        let before = files[0].path();
+            .map(|e| e.path())
+            .min()
+            .unwrap();
         let _ = typeset_in(r"E = mc^2", &dir).unwrap();
-        let after: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect();
-        assert_eq!(after.len(), 5, "重复排版不应新增缓存文件");
+        assert_eq!(count_ext("svg"), 5, "重复排版不应新增 SVG");
+        assert_eq!(count_ext("meta"), 5, "重复排版不应新增 sidecar");
         assert!(before.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -3324,7 +3324,10 @@ fn table_row(rows: &[crate::mdblocks::MdBlock]) -> SysChatBlockRow {
                     cells: slint::ModelRc::from(Rc::new(slint::VecModel::from(cs))),
                     header: b.header,
                     flows: slint::ModelRc::from(Rc::new(slint::VecModel::from(flows))),
-                    flow_hs: slint::ModelRc::from(Rc::new(slint::VecModel::from(flow_hs))),
+                    flow_hs: slint::ModelRc::from(Rc::new(slint::VecModel::from(flow_hs.clone()))),
+                    // 行高 = 本行最高格 + 8px（上下各 4px 留白）；**显式给行高**，
+                    // 否则行间会露出空隙（实测约 8–10px，owner 2026-10-16 反馈）。
+                    row_h: flow_hs.iter().copied().fold(16.0f32, f32::max) + 8.0,
                 }
             })
             .collect();
