@@ -3795,6 +3795,31 @@ fn convo_follow_epoch_does_not_yank_when_not_at_bottom() {
     );
 }
 
+/// 【诊断用·临时】Slint **原生富文本**（`styled-text`）能渲什么：HTML 与 markdown 各一份。
+///
+/// ⚠️ 必须走**真实管线**（`mdblocks::parse` → `mdblocks::styled` = `StyledText::from_markdown`）：
+/// 手工造的 `p` 行不带 `styled` 字段，`.slint` 会直接画原文（前两版样本就这么白测了，图上还带着
+/// `**入口**` 的星号）——那不是原生解析器的能力，是测试自己绕过了它。
+#[test]
+#[ignore = "诊断用：出图对比 Slint 原生富文本"]
+fn diag_slint_native_rich_text() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    let _ = std::fs::create_dir_all(dir);
+    // ① 内联 **HTML 标签**（pulldown 会原样带进 `p` 块 ⇒ 交给 Slint 的原生解析器）
+    let html = "**入口** <b>HTML粗</b> / <i>HTML斜</i> / <s>HTML删除</s> / <u>HTML下划线</u> / <code>code</code> / <a href=\"https://a.b\">链接</a> / <font color=\"#c0392b\">红字</font>";
+    // ② 同样的语义用 **markdown** 写
+    let md = "**粗** / *斜* / ~~删除~~ / `code` / [链接](https://a.b) / <u>下划线</u>";
+    for (name, src) in [("native-html", html), ("native-md", md)] {
+        let mut rows = vec![row("role", "怹")];
+        push_block_rows_w(&mut rows, crate::mdblocks::parse(src), 416.0, false);
+        let (ui, win, _m) = setup(rows, 700);
+        ui.window().set_size(slint::PhysicalSize::new(520, 700));
+        apply_syschat_layout(&ui, 520.0);
+        let f = settle_w(&win, 520, 700);
+        write_png(&f, &dir.join(format!("{name}.png")));
+    }
+}
+
 /// 【诊断用·临时】思考块（折叠 + 展开）下面到底有没有线。
 #[test]
 #[ignore = "诊断用；默认不跑"]
