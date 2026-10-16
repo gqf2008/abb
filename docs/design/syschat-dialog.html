@@ -357,8 +357,8 @@
     <li><b>标题</b>：h1 <b>18px</b> / h2 <b>15px</b> / h3 14px；段落 13px、行高随字体默认。</li>
     <li><b>代码</b>：块级＝深底 <code>#1c1a17</code> + 浅字 <code>#f6efe1</code>、圆角 6、可选语言标注；行内＝暖底等宽等（由 Slint <code>StyledText</code> 渲染，<b>没有稿里那条 1px 描边</b>——该样式 Slint 不暴露，要一致只能自绘行内码）。</li>
     <li><b>引用</b>：左侧 4px 暖黄强调条 + 暖底，<b>只圆右侧两角</b>（<code>0 6px 6px 0</code>）。</li>
-    <li><b>图片</b>：按源宽高比自适应（<code>contain</code>，高夹 120–360px；SVG 读 <code>viewBox</code> 拿比例）；下方带 <code>.cap</code> <b>说明条</b>（11px dim、上边 2px 描边、底 <code>panel</code>）。加载不出来时退化成「打开」卡片。</li>
-    <li><b>表格</b>：整表一个块（列宽按内容估、一个横向滚动条、行高取该行最高格）；<b>列对齐</b>按 <code>|:---|:--:|--:|</code>；<b>单元格里的公式也真排版</b>（与段落同一套混排）。</li>
+    <li><b>图片</b>：按源宽高比自适应（<code>contain</code>，高夹 120–360px；SVG 读 <code>viewBox</code> 拿比例）。<b>遵守 markdown 规范</b>：只有图本身——<b>无边框、无 <code>.cap</code> 说明条、无「打开」按钮</b>（owner 2026-10-16 口径，推翻本稿早先的 <code>.media</code> 卡片样式）；加载不出来时给<b>一行可点的提示</b>（<code>🖼 alt（图片打不开）</code>），不做卡片/按钮。</li>
+    <li><b>表格</b>：整表一个块（列宽按内容估、一个横向滚动条）；行高<b>显式</b>给（= 该行最高格 + 8px，行与行<b>紧贴无缝隙</b>）；<b>列对齐</b>按 <code>|:---|:--:|--:|</code>；<b>单元格里的公式也真排版</b>（与段落同一套混排）。</li>
     <li><b>数学</b>：块级 <code>$$…$$</code> 由 KaTeX 的 Rust 移植（ratex）出 SVG；<b>行内</b> <code>$…$</code> 与文字同一套 parley 混排（文字仍由 Slint 画、公式是图）；排不出来一律回落等宽源码，<b>绝不吞字</b>。<b>含行内公式的段落不可拖选</b>（整段是定位好的片段），宽度变化会重排。</li>
     <li><b>思考块</b>：浅暖灰 2px 边框 <code>#d9cdb4</code>、标题<b>左对齐</b> <code>▸ 思考 · 用时 3.2s</code>（进行中 <code>思考中</code>）；展开态的<b>虚线分隔做不了</b>（Slint 无 dashed 边框）。</li>
     <li><b>动作行字形</b>：<code>📋 复制</code> / <code>↻ 重新生成</code> / <code>🔊 朗读</code>。原稿的 <code>⧉</code>(U+29C9)/<code>⟳</code>(U+27F3) <b>系统 UI 字体没有</b>（真机渲染成方框，2026-10-16 owner 截图），故替换为能渲染的等价字形。</li>
