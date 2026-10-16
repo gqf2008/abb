@@ -3606,4 +3606,39 @@ fn diag_media_player() {
     apply_syschat_layout(&ui, 520.0);
     let f = settle_w(&win, 520, 900);
     write_png(&f, &dir.join("media-player.png"));
+    // 最大化后（宽窗）卡片是否跟着铺满？
+    ui.window().set_size(slint::PhysicalSize::new(1200, 900));
+    apply_syschat_layout(&ui, 1200.0);
+    println!("宽窗 convo-text-width={}", ui.get_convo_text_width());
+    let f2 = settle_w(&win, 1200, 900);
+    write_png(&f2, &dir.join("media-player-wide.png"));
+}
+
+/// 【诊断用·临时】思考块（折叠 + 展开）下面到底有没有线。
+#[test]
+#[ignore = "诊断用；默认不跑"]
+fn diag_think_lines() {
+    let dir = std::path::Path::new("/Volumes/DataExt/tmp/syschat-shots");
+    let _ = std::fs::create_dir_all(dir);
+    let long = "用户要把架构图做成 HTML 页面。需要：① 把图存成文件 ② 配说明 ③ 单文件即开即用。\
+先读工作区里的图片与说明，再套一个自适应模板，最后把下载入口补上。";
+    let rows = vec![
+        role_row("怹", true),
+        think_row(long, "3.2s", false, false),
+        think_row(long, "", true, false),
+        row("p", "正文在思考块下面一行。"),
+    ];
+    let (ui, win, _m) = setup(rows, 700);
+    ui.set_session_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("新会话"),
+    ]))));
+    ui.set_model_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("m"),
+    ]))));
+    ui.set_session_index(0);
+    ui.set_model_index(0);
+    ui.window().set_size(slint::PhysicalSize::new(520, 700));
+    apply_syschat_layout(&ui, 520.0);
+    let f = settle_w(&win, 520, 700);
+    write_png(&f, &dir.join("think-lines.png"));
 }

@@ -4342,6 +4342,20 @@ export component SystemChatWindow inherits Window {
                                         clicked => { root.toggle-think(i); }
                                     }
                                 }
+                                // 稿 `details.think .body{border-top:2px dashed #e2d7bf}`：展开态标题与
+                                // 正文之间那条**虚线**。Slint 没有 dashed 边框（§6），用一排小块拼：
+                                // 每块 `horizontal-stretch: 1` ⇒ 无论块多宽都铺满，缝宽固定 4px。
+                                if b.think-expanded: HorizontalBox {
+                                    width: 100%;
+                                    height: 2px;
+                                    spacing: 4px;
+                                    // Slint 的重复语法：整数当模型（`for i in 20`），不是 range。
+                                    for _i in 20: Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: 2px;
+                                        background: #e2d7bf;
+                                    }
+                                }
                                 // 正文窗口：展开（最多 10 行）或生成中（一行滚动的打字机窗口）。
                                 // 用 `Text`（不是 `TextInput`）：要放进 Flickable 做块内滚动，
                                 // 代价是思考文字不再可拖选（正文与整轮的复制不受影响）。
@@ -4647,17 +4661,25 @@ export component SystemChatWindow inherits Window {
                         // 音视频（稿 v16）：**内联播放器卡片**——封面/画面 + 控件 + 说明条。
                         // Slint 没有 audio/video 元素（§6）：播放由 `src/mediaplay.rs` 用本机
                         // ffmpeg（视频逐帧流）与 ffplay/afplay（音频）驱动，帧以 RGBA 交给这里。
-                        if b.kind == "audio" || b.kind == "video": Rectangle {
+                        // 音视频（稿 v16/v17）：**内联播放器**。
+                        // · 视频 = 封面/画面 + 中央 ▶ + 控件条（▶/⏸ + 进度 + 时间）+ 说明条；
+                        // · 音频 = **只要一个播放/暂停钮 + 名称**（owner 口径：音频不必有进度条）。
+                        // Slint 没有 audio/video 元素：播放由 `src/mediaplay.rs` 用本机 ffmpeg/ffplay
+                        // 驱动，帧以 RGBA 交给这里。
+                        // ⚠️ 卡片内部**不要靠 preferred-宽推算**（`horizontal-stretch` / 裸容器）：
+                        // 最大化后消息区变宽时那样的宽度不会跟着走（owner 2026-10-16 真机截图：
+                        // 音频卡不铺满、视频卡反而更宽）。可见宽一律写成 `convo-text-width` 的表达式。
+                        if b.kind == "video": Rectangle {
                             width: 100%;
-                            height: media-col.preferred-height;
+                            height: video-col.preferred-height;
                             border-width: 2px;
                             border-color: PixelTheme.edge;
                             border-radius: 6px;
                             background: PixelTheme.bg;
-                            media-col := VerticalBox {
+                            video-col := VerticalBox {
                                 spacing: 0px;
-                                // 画面：视频放封面/当前帧；音频没有画面，只留一条窄标题带。
-                                if b.kind == "video": Rectangle {
+                                // 画面（封面 / 当前帧）。
+                                Rectangle {
                                     width: 100%;
                                     height: b.img-ok
                                         ? max(120px, min(320px, root.convo-text-width * b.img-aspect))
@@ -4678,7 +4700,6 @@ export component SystemChatWindow inherits Window {
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
-                                    // 未播放时的中央 ▶（点了就开始播）。
                                     if !b.media-playing: Rectangle {
                                         width: 46px;
                                         height: 46px;
@@ -4703,7 +4724,7 @@ export component SystemChatWindow inherits Window {
                                         clicked => { root.media-toggle(b.src); }
                                     }
                                 }
-                                // 控件条：▶/⏸ + 进度条 + 时间。
+                                // 控件条：▶/⏸ + 进度条（**显式宽**）+ 时间。
                                 HorizontalBox {
                                     padding-left: 8px;
                                     padding-right: 8px;
@@ -4716,10 +4737,11 @@ export component SystemChatWindow inherits Window {
                                         color: PixelTheme.text;
                                         vertical-alignment: center;
                                     }
-                                    media-bar := Rectangle {
+                                    // 进度条宽 = 卡片内可用宽 − ▶(14) − 时间(56) − 三段 spacing(24)；
+                                    // 用显式宽而不是 `horizontal-stretch`（见上面 ⚠️）。
+                                    Rectangle {
+                                        width: max(40px, root.convo-text-width - 110px);
                                         height: 8px;
-                                        horizontal-stretch: 1;
-                                        vertical-stretch: 0;
                                         background: PixelTheme.panel;
                                         border-width: 2px;
                                         border-color: PixelTheme.edge;
@@ -4728,7 +4750,7 @@ export component SystemChatWindow inherits Window {
                                             x: 0px;
                                             y: 0px;
                                             height: 100%;
-                                            width: parent.width * b.media-progress;
+                                            width: (parent.width - 4px) * b.media-progress;
                                             background: PixelTheme.accent;
                                         }
                                         TouchArea {
@@ -4749,7 +4771,7 @@ export component SystemChatWindow inherits Window {
                                         clicked => { root.media-toggle(b.src); }
                                     }
                                 }
-                                // 稿 `.cap`：说明条（11px dim + 上边 2px 描边 + 底 panel）。
+                                // 稿 `.cap`：说明条。
                                 Rectangle { width: 100%; height: 2px; background: PixelTheme.edge; }
                                 Rectangle {
                                     width: 100%;
@@ -4758,13 +4780,45 @@ export component SystemChatWindow inherits Window {
                                     Text {
                                         x: 8px;
                                         width: parent.width - 16px;
-                                        text: (b.kind == "video" ? "video · " : "audio · ") + b.alt;
+                                        text: "video · " + b.alt;
                                         font-size: 11px;
                                         color: UiTokens.text-dim;
                                         vertical-alignment: center;
                                         overflow: elide;
                                     }
                                 }
+                            }
+                        }
+                        // 音频：**一个播放/暂停钮 + 名称**（owner 口径），不做进度条。
+                        if b.kind == "audio": Rectangle {
+                            width: 100%;
+                            height: 34px;
+                            border-width: 2px;
+                            border-color: PixelTheme.edge;
+                            border-radius: 6px;
+                            background: PixelTheme.bg;
+                            HorizontalBox {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 8px;
+                                Text {
+                                    text: b.media-playing ? "⏸" : "▶";
+                                    font-size: 13px;
+                                    color: PixelTheme.text;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: "audio · " + b.alt;
+                                    font-size: 12px;
+                                    color: PixelTheme.text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.media-toggle(b.src); }
                             }
                         }
                         if b.kind == "p" && b.selectable: ConvoSelectableText {
