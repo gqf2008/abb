@@ -424,6 +424,11 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
     if markdown.trim().is_empty() {
         return Vec::new();
     }
+    // 「HTML 渲染支持」（2026-10-16 owner）：先把**成块的裸 HTML** 就地翻成 markdown，再走
+    // 下面这条既有管线——这样 HTML 得到的排版与 markdown **完全一致**（表格/公式/媒体/代码选择
+    // 全都复用）。行内标签（`<b>`/`<code>`/`<a>`）不在这里动，见 `htmlmd` 顶注的口径。
+    let converted = crate::htmlmd::convert_html_blocks(markdown);
+    let markdown = converted.as_str();
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -582,6 +587,14 @@ pub fn parse(markdown: &str) -> Vec<MdBlock> {
                 }
                 TagEnd::CodeBlock => {
                     if let Some((lang, buf)) = code.take() {
+                        // ```html / ```htm 围栏**直接渲染**（owner：「像 markdown 一样」）——
+                        // 与裸 HTML 段同口径（转换后进同一条管线）。其它语言仍是代码块。
+                        let l = lang.trim().to_ascii_lowercase();
+                        if l == "html" || l == "htm" {
+                            let md = crate::htmlmd::html_to_markdown(&buf);
+                            blocks.extend(parse(&md));
+                            continue;
+                        }
                         let mut b = MdBlock::new("code");
                         b.lang = lang;
                         b.text = buf.strip_suffix('\n').unwrap_or(&buf).to_string();

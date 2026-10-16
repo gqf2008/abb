@@ -28,6 +28,7 @@ mod emoji;
 mod feishu;
 mod guard;
 mod history;
+mod htmlmd;
 mod inlineflow;
 mod install;
 mod lark_user;

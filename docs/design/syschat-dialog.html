@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABB 系统对话 · 设计稿 v20</title>
+<title>ABB 系统对话 · 设计稿 v21</title>
 <style>
   :root{
     --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
@@ -332,7 +332,7 @@
 <!-- /左列 -->
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v20</h1>
+  <h1>ABB 系统对话 · 设计稿 v21</h1>
   <div class="sub">本轮：交互细化（面板位置 / 截屏 / 上下文用量条 / 可拉升 / 消息动作 / 归档 / 新建去重）</div>
   <div class="sub" style="color:var(--info)"><b>v11 新增的交互要求</b>（本稿先画示意，walgit 已登记待逐步实现）</div>
   <ol>
@@ -354,6 +354,25 @@
     <li><b>新建会话图标</b>：<code>＋</code> → <b>对话气泡</b>图标（同 logo 里那个气泡，14px，墨黑描边色），放在 历史会话 <code>🗂</code> 左边。</li>
     <li><b>附件移进输入框内</b>：输入区**不再有框外图标列**；框内底部一行（靠右）＝ <code>[😊 表情] [📎 附件] [✂ 截图] [⋯ 更多(定时)]</code> + <code>发送</code> + <code>🗑 清空</code>，全部**同一水平线**。</li>
     <li><b>输入区边距一致</b>：去掉框外图标列后，输入框左右各留 10px（原来右侧偏大）。</li>
+  </ol>
+  <div class="sub" style="color:var(--info)"><b>v21：HTML 渲染支持（像 markdown 一样排出来）</b>（2026-10-16 owner 口径）</div>
+  <ol>
+    <li><b>范围 = 结构与文本级样式</b>，<b>不是</b>网页渲染：<code>h1..h6</code> / <code>p</code> / <code>br</code> /
+      <code>hr</code> / <code>ul|ol|li</code>（含嵌套） / <code>blockquote</code> / <code>pre&gt;code</code> /
+      <code>table|tr|td|th</code> / <code>img</code> / <code>a</code> / <code>b|strong</code> /
+      <code>i|em</code> / <code>s|del</code> / <code>code</code>，实体解码。
+      <b>CSS 布局（flex/position/grid）、<code>style</code> 属性的视觉样式、iframe/canvas/svg 一律不做</b>
+      ——Slint 没有网页引擎（它只把 <code>Text.text</code> 当 CommonMark + 行内 HTML 样式渲染，
+      见 <code>i-slint-compiler/builtins.slint:745</code>），要真网页预览必须走 WKWebView（另立项）。</li>
+    <li><b>两种触发形态都认</b>：① 回复里**成块的裸 HTML**（行首是块级标签，按同名标签配对深度整段收走）；
+      ② <b><code>```html</code> 围栏直接渲染</b>（不再是代码块）。<b>行内标签不动</b>
+      （<code>他有 &lt;b&gt;重点&lt;/b&gt;</code> 这种既有排版不受影响）。</li>
+    <li><b>安全与保真两条硬口径</b>：<code>&lt;style&gt;/&lt;script&gt;/&lt;head&gt;</code> 的<b>内容整段丢弃</b>
+      （否则 CSS/JS 源码会被当正文画出来）；<b>缺配对的闭合标签时原样显示源码</b>
+      ——宁可给人看源码，<b>绝不吞内容</b>。</li>
+    <li><b>实现</b>：新增 <code>src/htmlmd.rs</code>（HTML → Markdown 文本），<b>复用</b>既有
+      <code>mdblocks</code> 管线 ⇒ HTML 得到的排版与 markdown <b>逐字节同源</b>（表格线、公式、媒体、
+      代码选择全都一致），不并排写第二套块解析器。</li>
   </ol>
   <div class="sub" style="color:var(--info)"><b>v20：发送/停止合并成一个按钮 / 生成中可插话（打断本轮）</b>（2026-10-16 owner 口径）</div>
   <ol>
