@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ABB 系统对话 · 设计稿 v14</title>
+<title>ABB 系统对话 · 设计稿 v15</title>
 <style>
   :root{
     --bg:#fdf6e9; --panel:#ffffff; --hover:#f4ebd9;
@@ -330,7 +330,7 @@
 <!-- /左列 -->
 
 <aside>
-  <h1>ABB 系统对话 · 设计稿 v14</h1>
+  <h1>ABB 系统对话 · 设计稿 v15</h1>
   <div class="sub">本轮：交互细化（面板位置 / 截屏 / 上下文用量条 / 可拉升 / 消息动作 / 归档 / 新建去重）</div>
   <div class="sub" style="color:var(--info)"><b>v11 新增的交互要求</b>（本稿先画示意，walgit 已登记待逐步实现）</div>
   <ol>
@@ -352,6 +352,14 @@
     <li><b>新建会话图标</b>：<code>＋</code> → <b>对话气泡</b>图标（同 logo 里那个气泡，14px，墨黑描边色），放在 历史会话 <code>🗂</code> 左边。</li>
     <li><b>附件移进输入框内</b>：输入区**不再有框外图标列**；框内底部一行（靠右）＝ <code>[😊 表情] [📎 附件] [✂ 截图] [⋯ 更多(定时)]</code> + <code>发送</code> + <code>🗑 清空</code>，全部**同一水平线**。</li>
     <li><b>输入区边距一致</b>：去掉框外图标列后，输入框左右各留 10px（原来右侧偏大）。</li>
+  </ol>
+  <div class="sub" style="color:var(--info)"><b>v15：底色统一 / 思考块 1+10 行 / 生成贴底 / 单线分割 / 左右分栏对齐</b>（2026-10-16 owner 口径）</div>
+  <ol>
+    <li><b>块不要独立底色</b>：公式块（以及其它「数据表达式」类块）的背景<b>必须与消息区一致</b>（<code>--panel</code>）；稿里那些 <code>.media</code>/<code>details.think</code> 的 <code>var(--bg)</code> 只用于「有框的卡片」，<b>公式块没有框、也没有底色</b>（现在看起来发黄 = 错）。</li>
+    <li><b>思考块：折叠 1 行 / 展开最多 10 行</b>。折叠态就只有标题那一行；展开态正文<b>最多 10 行高</b>，超出<b>块内滚动</b>，生成中始终滚到最新一行（不要在页面里撑开几十行）。</li>
+    <li><b>生成中（含思考部分）始终贴底</b>：流式输出时视图必须跟着内容走（<b>推翻</b> v14 加的「只有已贴底才跟随」——那会让生成看起来不是流式）。</li>
+    <li><b>中继（内容区 ↔ 输入区）分割区只留一根线</b>：那条 2px 线之外不要再出现第二条观感的分界（分割条底色与下侧输入区同色，不要靠色差造出「第二条线」）。</li>
+    <li><b>左右分栏对齐</b>：<b>用户输入的消息靠右</b>、<b>怹（AI）的输出靠左</b>（角色名与正文一起）。</li>
   </ol>
   <div class="sub" style="color:var(--info)"><b>v14：消息动作图标化 / 思考块展开不跳底 / 远程图片</b>（2026-10-16 owner 口径，实现随之）</div>
   <ol>
