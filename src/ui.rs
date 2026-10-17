@@ -605,6 +605,40 @@ const BUBBLE_VISUAL_SIZE: i32 = 36;
 /// 否则窗口位与可视位会差 4px（`bubble_saved_pos`/`bubble_visual_rect` 那一组换算）。
 const BUBBLE_INSET: i32 = if cfg!(windows) { 0 } else { 4 };
 
+/// 把气泡窗口的原生最小/最大尺寸钉死为「可视气泡 + 边距」（Windows 必需）。
+///
+/// 为什么需要（owner 2026-10-17 真机：气泡变成「蓝色图标 + 右侧一条黑底」）：Slint 的窗口
+/// min/max 约束来自根布局，而 `Window` 的 `layout_info` 是默认值（min=0 / max=∞）⇒ winit
+/// 不向 Windows 报 min/max，`WM_GETMINMAXINFO` 落回 DefWindowProc 的默认值，系统按「带标题
+/// 样式窗口的最小宽度」把 36px 的小窗撑成 124×37 逻辑 px（本机 150% 缩放 = 186×56 物理 px）。
+/// 多出来的窗口区域不是透明的：Slint 在 Windows 上开的是普通（非分层）窗，DWM 按不透明合成
+/// ⇒ 纯黑。显式给 winit 报 min=max，`WM_GETMINMAXINFO` 就会用我们的值覆盖系统默认（实测
+/// 54×54 物理 px = 36×36 逻辑 px）。
+///
+/// 只要求 winit 改约束不够：当前窗口已经被系统撑大，必须再显式请求一次目标尺寸才会缩回。
+///
+/// 返回是否真的碰到了原生窗（`false` = 还没 realize，调用方下一 tick 再试）。
+#[cfg(target_os = "windows")]
+fn pin_bubble_window_size(bubble: &AnchorBubble) -> bool {
+    use slint::winit_030::WinitWindowAccessor;
+    let side = (BUBBLE_VISUAL_SIZE + BUBBLE_INSET * 2) as f64;
+    bubble
+        .window()
+        .with_winit_window(|w| {
+            use slint::winit_030::winit::dpi::LogicalSize;
+            let size = LogicalSize::new(side, side);
+            w.set_min_inner_size(Some(size));
+            w.set_max_inner_size(Some(size));
+            let _ = w.request_inner_size(size);
+        })
+        .is_some()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn pin_bubble_window_size(_bubble: &AnchorBubble) -> bool {
+    true
+}
+
 /// 气泡显隐的**唯一收口**。
 ///
 /// 可见 ⟺ `config.syschat_bubble == true`（**只由托盘开关决定**）。
@@ -4455,6 +4489,9 @@ pub fn run_gui() -> Result<()> {
     // macOS 的窗口级联覆盖，保存的位置实际不生效（2026-10-13 实测：设 (1398,120) 后窗口落在 (1206,65)）。
     // 坐标统一用**逻辑像素**（winit 的 MonitorHandle::size() 是物理像素，Retina 下差 2 倍）。
     let bubble_pos_apply = Rc::new(Cell::new(true));
+    // Windows：气泡原生窗尺寸钉死只在首次 realize 后做一次（`show()` 只是登记，原生窗要等
+    // 事件循环转起来才创建；见 `pin_bubble_window_size`）。
+    let bubble_size_pinned = Rc::new(Cell::new(false));
     // 气泡显示/隐藏统一走 refresh_bubble_visibility（只按托盘开关；v10 起与对话框显隐无关）。
     refresh_bubble_visibility(&bubble, false); // 启动：对话框还没开
 
@@ -9546,6 +9583,8 @@ pub fn run_gui() -> Result<()> {
         let bubble_weak = bubble.as_weak();
         // 气泡位置待施加标记（见启动处注释）
         let bubble_pos_apply_t = bubble_pos_apply.clone();
+        // 气泡原生窗尺寸是否已钉死（见 `pin_bubble_window_size`）
+        let bubble_size_pinned_t = bubble_size_pinned.clone();
         // 卡 d9：定时发送到点——复用托盘进程**既有的** 2s 主定时器（不新增线程/不新增依赖）。
         // 到点项由 `take_due` 取出并**同时揭除**（防重复触发），再走与手动发送同一个
         // `submit_sc` 入口（上屏 + 落点判定 + 状态行）；发出失败由 submit_sc 自身的状态行可见。
@@ -10099,6 +10138,14 @@ pub fn run_gui() -> Result<()> {
                                 ));
                                 bubble_pos_apply_t.set(false);
                             }
+                        }
+                    }
+                }
+                // Windows：气泡原生窗一旦 realize，就把尺寸钉死（见 `pin_bubble_window_size`）。
+                if !bubble_size_pinned_t.get() {
+                    if let Some(b) = bubble_weak.upgrade() {
+                        if b.window().is_visible() && pin_bubble_window_size(&b) {
+                            bubble_size_pinned_t.set(true);
                         }
                     }
                 }
