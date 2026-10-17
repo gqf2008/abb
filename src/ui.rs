@@ -3754,30 +3754,42 @@ pub fn run_gui() -> Result<()> {
                     ticks.set(ticks.get() + 1);
                     let k = ticks.get();
                     if k == 5 {
-                        use slint::winit_030::WinitWindowAccessor;
-                        let before = live_window_rect(&w.window());
-                        let vis = w
-                            .window()
-                            .with_winit_window(platform::visible_work_area)
-                            .flatten();
-                        let mon = monitor_work_area(&w.window());
-                        crate::log!("[verify-set-size] work-area visible={vis:?} monitor={mon:?}");
-                        crate::log!(
-                            "[verify-set-size] before={before:?} physical={:?}",
-                            w.window().size()
-                        );
-                        // `ABB_VERIFY_SIZE=WxH` 可覆盖（用来分辨「一律 no-op」与「被最大尺寸夹住」）。
-                        let (tw, th) = std::env::var("ABB_VERIFY_SIZE")
-                            .ok()
-                            .and_then(|v| {
-                                let (a, b) = v.split_once('x')?;
-                                Some((a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?))
-                            })
-                            .unwrap_or_else(|| {
-                                vis.map(|(_, _, w, h)| (w, h)).unwrap_or((700.0, 700.0))
-                            });
-                        w.window().set_size(slint::LogicalSize::new(tw, th));
-                        crate::log!("[verify-set-size] requested logical {tw}x{th}");
+                        // ⚠️ **Windows 没有 `winit` 依赖**（Cargo.toml 按 target 门控）⇒ 这段
+                        // `with_winit_window` 探查必须一并门控，否则 Windows 编译失败
+                        //（CI 实测：`cannot find value visible_work_area in module platform`）。
+                        // 这是**诊断用**快捷键（`ABB_VERIFY_SIZE` 那套），Windows 上不需要。
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            use slint::winit_030::WinitWindowAccessor;
+                            let before = live_window_rect(&w.window());
+                            let vis = w
+                                .window()
+                                .with_winit_window(platform::visible_work_area)
+                                .flatten();
+                            let mon = monitor_work_area(&w.window());
+                            crate::log!(
+                                "[verify-set-size] work-area visible={vis:?} monitor={mon:?}"
+                            );
+                            crate::log!(
+                                "[verify-set-size] before={before:?} physical={:?}",
+                                w.window().size()
+                            );
+                            // `ABB_VERIFY_SIZE=WxH` 可覆盖（用来分辨「一律 no-op」与「被最大尺寸夹住」）。
+                            let (tw, th) = std::env::var("ABB_VERIFY_SIZE")
+                                .ok()
+                                .and_then(|v| {
+                                    let (a, b) = v.split_once('x')?;
+                                    Some((
+                                        a.trim().parse::<f32>().ok()?,
+                                        b.trim().parse::<f32>().ok()?,
+                                    ))
+                                })
+                                .unwrap_or_else(|| {
+                                    vis.map(|(_, _, w, h)| (w, h)).unwrap_or((700.0, 700.0))
+                                });
+                            w.window().set_size(slint::LogicalSize::new(tw, th));
+                            crate::log!("[verify-set-size] requested logical {tw}x{th}");
+                        }
                     } else if k == 6 || k == 7 {
                         let r = live_window_rect(&w.window());
                         crate::log!(
@@ -9093,13 +9105,21 @@ pub fn run_gui() -> Result<()> {
             if let WindowEvent::KeyboardInput { event, .. } = ev {
                 // 稿 v16：输入框**为空**时按 ⌫ ⇒ 删掉**最后一个**待发附件（再按继续往前删）。
                 // 输入框里有字时不动它（照旧交给 TextInput 删字符）。判据是纯函数（可单测）。
-                if event.state == ElementState::Pressed
-                    && !event.repeat
-                    && matches!(
-                        event.logical_key,
-                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace)
-                    )
-                {
+                // ⚠️ **Windows 没有 `winit` 依赖**（Cargo.toml 按 target 门控）⇒ 用
+                // `winit::keyboard::…` 做模式匹配的这半句必须门控（CI 实测：
+                // `cannot find module or crate winit`）。同一块里的 ⌘V 粘贴是跨平台的，**不**
+                // 跟着关——所以只把「是不是 Backspace」抽成一个门控变量。
+                // 代价：Windows 上暂时没有「输入框空时 ⌫ 删最后一个待发附件」这条快捷方式
+                //（待发列表里仍可逐条取消）。**正确修法**：改走 Slint 的 `key-pressed` 回调，
+                // 跨平台且彻底不依赖 winit（见交接文档 §7.4 的跟进项）。
+                #[cfg(not(target_os = "windows"))]
+                let hit_backspace = matches!(
+                    event.logical_key,
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace)
+                );
+                #[cfg(target_os = "windows")]
+                let hit_backspace = false;
+                if event.state == ElementState::Pressed && !event.repeat && hit_backspace {
                     let n = atts_bs.borrow().len();
                     if n > 0 {
                         if let Some(win) = cw2.upgrade() {
