@@ -36,7 +36,7 @@ powershell -ExecutionPolicy Bypass -File tools\windows\diag-abb.ps1
 | 现象 | 怀疑 | 我们要的证据 |
 |---|---|---|
 | 整个界面卡死、设置窗打不开 | UI 线程上有**阻塞调用**（文件/网络/进程/等待）或重入死锁 | `abb.dmp` 的**主线程栈**（有它就能定位到函数） |
-| 任务栏有 **3 个**窗口 | 气泡窗 / 对话窗 / 设置窗**都没设** `WS_EX_TOOLWINDOW`，且都没隐藏任务栏按钮 | `windows.txt` 里三行的 `exStyle` 与 owner |
+| 任务栏有 **3 个**窗口（**已修** 2026-10-17） | Slint 的原生窗创建时是隐藏的，winit 的 `skip_taskbar` 只在建窗那一刻调 `DeleteTab`（对隐藏窗是空操作），之后 show 也不会补；事后补 `WS_EX_TOOLWINDOW` 又不会让已注册的按钮消失 | 修法见 `ui.rs::delete_own_taskbar_buttons`：tick 里对**本进程可见顶层窗**周期调 `ITaskbarList::DeleteTab`（只删任务栏按钮，不影响 Alt-Tab） |
 | 气泡黑边（已修，待验） | Windows 透明合成不保证逐像素 alpha | 新版本是否还有；`SLINT_BACKEND=winit-software` 对照 |
 | 气泡↔窗口切换卡顿 | 渲染后端 / 窗口显隐成本 | 正常时也卡？（`Responding=True` 但顿）⇒ 试 `SLINT_BACKEND=winit-software` 对照 |
 
@@ -59,6 +59,5 @@ $env:ABB_SYSCHAT_DEBUG='1'     # 系统对话的流式滚动诊断（写 ~/.agen
 
 Windows 侧目前**没有**做这些（见 `ui.rs` 的 `#[cfg]`）：
 
-- 任务栏：未设 `skip_taskbar` / `WS_EX_TOOLWINDOW`；
 - 透明窗：未做逐像素 alpha 兜底（气泡黑边就是这么来的，已用「Windows 零边距」绕开）；
 - ⌫ 删待发附件：Windows 上暂缺（winit 不在依赖里，要改走 Slint `key-pressed`）。

@@ -2711,7 +2711,7 @@ fn configure_backend() -> Result<()> {
             })
             .select()?;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     slint::BackendSelector::new().select()?;
     Ok(())
 }
@@ -2756,6 +2756,137 @@ fn win32_hwnd(window: &slint::winit_030::winit::window::Window) -> Option<*mut s
         RawWindowHandle::Win32(h) => Some(h.hwnd.get() as *mut std::ffi::c_void),
         // 非 Win32 句柄只在 Windows 上不可达（后端就是 winit-win32），防御性返回
         _ => None,
+    }
+}
+
+/// 删掉本进程所有顶层窗口的任务栏按钮（`ITaskbarList::DeleteTab`），幂等。
+///
+/// 为什么不能用 `WS_EX_TOOLWINDOW`/winit 的 `skip_taskbar`：
+/// - Slint 的原生窗**创建时是隐藏的**（`with_visible(false)`），任务栏按钮要等 `ShowWindow`
+///   才注册；winit 的 `skip_taskbar` 只在建窗那一刻调一次 `DeleteTab`（对隐藏窗是空操作），
+///   之后显示也不会补（winit-0.30 只在 Explorer 重启的 `TASKBAR_CREATED` 上重试）；
+/// - 事后补 `WS_EX_TOOLWINDOW` 实测**不会**让已注册的按钮消失，而且会顺手把窗口排除出
+///   Alt-Tab——代价比需求大。
+///
+/// `DeleteTab` 是任务栏自己的 API：只看当前有没有按钮，有就删，不影响 Alt-Tab。由 tick
+/// 周期调用（窗口 show 之后最多 2s 内收口），owner 2026-10-17：「任务栏不需要显示应用」。
+#[cfg(target_os = "windows")]
+fn delete_own_taskbar_buttons() {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+    // CLSID_TaskbarList {56FDF344-FD6D-11d0-958A-006097C9A090}
+    const CLSID_TASKBAR_LIST: Guid = Guid {
+        data1: 0x56FD_F344,
+        data2: 0xFD6D,
+        data3: 0x11D0,
+        data4: [0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90],
+    };
+    // IID_ITaskbarList {56FDF342-FD6D-11d0-958A-006097C9A090}
+    const IID_ITASKBAR_LIST: Guid = Guid {
+        data1: 0x56FD_F342,
+        data2: 0xFD6D,
+        data3: 0x11D0,
+        data4: [0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90],
+    };
+    const CLSCTX_INPROC_SERVER: u32 = 0x1;
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+
+    /// `ITaskbarList` 的 vtable（IUnknown 3 项 + 自身 5 项）。
+    /// 布局必须与 `shobjidl.h` 一致：HrInit 在下标 3，DeleteTab 在**下标 5**。
+    #[repr(C)]
+    struct TaskbarListVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        hr_init: unsafe extern "system" fn(*mut c_void) -> i32,
+        add_tab: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
+        delete_tab: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
+        activate_tab: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
+        set_active_alt: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
+    }
+
+    struct Ctx {
+        list: *mut c_void,
+        vtbl: *const TaskbarListVtbl,
+    }
+
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
+        fn CoCreateInstance(
+            clsid: *const Guid,
+            outer: *mut c_void,
+            clsctx: u32,
+            iid: *const Guid,
+            out: *mut *mut c_void,
+        ) -> i32;
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(
+            cb: unsafe extern "system" fn(*mut c_void, isize) -> i32,
+            lparam: isize,
+        ) -> i32;
+        fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
+        fn GetWindowTextLengthW(hwnd: *mut c_void) -> i32;
+        fn IsWindowVisible(hwnd: *mut c_void) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcessId() -> u32;
+    }
+
+    unsafe extern "system" fn visit(hwnd: *mut c_void, param: isize) -> i32 {
+        // SAFETY: param 是调用方栈上 Ctx 的地址，EnumWindows 同步枚举期间有效。
+        let ctx = unsafe { &*(param as *const Ctx) };
+        let mut pid = 0u32;
+        // SAFETY: 标准 Win32 查询
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        // SAFETY: 无参查询
+        if pid != unsafe { GetCurrentProcessId() } || unsafe { IsWindowVisible(hwnd) } == 0 {
+            return 1;
+        }
+        // 无标题的辅助窗（输入法、托盘 helper）没有任务栏按钮，跳过。
+        // SAFETY: 同上
+        if unsafe { GetWindowTextLengthW(hwnd) } == 0 {
+            return 1;
+        }
+        // SAFETY: list 由 CoCreateInstance 返回且已 HrInit；hwnd 是本进程可见顶层窗。
+        unsafe { ((*ctx.vtbl).delete_tab)(ctx.list, hwnd) };
+        1
+    }
+
+    let mut ctx = Ctx {
+        list: std::ptr::null_mut(),
+        vtbl: std::ptr::null(),
+    };
+    // SAFETY: COM 若已被 Slint/winit 初始化会返回 S_FALSE/RPC_E_CHANGED_MODE——两者都不影响
+    // 继续使用已初始化的 COM 单元；失败返回值故意忽略。
+    unsafe {
+        let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+        if CoCreateInstance(
+            &CLSID_TASKBAR_LIST,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_ITASKBAR_LIST,
+            &mut ctx.list,
+        ) != 0
+            || ctx.list.is_null()
+        {
+            return;
+        }
+        ctx.vtbl = *(ctx.list as *const *const TaskbarListVtbl);
+        ((*ctx.vtbl).hr_init)(ctx.list);
+        EnumWindows(visit, &mut ctx as *mut Ctx as isize);
+        ((*ctx.vtbl).release)(ctx.list);
     }
 }
 
@@ -10149,6 +10280,9 @@ pub fn run_gui() -> Result<()> {
                         }
                     }
                 }
+                // Windows：本进程的窗口不进任务栏（幂等，见 `delete_own_taskbar_buttons`）。
+                #[cfg(target_os = "windows")]
+                delete_own_taskbar_buttons();
                 // #74 历史记录页刷新（仅该页打开时）：会话列表整体替换；选中会话的
                 // 消息流随 tick 重查（新消息进入即上屏，标题条数同步更新）。
                 if let Some(w) = settings_weak.upgrade() {
@@ -10213,6 +10347,11 @@ pub fn run_gui() -> Result<()> {
     // 放在**所有窗口/托盘初始化成功、事件循环即将开始**之后：删除不可逆，若启动中途失败，
     // 旧任务（尤其每 5 分钟自愈）还是唯一的兜底——不能「启动失败 + 兜底已被自己删掉」。
     platform::retire_legacy_bridge_task();
+
+    // Windows：启动窗（气泡/设置）在事件循环里才真正 show、任务栏按钮随之注册；主 tick 是
+    // 2s 一拍，为了不让启动时任务栏闪一下图标，这里提前 300ms 收口一次（之后交给 tick）。
+    #[cfg(target_os = "windows")]
+    slint::Timer::single_shot(Duration::from_millis(300), delete_own_taskbar_buttons);
 
     slint::run_event_loop()?;
     Ok(())
