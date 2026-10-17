@@ -21,6 +21,8 @@ param(
   [switch]$Once,
   [switch]$NoNotify,
   [switch]$NoWake,
+  # 干跑：不推送、不唤醒，也**不写任何状态文件**（否则会把真实监听器该报的事件静默吞掉）。
+  [switch]$DryRun,
   [switch]$ReSeedOwnThreads,
   [int]$MaxItems = 15,
   [int]$WakeCooldownSec = 120,
@@ -44,6 +46,10 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
+# README 的干跑写法是 -NoNotify -NoWake；-DryRun 显式等价，并且都不写状态文件。
+if ($DryRun) { $NoNotify = $true; $NoWake = $true }
+$dryRun = [bool]($DryRun -or ($NoNotify -and $NoWake))
+
 if (-not $Base) { $Base = (Get-Location).Path }
 if (-not $Workspace) { $Workspace = (Split-Path $Base -Parent) }
 if (-not $AbbExe) {
@@ -57,11 +63,13 @@ $LogFile   = Join-Path $Base 'watch.log'
 $EventsLog = Join-Path $Base 'events.jsonl'
 $PidFile   = Join-Path $Base 'watch.pid'
 $StopFile  = Join-Path $Base 'watch.stop'
+$LockFile  = Join-Path $Base 'watch.lock'
 $StateFile = Join-Path $Base 'refs-state.json'
 $OwnFile   = Join-Path $Base 'own-threads.json'
 $PendFile  = Join-Path $Base 'pending-wake.json'
 $WakeLog   = Join-Path $Base 'wakes.jsonl'
 $WakeDoc   = Join-Path $Base 'wake-prompt.md'
+$LastWake  = Join-Path $Base 'last-wake.txt'
 
 # 需要唤醒处理的 entry kind。
 #   - 任何 actor != MyPrincipal 的 **新 issue**：一律唤醒（新工作项，不能只报不办）
@@ -72,6 +80,19 @@ $TriggerKinds = @('issue', 'patch', 'review', 'status')
 function Write-Log([string]$msg) {
   $line = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $msg
   try { Add-Content -Path $LogFile -Value $line -Encoding UTF8 } catch {}
+}
+
+# 状态文件一律 tmp + rename（与仓库其它运行期状态同约定）：半截写入会让 Load-State
+# 解析失败 → 退回「首次基线」→ 停机窗口内的事件被静默跳过。
+function Write-AtomicText([string]$path, [string]$text) {
+  $tmp = $path + '.tmp'
+  try {
+    Set-Content -Path $tmp -Value $text -Encoding UTF8
+    Move-Item -Path $tmp -Destination $path -Force
+  } catch {
+    Write-Log ('atomic write failed: ' + $path + ' : ' + $_.Exception.Message)
+    if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+  }
 }
 
 function Send-Text([string]$text) {
@@ -130,15 +151,23 @@ function Fetch-Refs([string[]]$refs) {
   }
 }
 
-function Decode-Ref([string]$ref) {
-  $txt = & git -C $Mirror cat-file -p $ref 2>$null
-  if (-not $txt) { return $null }
+function Test-Object([string]$oid) {
+  if (-not $oid) { return $false }
+  & git -C $Mirror cat-file -e ($oid + '^{blob}') 2>$null
+  return ($LASTEXITCODE -eq 0)
+}
+
+function Decode-Object([string]$oid) {
+  # 按**远端 oid** 解码，而不是 ref 名：fetch 失败时 ref 还指着旧对象，
+  # 按 ref 名解码会把上一条旧 event 当成本次变更重复上报/重复唤醒。
+  $txt = & git -C $Mirror cat-file -p $oid 2>$null
+  if ($LASTEXITCODE -ne 0 -or -not $txt) { return $null }
   $joined = ($txt | Out-String).Trim()
   try { return ($joined | ConvertFrom-Json) } catch { return $null }
 }
 
 function Save-State($map) {
-  try { ($map | ConvertTo-Json -Compress) | Set-Content -Path $StateFile -Encoding UTF8 } catch {}
+  Write-AtomicText $StateFile ($map | ConvertTo-Json -Compress)
 }
 
 # ---------- own-threads：谁算「我的线程」 ----------
@@ -159,7 +188,7 @@ function Load-OwnThreads {
   $set = New-Object System.Collections.Generic.HashSet[string]
   if ($ReSeedOwnThreads -or -not (Test-Path $OwnFile)) {
     $set = Seed-OwnThreads
-    Save-OwnThreads $set
+    if (-not $dryRun) { Save-OwnThreads $set }
     Write-Log ('own-threads seeded: ' + $set.Count + ' threads')
   } else {
     try {
@@ -171,9 +200,7 @@ function Load-OwnThreads {
 }
 
 function Save-OwnThreads($set) {
-  try {
-    @($set) | Sort-Object | ConvertTo-Json -Compress | Set-Content -Path $OwnFile -Encoding UTF8
-  } catch {}
+  Write-AtomicText $OwnFile (@($set) | Sort-Object | ConvertTo-Json -Compress)
 }
 
 # ---------- pending-wake：攒批 ----------
@@ -187,11 +214,9 @@ function Load-Pending {
 }
 
 function Save-Pending($arr) {
-  try {
-    $n = @($arr).Count
-    if ($n -eq 0) { Set-Content -Path $PendFile -Value '[]' -Encoding UTF8; return }
-    (@($arr) | ConvertTo-Json -Compress) | Set-Content -Path $PendFile -Encoding UTF8
-  } catch {}
+  $n = @($arr).Count
+  if ($n -eq 0) { Write-AtomicText $PendFile '[]'; return }
+  Write-AtomicText $PendFile (@($arr) | ConvertTo-Json -Compress)
 }
 
 function Ensure-WakeDoc {
@@ -227,8 +252,8 @@ function Invoke-Wake([System.Collections.ArrayList]$batch) {
 
   if ($NoWake) { Write-Log ('DRYRUN-WAKE>> ' + $prompt); return $false }
 
-  if (-not $AbbExe -or -not $BotKey) {
-    Write-Log 'wake skipped: AbbExe/BotKey 未配置（用 -AbbExe/-BotKey 或环境变量提供）'
+  if (-not $AbbExe -or -not $BotKey -or -not $ChatId) {
+    Write-Log 'wake skipped: AbbExe/BotKey/ChatId 未配置（用 -AbbExe/-BotKey/-ChatId 或环境变量提供）'
     return $false
   }
   $fire = (Get-Date).AddMinutes(1).ToString('yyyy-MM-dd HH:mm')
@@ -270,15 +295,17 @@ function Format-Events([System.Collections.ArrayList]$events, [int]$ciCount, [in
 function Invoke-PendingFlush {
   $pend = @(Load-Pending)
   if ($pend.Count -eq 0) { return 0 }
-  $last = Get-Content (Join-Path $Base 'last-wake.txt') -ErrorAction SilentlyContinue
+  $last = Get-Content $LastWake -ErrorAction SilentlyContinue
   $ok = $true
   if ($last) {
     try { $ok = (((Get-Date) - [datetime]::Parse($last)).TotalSeconds -ge $WakeCooldownSec) } catch { $ok = $true }
   }
   if (-not $ok) { Write-Log ('wake deferred: pending=' + $pend.Count + ' (cooldown ' + $WakeCooldownSec + 's)'); return 0 }
   if (Invoke-Wake $pend) {
-    Set-Content -Path (Join-Path $Base 'last-wake.txt') -Value ((Get-Date).ToString('o')) -Encoding UTF8
-    Save-Pending @()
+    if (-not $dryRun) {
+      Write-AtomicText $LastWake ((Get-Date).ToString('o'))
+      Save-Pending @()
+    }
     Write-Log ('wake flushed: ' + $pend.Count + ' 条')
     return $pend.Count
   }
@@ -286,7 +313,19 @@ function Invoke-PendingFlush {
 }
 # ---------- main ----------
 New-Item -ItemType Directory -Force -Path $Base | Out-Null
-Set-Content -Path $PidFile -Value $PID -Encoding ASCII
+
+# 常驻模式单实例：独占锁文件；进程退出（含崩溃）时由 OS 释放。避免两个监听器
+# 同时冲刷 pending-wake 造重复 job，或互相覆盖状态文件。干跑/单趟不持锁。
+if (-not $Once -and -not $dryRun) {
+  try {
+    $script:WatchLock = [System.IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None')
+  } catch {
+    Write-Log 'another watcher is running (watch.lock is busy) -> exit'
+    exit 0
+  }
+}
+
+if (-not $dryRun) { Write-AtomicText $PidFile ([string]$PID) }
 
 $prev       = Load-State
 $first      = ($null -eq $prev)
@@ -294,6 +333,7 @@ $own        = Load-OwnThreads
 $wokeSum    = 0
 
 Write-Log ('watcher start pid=' + $PID + ' interval=' + $IntervalSec + 's once=' + [bool]$Once +
+           ' dry=' + $dryRun +
            ' state=' + $(if ($first) { '无(首次基线)' } else { $prev.Count.ToString() + ' refs(增量续跑)' }) +
            ' own=' + $own.Count + ' trigger=' + ($TriggerKinds -join ',') + ' cooldown=' + $WakeCooldownSec + 's')
 
@@ -303,49 +343,77 @@ while ($true) {
     $remoteMap = Get-RemoteMap
     $local  = Get-LocalMap
 
+    if ($remoteMap.Count -eq 0 -and $prev -and $prev.Count -gt 0) {
+      # ls-remote 成功但返回空：多半是远端配置/服务异常。不能当成「全部删除」清空基线，
+      # 否则下一次全量 refs 会被当成基线，停机期间的事件永久丢失。
+      throw ('remote returned 0 refs while state has ' + $prev.Count + '; refusing to treat as mass deletion')
+    }
+
+    # 变更判定对齐「上次已处理的状态」，而不是本地镜像：若进程在 fetch 之后、
+    # Save-State 之前崩溃，本地镜像已经追上远端；拿本地镜像比对会把这段事件永久漏掉。
     $changed = New-Object System.Collections.ArrayList
     foreach ($k in $remoteMap.Keys) {
-      if (-not $local.ContainsKey($k) -or $local[$k] -ne $remoteMap[$k]) { [void]$changed.Add($k) }
+      if (-not $prev -or -not $prev.ContainsKey($k) -or $prev[$k] -ne $remoteMap[$k]) { [void]$changed.Add($k) }
     }
     $deleted = New-Object System.Collections.ArrayList
     if ($prev) { foreach ($k in $prev.Keys) { if (-not $remoteMap.ContainsKey($k)) { [void]$deleted.Add($k) } } }
 
+    # 本地缺对象/落后的 ref 需要 fetch（与「是否变更」无关：上次 fetch 失败、镜像被清理都会这样）。
+    $stale = New-Object System.Collections.ArrayList
+    foreach ($k in $remoteMap.Keys) {
+      if (-not $local.ContainsKey($k) -or $local[$k] -ne $remoteMap[$k]) { [void]$stale.Add($k) }
+    }
+
     if ($first) {
-      Write-Log ('baseline: remote=' + $remoteMap.Count + ' local=' + $local.Count + ' pending=' + $changed.Count)
-      Fetch-Refs $changed
-      Save-State $remoteMap
+      Write-Log ('baseline: remote=' + $remoteMap.Count + ' local=' + $local.Count + ' fetch=' + $stale.Count)
+      Fetch-Refs $stale
+      if (-not $dryRun) { Save-State $remoteMap }
       $prev = $remoteMap
       $first = $false
     }
     elseif ($changed.Count -gt 0 -or $deleted.Count -gt 0) {
-      Write-Log ('changed refs: ' + $changed.Count + '  deleted refs: ' + $deleted.Count)
-      Fetch-Refs $changed
+      Write-Log ('changed refs: ' + $changed.Count + '  deleted refs: ' + $deleted.Count + '  stale: ' + $stale.Count)
+      Fetch-Refs $stale
 
       $events  = New-Object System.Collections.ArrayList
       $ciCount = 0
       $ownChanged = $false
-      $cands = New-Object System.Collections.ArrayList   # 命中唤醒规则的事件
+      $cands = New-Object System.Collections.ArrayList       # 命中唤醒规则的事件
+      $unresolved = New-Object System.Collections.ArrayList  # fetch 后本地仍缺对象的 ref
 
+      # 第一遍：只解码 + 补齐 own-threads。必须先全量补齐再判唤醒，否则同一批里
+      # 「别人的 review」可能先于「我的 patch」被处理（ref 顺序不定），导致漏唤醒。
+      $decoded = @{}
+      foreach ($r in $changed) {
+        if ($r -like 'refs/collab/ci-artifacts/*') { continue }
+        $oid = [string]$remoteMap[$r]
+        if (-not (Test-Object $oid)) { [void]$unresolved.Add($r); continue }
+        $o = Decode-Object $oid
+        $decoded[$r] = $o
+        if ($o -and $o.actor -eq $MyPrincipal -and $o.id -and -not $own.Contains([string]$o.id)) {
+          [void]$own.Add([string]$o.id); $ownChanged = $true
+        }
+      }
+
+      # 第二遍：生成事件 + 唤醒候选
       foreach ($r in $changed) {
         if ($r -like 'refs/collab/ci-artifacts/*') { $ciCount++; continue }
-        $o = Decode-Ref $r
+        if ($unresolved.Contains($r)) { Write-Log ('resolve failed (fetch): ' + $r + ' -> retry next pass'); continue }
+        $oid = [string]$remoteMap[$r]
+        $o = $decoded[$r]
         if ($o -and $o.kind) {
           [void]$events.Add(@{ line = '' + $o.kind + '  ' + $o.id + '  <- ' + $o.actor })
-          # 我参与过的线程 → 纳入 own-threads
-          if ($o.actor -eq $MyPrincipal -and $o.id -and -not $own.Contains([string]$o.id)) {
-            [void]$own.Add([string]$o.id); $ownChanged = $true
-          }
-          # 唤醒规则
+          # 唤醒规则（own-threads 已在第一遍补齐）
           $k = [string]$o.kind
           $isOwn = ($o.id -and $own.Contains([string]$o.id))
           $isNewIssue = ($k -eq 'issue')
           if ($o.actor -ne $MyPrincipal -and $o.id -and ($isNewIssue -or ($TriggerKinds -contains $k -and $isOwn))) {
-            [void]$cands.Add(@{ kind = $k; id = [string]$o.id; actor = [string]$o.actor; ref = $r; oid = $remoteMap[$r]; own = [bool]$isOwn })
+            [void]$cands.Add(@{ kind = $k; id = [string]$o.id; actor = [string]$o.actor; ref = $r; oid = $oid; own = [bool]$isOwn })
           }
         } else {
           [void]$events.Add(@{ line = ($r -replace '^refs/collab/', '') })
         }
-        $rec = [ordered]@{ ts = (Get-Date).ToString('o'); ref = $r; oid = $remoteMap[$r]; kind = $o.kind; id = $o.id; actor = $o.actor }
+        $rec = [ordered]@{ ts = (Get-Date).ToString('o'); ref = $r; oid = $oid; kind = $o.kind; id = $o.id; actor = $o.actor }
         try { Add-Content -Path $EventsLog -Value ($rec | ConvertTo-Json -Compress) -Encoding UTF8 } catch {}
       }
       foreach ($r in $deleted) {
@@ -353,13 +421,13 @@ while ($true) {
         $rec = [ordered]@{ ts = (Get-Date).ToString('o'); ref = $r; oid = $null; kind = 'deleted'; id = $null; actor = $null }
         try { Add-Content -Path $EventsLog -Value ($rec | ConvertTo-Json -Compress) -Encoding UTF8 } catch {}
       }
-      if ($ownChanged) { Save-OwnThreads $own }
+      if ($ownChanged -and -not $dryRun) { Save-OwnThreads $own }
 
       # ---- 攒批 + 唤醒 ----
       if ($cands.Count -gt 0) {
         $pend = @(Load-Pending)
         foreach ($c in $cands) { $pend += $c }
-        Save-Pending $pend
+        if (-not $dryRun) { Save-Pending $pend }
         Write-Log ('wake candidates +' + $cands.Count + ' -> pending ' + $pend.Count)
       }
       $wokeN = Invoke-PendingFlush
@@ -367,8 +435,19 @@ while ($true) {
 
       $msg = Format-Events $events $ciCount $deleted.Count $wokeN
       if ($msg) { Send-Text $msg }
-      Save-State $remoteMap
-      $prev = $remoteMap
+
+      if ($dryRun) {
+        # 干跑只在内存里推进，不碰磁盘状态（否则真实监听器会以为这些事件已处理）。
+        $prev = $remoteMap
+      } else {
+        # 未解决（fetch 失败）的 ref 不回写进状态：下一轮继续重试，而不是被当成已处理永久丢掉。
+        foreach ($u in $unresolved) {
+          if ($prev -and $prev.ContainsKey($u)) { $remoteMap[$u] = $prev[$u] }
+          else { [void]$remoteMap.Remove($u) }
+        }
+        Save-State $remoteMap
+        $prev = $remoteMap
+      }
     }
     # 本轮没有新变更时，pending 仍需按冷却期冲刷（否则会一直攒着）
     $idle = Invoke-PendingFlush

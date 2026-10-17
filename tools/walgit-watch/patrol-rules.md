@@ -48,7 +48,8 @@
 **一律不自动做**，只输出：「<线程> 已 approve，但需重基（非快进），需 owner 决定」。
 
 ### 1.2 `[需退回]` —— 被 review 打回
-动作：记一条 `status` = `in-progress`（`abb-win` 签），body 里列清 needs-changes 的问题点；
+动作：记一条 `status` = `in-progress`（`abb-win` 签），body 里列清 request_changes 的问题点
+（历史条目里也见过 `needs-changes` 这种写法；`patrol.py` 两种都认）；
 输出 1–3 行。
 
 ## 2. 只报（不动作）
@@ -69,10 +70,11 @@
 
 ## 4. 当前已知项（做过一次判定，记录在此避免反复）
 
-- `abb-walgit-event-watch-20260921`（自家线程，已 approve，patrol 每轮会报 `[需收口]`）：
-  其分支内容是把**旧的 watch.ps1 那套**随仓引入（`tools/walgit-watch/`），
-  而本机已改用 `walgit-watch\patrol.py`，且该分支已落后 main 多个提交（非快进），**不要合并**。
-  每轮只输出一行：「`abb-walgit-event-watch-20260921` 已 approve，但内容已被 patrol.py 取代且非快进，待 owner 决定作废 / 改写重提」。
+- `abb-walgit-event-watch-20260921`（自家线程）：该分支**已经随 main 合入**（merge `12c9990`，
+  `5e59964` 是祖先；仓库里的 `tools/walgit-watch/watch.ps1` 就是它的内容），
+  不再是「非快进 / 待作废」状态。若线程仍停在 `needs-review`：按 §1.1 正常收口
+  （`merge_result` 指向 main 上的合并点 + `status: closed`），不要继续每轮报「不要合并」——
+  那是合并前的旧判定。
 
 ## 5. 协同办（派单制）——「待派单」段落怎么处理
 
@@ -87,10 +89,21 @@
 | `[待派单·认领] <线程> 自家 open issue` | 自家名下、无人推进的存量 issue | 派**认领+实施**子代理（身份 `abb-win`）|
 
 ### 5.1 判重（先做，防每 10 分钟重复派单）
-派单前先跑：
+派单前先跑 `task list`。注意 `task list` **没有 `--bot`**，多 bot 环境下必须用目标 shell 的语法真正设置环境变量：
+```powershell
+# PowerShell
+$env:AGENT_BRIDGE_BOT_KEY='cli_a8a27ff268b8900e'; & 'C:\Users\gxh\AppData\Local\Programs\ABB\agent-bridge.exe' task list
 ```
+```bash
+# bash（Claude Code 的 Bash 工具）
+AGENT_BRIDGE_BOT_KEY=cli_a8a27ff268b8900e C:/Users/gxh/AppData/Local/Programs/ABB/agent-bridge.exe task list
+```
+```bat
+REM cmd.exe
 set AGENT_BRIDGE_BOT_KEY=cli_a8a27ff268b8900e && C:\Users\gxh\AppData\Local\Programs\ABB\agent-bridge.exe task list
 ```
+> `set VAR=...` 只在 cmd.exe 里设置环境变量；在 PowerShell/bash 里它不会导出，`task list`
+> 会因「有多个 bot 但未指定目标」直接失败——判重失败就会每 10 分钟重复派单。
 若已有任务的**名字**包含该线程 slug（见下）且运行态为 `Running`/`Pending`，**跳过，不重复派**。
 
 线程 slug 取法：线程 id 里去掉 `-20260922` 这类日期尾巴前 40 字符即可（例：
@@ -98,17 +111,19 @@ set AGENT_BRIDGE_BOT_KEY=cli_a8a27ff268b8900e && C:\Users\gxh\AppData\Local\Prog
 **任务名一律 `patrol-task-<slug>`**，靠这个名字判重。
 
 ### 5.2 派单命令
-```
-set AGENT_BRIDGE_BOT_KEY=cli_a8a27ff268b8900e && C:\Users\gxh\AppData\Local\Programs\ABB\agent-bridge.exe task add ^
+`--bot` 已显式指定目标 bot，不需要再设 `AGENT_BRIDGE_BOT_KEY`（下面是 cmd 示例，`^` 是续行）：
+```bat
+C:\Users\gxh\AppData\Local\Programs\ABB\agent-bridge.exe task add ^
   --prompt "<见 5.3 模板>" --bot cli_a8a27ff268b8900e --name patrol-task-<slug> ^
   --cwd C:\Users\gxh\.agent-bridge\workspaces\cli_a8a27ff268b8900e ^
   --timeout-secs 2400 --max-restarts 1 --to oc_1f097b843c4d12b3bc8b91205cfe4dd8
 ```
-（中文 prompt 很长，**用 python 写文件再读入传参**，别在 cmd 里手拼引号。）
+（中文 prompt 很长，**用 python 写文件再读入传参**，别在 shell 里手拼引号；PowerShell 里用
+`& 'C:\Users\gxh\AppData\Local\Programs\ABB\agent-bridge.exe' task add --prompt ...`。）
 
 ### 5.3 子代理 prompt 模板
 **评审单**：核对最新 head 对 main 的 diff 与 patch 自述是否一致；在被派线程上以 `abb-reviewer-12`
-签一条 `review`（`decision=approve|needs-changes`，`--parent` 取当前 head oid）推回 origin；
+签一条 `review`（`decision=approve|request_changes`；历史数据也用过 `needs-changes`，两种写法 walgit 都接受；`--parent` 取当前 head oid）推回 origin；
 **不合并、不改码、不关线程**；门禁跑不了就如实声明。结果 ≤10 行。
 
 **认领单**：先核对 main 现状——若该 issue 已被别人实现/已过时，签 `comment`（附证据）+

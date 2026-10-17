@@ -20,7 +20,7 @@
 | `start-watch.ps1` | 便捷启动（后台隐藏窗口）。只负责起进程，立刻返回。 |
 | `wake-prompt.template.md` | 唤醒回合读到的工作指引模板。首次运行时复制成状态目录里的 `wake-prompt.md`；**已存在则不覆盖**。 |
 
-运行期状态文件（不进版本库）：`watch.pid`、`watch.stop`、`refs-state.json`、
+运行期状态文件（不进版本库）：`watch.pid`、`watch.lock`、`watch.stop`、`refs-state.json`、
 `own-threads.json`、`pending-wake.json`、`wakes.jsonl`、`events.jsonl`、`watch.log`、`last-wake.txt`。
 
 ## 用法
@@ -30,12 +30,16 @@
 pwsh -File tools/walgit-watch/start-watch.ps1 -IntervalSec 20 `
      -NotifierBot cli_xxxx -NotifierChat oc_xxxx
 
-# 单趟干跑（不推送、不唤醒），用于验证规则与解析
-pwsh -File tools/walgit-watch/watch.ps1 -Once -NoNotify -NoWake
+# 单趟干跑（不推送、不唤醒、**不写任何状态文件**），用于验证规则与解析
+pwsh -File tools/walgit-watch/watch.ps1 -Once -DryRun
 
 # 停止：在状态目录放一个 watch.stop（只影响监听进程，不碰 ABB 服务）
 New-Item -ItemType File "$env:LOCALAPPDATA\abb-walgit-watch\watch.stop"
 ```
+
+> 干跑不要用「不带 -DryRun 的 -Once」：那会正常推进 `refs-state.json` / `pending-wake.json`，
+> 真实监听器之后会把这些事件当成已处理。`-NoNotify -NoWake` 同时给等价于 `-DryRun`。
+> 常驻模式用 `watch.lock` 保证单实例；`start-watch.ps1` 发现锁被占用会直接报错，不会再起第二个。
 
 ### 前置
 

@@ -23,13 +23,29 @@ $Watch = Join-Path $PSScriptRoot 'watch.ps1'
 if (-not (Test-Path $Watch)) { throw "找不到 $Watch" }
 New-Item -ItemType Directory -Force -Path $Base | Out-Null
 
+# 已在常驻的监听器会独占 watch.lock（watch.ps1 用 FileShare.None 持有）。
+# 起第二个进程只会立刻退出，还会误清 watch.stop —— 这里提前拦住并说清楚。
+try {
+  $probe = [System.IO.File]::Open((Join-Path $Base 'watch.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+  $probe.Dispose()
+} catch {
+  throw "已有监听器在运行（$Base\watch.lock 被占用）。先停止它，或用 -Base 指定别的状态目录。"
+}
+
 # 先清掉停止标记，否则新进程会立刻退出。
 Remove-Item (Join-Path $Base 'watch.stop') -Force -ErrorAction SilentlyContinue
 
-$psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Watch, '-IntervalSec', "$IntervalSec",
-            '-Base', $Base, '-Remote', $MirrorRemote)
-if ($NotifierBot)  { $psArgs += @('-BotKey', $NotifierBot) }
-if ($NotifierChat) { $psArgs += @('-ChatId', $NotifierChat) }
+# Start-Process 的 -ArgumentList 是按空格拼接的：含空格的路径必须自己加引号，
+# 否则 -File / -Base 会被拆开，隐藏窗口里的子进程直接起不来。
+function Quote-Arg([string]$s) {
+  if ($s -match '[\s"]') { return '"' + ($s -replace '"', '\"') + '"' }
+  return $s
+}
+
+$psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Quote-Arg $Watch), '-IntervalSec', "$IntervalSec",
+            '-Base', (Quote-Arg $Base), '-Remote', (Quote-Arg $MirrorRemote))
+if ($NotifierBot)  { $psArgs += @('-BotKey', (Quote-Arg $NotifierBot)) }
+if ($NotifierChat) { $psArgs += @('-ChatId', (Quote-Arg $NotifierChat)) }
 
 $ps = Start-Process -FilePath 'powershell.exe' -ArgumentList $psArgs -WindowStyle Hidden -PassThru
 Set-Content -Path (Join-Path $Base 'launcher.pid') -Value $ps.Id -Encoding ASCII

@@ -43,3 +43,19 @@ tools-dist/
 # Python 生成物（探针/夹具；2026-10-12 误提交过一次，见卡 abb-mcp-orchestrator-p0-20261012 R2）
 __pycache__/
 *.pyc
+
+# tools/walgit-watch 的运行期状态与镜像。仓库里这份只是被复制到工作区的源；
+# 就地跑脚本产生的状态（含 300KB+ 的 refs 快照）不能入库。
+/tools/walgit-watch/abb-mirror.git/
+/tools/walgit-watch/patrol-refs.json
+/tools/walgit-watch/own-threads.json
+/tools/walgit-watch/refs-state.json
+/tools/walgit-watch/pending-wake.json
+/tools/walgit-watch/wakes.jsonl
+/tools/walgit-watch/events.jsonl
+/tools/walgit-watch/last-wake.txt
+/tools/walgit-watch/watch.pid
+/tools/walgit-watch/watch.lock
+/tools/walgit-watch/watch.stop
+/tools/walgit-watch/launcher.pid
+/tools/walgit-watch/wake-prompt.md

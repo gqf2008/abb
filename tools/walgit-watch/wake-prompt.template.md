@@ -5,7 +5,7 @@
 
 ## 环境
 
-- walgit CLI：`walgit.exe`（Windows 常见位置 `%USERPROFILE%\walgit\walgit.exe`）
+- walgit CLI：`walgit.exe`（本机实测 `%LOCALAPPDATA%\Programs\walgit\walgit.exe`；先跑 `walgit --version`，PATH 里有就直接用）
 - 配置：`%USERPROFILE%\.walgit\walgit.toml`
 - 本 bot 检出：`<工作区>\abb`，origin 指向本机 walgit 服务（`127.0.0.1:8081`）
 - 远端镜像（含全量 refs）：`<状态目录>\abb-mirror.git`
@@ -24,7 +24,7 @@
 
 - `review=approve` 的自家线程：可自行集成收口（`merge_result` ×2 + `status: closed`），
   但**收口前先查重**——已有非本人签的 `merge_result` / `closed` 就让位。
-- `review=needs-changes`：退回 `status: in-progress`，列清问题，**不要替 worker 改代码**。
+- `review=request_changes`（历史数据里也写成 `needs-changes`）：退回 `status: in-progress`，列清问题，**不要替 worker 改代码**。
 - 跨线程的不可逆动作（删线程 / 删 ref / 关 issue / 动别的仓库）：先做一句话报备。
 - 不用别人的 key 代签；不抢 worker 的活。
 - 回复保持简短：一行状态 + 必要结论，不刷屏。
