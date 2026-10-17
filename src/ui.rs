@@ -777,6 +777,16 @@ fn bubble_visible(enabled: bool, dialog_visible: bool) -> bool {
     enabled && !dialog_visible
 }
 
+/// 对话框是否**挡住了气泡**：可见**且未最小化**。
+///
+/// 为什么要单列最小化（owner 2026-10-17：「最小化后要显示气泡」）：Win32 的
+/// `IsWindowVisible` 对最小化窗口仍返回 true，而最小化后用户看不见对话框——若还按
+/// 「可见」算，气泡会一直藏着，除托盘外没有入口（实测：设置窗与对话窗同时开着、
+/// 对话窗被最小化时就会这样；失焦隐藏路径只在 `app_is_active=false` 时才收窗）。
+fn dialog_blocks_bubble(visible: bool, minimized: bool) -> bool {
+    visible && !minimized
+}
+
 /// 系统对话窗的**当前逻辑宽度**（标题栏计划要用）；窗口还没 realize（`size()` 为 0）时返回 0，
 /// 调用方回落到 `syschat::SYSCHAT_PREFERRED_WIDTH`。
 ///
@@ -6302,7 +6312,9 @@ pub fn run_gui() -> Result<()> {
                 // 互斥——开窗时藏气泡、失焦/关窗后回来；托盘开关仍管「要不要气泡」）。
                 let dialog_visible = dw
                     .upgrade()
-                    .map(|w| w.window().is_visible())
+                    .map(|w| {
+                        dialog_blocks_bubble(w.window().is_visible(), w.window().is_minimized())
+                    })
                     .unwrap_or(false);
                 if let Some(b) = bw.upgrade() {
                     refresh_bubble_visibility(&b, dialog_visible);
@@ -9725,6 +9737,8 @@ pub fn run_gui() -> Result<()> {
         // 「⏹ 停止朗读」复位成「🔊 朗读」（不靠用户再点一次才恢复）。
         let speaker_t = sc_speaker.clone();
         let syschat_weak_tts = syschat_win.as_weak();
+        // 对话框「挡住气泡」的上一次状态（可见 && 未最小化）；tick 里只在变化时重算气泡显隐。
+        let bubble_dlg_open_t = Rc::new(Cell::new(None::<bool>));
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(2),
@@ -10283,6 +10297,18 @@ pub fn run_gui() -> Result<()> {
                 // Windows：本进程的窗口不进任务栏（幂等，见 `delete_own_taskbar_buttons`）。
                 #[cfg(target_os = "windows")]
                 delete_own_taskbar_buttons();
+                // 对话框被最小化/还原：气泡要跟着回来/让位（见 `dialog_blocks_bubble`）。
+                // 只在**状态变化**时重算，避免每拍都读 config、重复 show/hide。
+                if let Some(w) = syschat_weak_tts.upgrade() {
+                    let now_open =
+                        dialog_blocks_bubble(w.window().is_visible(), w.window().is_minimized());
+                    if bubble_dlg_open_t.get() != Some(now_open) {
+                        bubble_dlg_open_t.set(Some(now_open));
+                        if let Some(b) = bubble_weak.upgrade() {
+                            refresh_bubble_visibility(&b, now_open);
+                        }
+                    }
+                }
                 // #74 历史记录页刷新（仅该页打开时）：会话列表整体替换；选中会话的
                 // 消息流随 tick 重查（新消息进入即上屏，标题条数同步更新）。
                 if let Some(w) = settings_weak.upgrade() {
@@ -10726,6 +10752,21 @@ mod tests {
                 && prod.contains("refresh_bubble_visibility(&bubble, false)"),
             "开窗藏气泡（true）、关窗/失焦/启动显气泡（false）三条调用点必须都在"
         );
+    }
+
+    /// 最小化的对话框不再挡气泡（owner 2026-10-17：「最小化后要显示气泡」）。
+    ///
+    /// 判别力：把实现退回 `visible`（不含 `!minimized`）⇒ 第二条断言红——那正是
+    /// 「IsWindowVisible 对最小化窗仍为 true、气泡一直被藏」的现场。
+    #[test]
+    fn minimized_dialog_does_not_block_bubble() {
+        assert!(dialog_blocks_bubble(true, false), "开着且未最小化 ⇒ 挡气泡");
+        assert!(
+            !dialog_blocks_bubble(true, true),
+            "最小化后用户看不见窗口 ⇒ 不挡气泡"
+        );
+        assert!(!dialog_blocks_bubble(false, false), "关着 ⇒ 不挡气泡");
+        assert!(!dialog_blocks_bubble(false, true), "关着就是关着");
     }
 
     /// D5 失焦隐藏的判据（行为侧）：**只有「窗口可见 + 焦点离开整个进程」才隐藏**。
