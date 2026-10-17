@@ -2228,40 +2228,91 @@ fn migrate_legacy_state_at(
     crate::log!("[migrate] 旧单 bot 数据已并入 workspaces/{new_key}/（幂等）");
 }
 
-/// 一次性退役：删除**旧的高权限常驻计划任务**（2026-10-04 新模型不再需要它）。
+/// 一次性退役：删除历史遗留的计划任务（存量清理）。
 ///
-/// 为什么必须做：旧任务以 `RunLevel=HighestAvailable` 运行 ⇒ 它拉起的是**高完整性** service，
-/// 而新模型的 service 是托盘的普通用户子进程。两者抢同一个 `service` 单实例锁 ⇒ 谁先拿到谁跑，
-/// 表现为「有时是提权实例、有时不是」的随机状态（也会让「全部以普通用户运行」这条承诺失真）。
-/// 删掉任务后语义唯一：**服务只由托盘以普通用户身份看守**。
+/// - `ABB-Bridge`：旧的高权限常驻任务（2026-10-04 新模型不再需要）。它以
+///   `RunLevel=HighestAvailable` 运行 ⇒ 拉起的是**高完整性** service，而新模型的 service 是
+///   托盘的普通用户子进程。两者抢同一个 `service` 单实例锁 ⇒ 谁先拿到谁跑，表现为「有时是
+///   提权实例、有时不是」的随机状态（也会让「全部以普通用户运行」这条承诺失真）。
+///   删掉后语义唯一：**服务只由托盘以普通用户身份看守**。
+/// - `ABB-EnsureRunning`：已删除的外部自愈任务（2026-10-11），连同其 `logs/ensure-tray.cmd`
+///   脚本一起清理；理由见函数体内的注释。
 ///
 /// 权限：任务属当前用户（RunLevel 只影响启动后的完整性），`/delete` 不需要提权。
 /// best-effort：绝大多数机器本来就没有旧任务，静默返回；只在「确实存在但删不掉」时响亮留痕。
 #[cfg(target_os = "windows")]
 pub fn retire_legacy_bridge_task() {
     // 名字写字面量：新模型下已没有任务定义模块（`src/svc_task.rs` 已删），而**退役旧任务**
-    // 恰恰需要这个历史名字 —— 它是这段迁移代码唯一的用途，故就地固定。
-    let name = "ABB-Bridge";
-    let exists = crate::spawn::command("schtasks")
+    // 恰恰需要这些历史名字 —— 它们是这段迁移代码仅有的用途，故就地固定。
+    retire_task("ABB-Bridge");
+    // 2026-10-11：外部脚本自愈一并退役。曾经的「每 5 分钟托盘自愈」用
+    // `schtasks` + `logs/ensure-tray.cmd` 实现，问题有二：① 自愈本应内部承担，不该由外部脚本/计划任务
+    // 实现；② 默认终端是 Windows Terminal 时，任务拉起 `cmd /c …cmd` 会每 5 分钟闪一次控制台窗口。
+    // 已删除注册路径（`ensure_running_task`/`ensure_tray_cmd`），此处只做存量清理。
+    if retire_task("ABB-EnsureRunning") {
+        // 只有**本次确实删掉了任务**才删脚本：查询失败/删不掉时保留脚本，否则残留任务会每
+        // 5 分钟执行一个不存在的文件（弹错误窗），比留着脚本更糟。
+        let script = crate::bridge_dir().join("logs").join("ensure-tray.cmd");
+        if script.is_file() {
+            match std::fs::remove_file(&script) {
+                Ok(()) => crate::log!("[migrate] 已删除旧自愈脚本 {}", script.display()),
+                Err(e) => crate::log!("[migrate] 删除旧自愈脚本失败（跳过）：{e:#}"),
+            }
+        }
+    }
+}
+
+/// 按名查询历史计划任务是否存在；`Err` = `schtasks` 本身执行失败（不能当成「不存在」）。
+#[cfg(target_os = "windows")]
+fn task_exists(name: &str) -> std::io::Result<bool> {
+    Ok(crate::spawn::command("schtasks")
         .args(["/query", "/tn", name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !exists {
-        return;
+        .output()?
+        .status
+        .success())
+}
+
+/// 按名 best-effort 删除一个历史计划任务（当前用户级，`/delete` 不需要提权）。
+///
+/// 不存在则静默返回；只在「确实存在但删不掉」时响亮留痕。
+/// 返回**本次调用是否成功删除了任务**——只有确定删掉了，调用方才能安全清理配套的脚本残留。
+/// 注意：`/query` 返回非零既可能是「不存在」也可能是「没权限查」（schtasks 没有可区分的
+/// 稳定错误码），所以不能据此断言任务已消失，更不能据此删脚本。
+#[cfg(target_os = "windows")]
+fn retire_task(name: &str) -> bool {
+    match task_exists(name) {
+        Ok(false) => return false, // 不存在或查不到：不冒险动配套文件
+        Ok(true) => {}
+        Err(e) => {
+            crate::log!("[migrate] schtasks 执行失败（跳过 {name} 退役）：{e:#}");
+            return false;
+        }
     }
     match crate::spawn::command("schtasks")
         .args(["/delete", "/tn", name, "/f"])
         .output()
     {
-        Ok(o) if o.status.success() => crate::log!(
-            "[migrate] 已退役旧常驻计划任务 {name}（新模型：服务由托盘以普通用户身份看守）"
-        ),
-        Ok(o) => crate::log!(
-            "[migrate] ⚠️ 删除旧常驻计划任务失败（它可能仍会拉起高完整性实例）：{}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        ),
-        Err(e) => crate::log!("[migrate] schtasks 执行失败（跳过旧任务退役）：{e:#}"),
+        Ok(o) if o.status.success() => {
+            crate::log!("[migrate] 已退役旧计划任务 {name}");
+            true
+        }
+        Ok(o) => {
+            // GUI 与服务启动时都会做同一份存量清理：另一进程可能刚好先删掉了。
+            // 重查一次——任务确实没了就不再误报 ⚠️（脚本由删成功的那一方清理）。
+            if matches!(task_exists(name), Ok(false)) {
+                crate::log!("[migrate] 旧计划任务 {name} 已由其他实例退役");
+                return false;
+            }
+            crate::log!(
+                "[migrate] ⚠️ 删除旧计划任务 {name} 失败：{}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            crate::log!("[migrate] schtasks 执行失败（跳过 {name} 退役）：{e:#}");
+            false
+        }
     }
 }
 
@@ -3251,89 +3302,34 @@ mod legacy_uninstall_guard_tests {
     }
 }
 
-/// 自愈脚本内容：每 5 分钟由计划任务调用；没有托盘就拉起（判活排除 `--service`：常驻服务不是托盘）。
-///
-/// 为什么需要它：2026-10-05 实测安装器 `[Run]` 拉起的实例**连 main() 都没到**（boot.log 无记录），
-/// 升级时那个一次性 .cmd 也可能静默放弃 ⇒ 必须有常驻自愈兜底，最坏 5 分钟内把托盘拉回来。
-#[cfg(target_os = "windows")] // 只被 ensure_running_task（Windows）调用
-pub fn ensure_tray_cmd(exe: &std::path::Path, log: &std::path::Path) -> String {
-    let lines: [&str; 12] = [
-        "@echo off",
-        "rem ABB 自愈：没有托盘就拉起（每 5 分钟一次）。判活必须排除 --service，",
-        "rem 否则会把常驻服务误判成托盘（2026-10-05 实测：装完 23 分钟无人接手）。",
-        "setlocal enabledelayedexpansion",
-        "set \"EXE=__EXE__\"",
-        "set \"LOG=__LOG__\"",
-        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$t=@(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'agent-bridge.exe' -and $_.CommandLine -notmatch '--service' }); if ($t.Count -gt 0) { 'TRAY' } else { 'NONE' }\" > \"%TEMP%\\abb-ensureprobe.txt\" 2>nul",
-        "set /p PROBE=<\"%TEMP%\\abb-ensureprobe.txt\"",
-        "if /I \"!PROBE!\"==\"TRAY\" exit /b 0",
-        ">>\"%LOG%\" echo [%DATE% %TIME%] [ensure] 未检测到托盘 ⇒ 自愈拉起",
-        "start \"\" \"%EXE%\"",
-        "exit /b 0",
-    ];
-    lines
-        .join("\r\n")
-        .replace("__EXE__", &exe.display().to_string())
-        .replace("__LOG__", &log.display().to_string())
-        + "\r\n"
-}
-
-/// 写自愈脚本并注册/刷新计划任务（当前用户、每 5 分钟、低权限、无需管理员）。失败只记日志。
-#[cfg(target_os = "windows")]
-pub fn ensure_running_task() {
-    let logs = crate::bridge_dir().join("logs");
-    let _ = std::fs::create_dir_all(&logs);
-    // 注意：名字不能用 ensure-running.cmd —— 本机该路径已存在且是个目录（实测写入 EISDIR）。
-    let script = logs.join("ensure-tray.cmd");
-    let log = logs.join("update.log");
-    let exe =
-        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("agent-bridge.exe"));
-    if let Err(e) = std::fs::write(&script, ensure_tray_cmd(&exe, &log)) {
-        crate::log!("[ensure] 写自愈脚本失败（跳过注册）：{e:#}");
-        return;
-    }
-    let action = format!("cmd /c \"{}\"", script.display());
-    match crate::spawn::command("schtasks")
-        .args([
-            "/create",
-            "/tn",
-            "ABB-EnsureRunning",
-            "/tr",
-            &action,
-            "/sc",
-            "minute",
-            "/mo",
-            "5",
-            "/f",
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => crate::log!(
-            "[ensure] 注册自愈任务失败（不影响运行）：{}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        ),
-        Err(e) => crate::log!("[ensure] schtasks 执行失败（跳过自愈任务）：{e:#}"),
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn ensure_running_task() {}
-
 #[cfg(test)]
-mod ensure_tray_guard_tests {
-    /// 自愈脚本必须精确判活（排除 `--service`）且未在跑就拉起并留痕。
+mod legacy_task_guard_tests {
+    /// 旧外部自愈任务的**存量清理**必须保留，且两个启动路径都要调用退役函数。
     ///
-    /// 判别力：把 `--service` 排除去掉 ⇒ 第一条断言红（2026-10-05 实测事故就是这个）。
+    /// 判别力：删掉 `retire_task("ABB-EnsureRunning")`、旧脚本清理，或把 `main.rs`/`ui.rs`
+    /// 里的 `retire_legacy_bridge_task()` 调用移走 ⇒ 对应断言红。这类 Windows-only 迁移
+    /// 无法在非 Windows 主机上行为测试，只能钉源码接线（同 `legacy_files_guard_tests`）。
     #[test]
-    #[cfg(target_os = "windows")] // 同上
-    fn ensure_tray_cmd_is_precise_and_self_healing() {
-        let s = crate::platform::ensure_tray_cmd(
-            std::path::Path::new(r"C:\Program Files\ABB\agent-bridge.exe"),
-            std::path::Path::new(r"C:\x\update.log"),
+    fn legacy_ensure_running_task_is_retired_on_startup() {
+        let src = include_str!("platform.rs");
+        assert!(
+            src.contains("retire_task(\"ABB-EnsureRunning\")"),
+            "ABB-EnsureRunning 的存量清理必须保留（否则升级机器上旧自愈任务会一直闪控制台）"
         );
-        assert!(s.contains("--service"), "判活必须排除 --service");
-        assert!(s.contains("自愈拉起"), "未在跑必须拉起并留痕");
+        assert!(
+            src.contains("ensure-tray.cmd"),
+            "必须清掉旧自愈脚本残留（任务删了脚本还在，文档的「已删除」就不成立）"
+        );
+        let main = include_str!("main.rs");
+        assert!(
+            main.contains("platform::retire_legacy_bridge_task()"),
+            "服务启动路径必须调用退役函数（锁被旧提权实例占着时也要能退役）"
+        );
+        let ui = include_str!("ui.rs");
+        assert!(
+            ui.contains("platform::retire_legacy_bridge_task()"),
+            "GUI 启动路径必须调用退役函数（否则托盘启动永远不清旧任务）"
+        );
     }
 }
 

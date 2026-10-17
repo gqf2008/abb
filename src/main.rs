@@ -491,13 +491,12 @@ fn main() {
         // 托管形态没有可用 stdout 时，先把日志接到 logs/bridge.out（见函数文档）；
         // 必须在任何输出之前调用，否则 Rust 已缓存旧句柄。
         attach_log_file("bridge.out");
-        // 新模型（2026-10-04）：退役旧的高权限常驻计划任务。若本次**就是**它拉起来的，
-        // 这一行会让下次登录改走托盘（普通用户）路径；随后把「仍在以高权限跑」留痕。
+        // 新模型（2026-10-04）：退役历史计划任务（旧的高权限常驻任务 + 已删除的外部自愈任务）。
+        // 若本次**就是**旧高权限任务拉起来的，这一行会让下次登录改走托盘（普通用户）路径；
+        // 随后把「仍在以高权限跑」留痕。
         platform::retire_legacy_bridge_task();
         platform::retire_legacy_per_user_files();
         platform::retire_legacy_uninstall_keys();
-        // 常驻自愈：2026-10-05 实测安装器 [Run] 拉起的实例连 main 都没到 ⇒ 必须有常驻兜底
-        platform::ensure_running_task();
         #[cfg(target_os = "windows")]
         if platform::is_elevated() {
             crate::log!(

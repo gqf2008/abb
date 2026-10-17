@@ -3591,8 +3591,6 @@ pub fn run_gui() -> Result<()> {
     // flat 遗留是单 bot 时代产物，归首 bot；bot2+ 的迁移由 service 的 migrate_keys 负责。
     if let Ok(c) = Config::load() {
         platform::migrate_legacy_state(&c);
-        // 新模型（2026-10-04）：退役旧的高权限常驻计划任务，避免它和托盘的普通用户服务抢锁。
-        platform::retire_legacy_bridge_task();
     }
 
     let tray = Tray::new()?;
@@ -10162,6 +10160,12 @@ pub fn run_gui() -> Result<()> {
             }},
         );
     }
+
+    // 新模型（2026-10-04）：退役历史计划任务（旧提权常驻任务 + 已删除的外部自愈任务），
+    // 避免提权实例和托盘的普通用户服务抢锁，并清掉会闪控制台的旧自愈任务。
+    // 放在**所有窗口/托盘初始化成功、事件循环即将开始**之后：删除不可逆，若启动中途失败，
+    // 旧任务（尤其每 5 分钟自愈）还是唯一的兜底——不能「启动失败 + 兜底已被自己删掉」。
+    platform::retire_legacy_bridge_task();
 
     slint::run_event_loop()?;
     Ok(())
