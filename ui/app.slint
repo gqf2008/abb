@@ -3293,10 +3293,16 @@ export component AnchorBubble inherits Window {
     // 留边距的原因：稿 `.bub` 悬停放大到 1.06（≈38.2px）、按下缩到 0.9 并加墨黑描边；
     // 窗口级裁剪关不掉，36px 窗口会把放大后的圆角裁平。位置记忆存的是**窗口**左上角，
     // 几何换算见 Rust `BUBBLE_INSET`（可视气泡 = 窗口内缩 4px）。
-    width: 44px;
-    height: 44px;
-    preferred-width: 44px;
-    preferred-height: 44px;
+    // ⚠️ 透明边距由 Rust 按平台写（`set_inset`）：**Windows 上必须为 0**——
+    // 那里 GL/透明合成不保证逐像素 alpha，4px 透明边距会被画成**黑色**，看着就是「气泡有黑边」
+    //（owner 2026-10-17 真机反馈）。macOS 保持 4px（悬停放大 1.06 要这点余量）。
+    in property <length> inset: 4px;
+    // Windows 上没有余量 ⇒ 关掉悬停放大，否则 38.16px 会被 36px 窗口裁掉边缘。
+    in property <bool> allow-scale: true;
+    width: 36px + self.inset * 2;
+    height: 36px + self.inset * 2;
+    preferred-width: 36px + self.inset * 2;
+    preferred-height: 36px + self.inset * 2;
     no-frame: true;
     always-on-top: true;
     background: transparent;
@@ -3326,8 +3332,8 @@ export component AnchorBubble inherits Window {
         // 画在 36px 可视框上；图片缩到 0.9 后描边即露出。
         Rectangle {
             visible: root.pressed;
-            x: 4px;
-            y: 4px;
+            x: root.inset;
+            y: root.inset;
             width: 36px;
             height: 36px;
             background: transparent;
@@ -3340,11 +3346,13 @@ export component AnchorBubble inherits Window {
         // 悬停放大 1.06 / 按下缩到 0.9（稿 `.bub:hover` / `.bub:active`）：用宽高缩放而不是
         // transform，避开子元素变换原点/裁剪的不确定性。
         Image {
-            property <float> sc: root.pressed ? 0.9 : (touch.has-hover ? 1.06 : 1.0);
+            property <float> sc: root.pressed
+                ? 0.9
+                : ((root.allow-scale && touch.has-hover) ? 1.06 : 1.0);
             width: 36px * self.sc;
             height: 36px * self.sc;
-            x: 4px + (36px - self.width) / 2;
-            y: 4px + (36px - self.height) / 2;
+            x: root.inset + (36px - self.width) / 2;
+            y: root.inset + (36px - self.height) / 2;
             source: @image-url("../app-assets/icon-1024.png");
             image-fit: fill;
             opacity: root.busy ? 0.6 : 1.0;   // 回合进行中的轻反馈

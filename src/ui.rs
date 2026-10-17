@@ -598,7 +598,12 @@ fn verify_probe_syschat(tag: &str, w: &SystemChatWindow) {
 // D 批：气泡窗口 = 36px 可视气泡 + 四周各 4px 透明边距（给悬停放大 1.06 / 按下描边留空间，
 // 见 `ui/app.slint` 的 AnchorBubble 注释）。位置记忆存的是**窗口**左上角，几何换算时要内缩。
 const BUBBLE_VISUAL_SIZE: i32 = 36;
-const BUBBLE_INSET: i32 = 4;
+/// 气泡窗口比可视气泡大多少（四周各这么多像素的**透明**边距）。
+///
+/// **Windows 必须是 0**：那边 GL/透明合成不保证逐像素 alpha，透明边距会被画成黑色
+///（owner 2026-10-17 真机：「气泡有黑边」）。位置记忆与拖动换算都用它，所以这里也要跟着变，
+/// 否则窗口位与可视位会差 4px（`bubble_saved_pos`/`bubble_visual_rect` 那一组换算）。
+const BUBBLE_INSET: i32 = if cfg!(windows) { 0 } else { 4 };
 
 /// 气泡显隐的**唯一收口**。
 ///
@@ -4445,6 +4450,9 @@ pub fn run_gui() -> Result<()> {
     }
 
     let bubble = AnchorBubble::new()?;
+    // 与 `BUBBLE_INSET` 同源：Windows 无边距、也不做悬停放大（36px 窗口会把 1.06 裁掉）。
+    bubble.set_inset(BUBBLE_INSET as f32);
+    bubble.set_allow_scale(!cfg!(windows));
     // 气泡位置：统一在**事件循环活跃后的首个 tick** 里施加（见 tick）——启动前 set_position 会被
     // macOS 的窗口级联覆盖，保存的位置实际不生效（2026-10-13 实测：设 (1398,120) 后窗口落在 (1206,65)）。
     // 坐标统一用**逻辑像素**（winit 的 MonitorHandle::size() 是物理像素，Retina 下差 2 倍）。
