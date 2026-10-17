@@ -16,6 +16,10 @@ $LicenseDir = Join-Path $Dest "licenses"
 $Tmp = Join-Path ([IO.Path]::GetTempPath()) ("abb-bundled-tools-" + [guid]::NewGuid().ToString("N"))
 
 New-Item -ItemType Directory -Force -Path $BinDir, $LicenseDir, $Tmp | Out-Null
+# 目标目录可能被上一次构建复用：先清空 bin/。否则已下架的工具（wassette 2026-10-10 废弃、
+# 旧 binutils 的 objcopy/objdump/ld/size、peports）会残留下来一起被打包；
+# check_bundled_tools.sh 的「期望集合 == 实际目录」也会红。
+if (Test-Path $BinDir) { Get-ChildItem -LiteralPath $BinDir -File -Force | Remove-Item -Force }
 Copy-Item (Join-Path $Root "tools/licenses/*") $LicenseDir -Force
 
 try {

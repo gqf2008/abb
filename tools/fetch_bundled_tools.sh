@@ -34,6 +34,9 @@ done
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/abb-bundled-tools.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$DEST/bin" "$DEST/licenses"
+# 目标目录可能被上一次构建复用：先清空 bin/（原因同 Windows 侧 fetch_bundled_tools.ps1——
+# 已下架的工具会残留并被打包，check_bundled_tools.sh 的集合相等断言也会红）。
+find "$DEST/bin" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 cp tools/licenses/* "$DEST/licenses/"
 
 # 宿主判定：Windows 产物在非 Windows 宿主上**不能执行**（PE），只能断言"存在且非空"。

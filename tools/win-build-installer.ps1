@@ -68,6 +68,18 @@ Assert-Fresh $rootExe (Join-Path $repo 'src') '根程序'
 Assert-Fresh $abbAgentExe (Join-Path $repo 'crates\abb-agent\src') 'abb-agent'
 Assert-Fresh $abbChartExe (Join-Path $repo 'crates\abb-chart\src') 'abb-chart'
 
+# 2026-10-17 owner：「wassette/objcopy/objdump 不需要随包安装」。tools-dist 可能是旧的 fetch
+# 产物（本地复用），已下架的工具必须在打包前清掉——否则会被 ABB.iss 的 `tools-dist\bin\*`
+# 原样打进安装包（wassette 2026-10-10 废弃；objcopy/objdump/ld/size 是旧 binutils 遗留、
+# peports 是早期 PE 检查小工具，均不在 tools/tool-lock.tsv）。
+foreach ($stale in 'wassette', 'objcopy', 'objdump', 'ld', 'size', 'peports') {
+  $p = Join-Path $repo ('tools-dist\bin\' + $stale + '.exe')
+  if (Test-Path $p) {
+    Remove-Item -LiteralPath $p -Force
+    Say ('清掉下架工具：' + $stale + '.exe')
+  }
+}
+
 # 运行期同目录解析：确保 .iss 取到的就是这两份
 $version = [regex]::Match((Get-Content (Join-Path $repo 'Cargo.toml') -Raw), 'version = "([^"]+)"').Groups[1].Value
 $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'

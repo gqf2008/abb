@@ -55,6 +55,15 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Type: files; Name: "{app}\abb-spawner.exe"
 Type: files; Name: "{app}\abb-elev-helper.exe"
 Type: files; Name: "{app}\abb-helper.exe"
+; 2026-10-17 owner：以下随包工具不再提供 —— wassette 已于 2026-10-10 废弃（代码侧已删）；
+; objcopy/objdump/ld/size 是旧包遗留的 GNU binutils，peports 是早期 PE 检查小工具，均不在
+; tools/tool-lock.tsv 里。升级时清掉，避免永远留在 Program Files（与上面三个提权件同理）。
+Type: files; Name: "{app}\tools\bin\wassette.exe"
+Type: files; Name: "{app}\tools\bin\objcopy.exe"
+Type: files; Name: "{app}\tools\bin\objdump.exe"
+Type: files; Name: "{app}\tools\bin\ld.exe"
+Type: files; Name: "{app}\tools\bin\size.exe"
+Type: files; Name: "{app}\tools\bin\peports.exe"
 ; 2026-10-05 审计 #12：per-user 时代（≤2.23.97，`{localappdata}\Programs\ABB`）迁到 per-machine
 ; 后，旧目录与旧快捷方式都没人清 —— 本机实测残留 162MB，且 `{userprograms}\ABB.lnk` 指向一个
 ; **已经不存在**的旧 exe（点了没反应）。这里在安装/升级时顺手清掉（不存在时为 no-op）。
