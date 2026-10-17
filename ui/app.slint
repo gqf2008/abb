@@ -100,7 +100,8 @@ export component Tray inherits SystemTrayIcon {
     callback start-service();
     callback stop-service();
     callback restart-service();
-    callback open-settings();
+    callback open-settings();   // 菜单「设置…」
+    callback open-chat();       // 左键点托盘图标：打开系统对话窗
     callback open-logs();
     callback open-folder();
     callback toggle-autostart(bool);
@@ -109,8 +110,9 @@ export component Tray inherits SystemTrayIcon {
     callback install-update();   // 点「升级」：下载+安装+重启
     callback quit-app();
 
-    // 左键点图标 = 打开设置（对齐 brewfs：clicked → show-window）
-    clicked => { root.open-settings(); }
+    // 左键点图标 = 打开系统对话窗（owner 2026-10-17：与点气泡/点 Dock 同一口径）；
+    // 设置窗仍从菜单「设置…」进入。
+    clicked => { root.open-chat(); }
 
     Menu {
         // Bot 状态：分区标题（仅在有 bot 时出现）+ 逐 bot 行直接铺在主菜单（不嵌套子菜单）。

@@ -6394,9 +6394,9 @@ pub fn run_gui() -> Result<()> {
         let model = bots_model.clone();
         let pmodel = providers_model.clone();
         let dirty_open = dirty.clone();
-        // 托盘「设置…」的显示逻辑：草稿恢复 + 显示置前。
-        // （v10 稿 v8 第 4 条：Dock 点击已改成**只开对话窗**，不再走这里——接线在系统对话窗那段，
-        //  与气泡点击共用同一个 `open_syschat` 收口。）
+        // 托盘菜单「设置…」的显示逻辑：草稿恢复 + 显示置前。
+        // （托盘图标的**左键点击**不在这里：2026-10-17 起与点气泡/点 Dock 同口径，
+        //  只开系统对话窗——接线见 `open_syschat` 那段。）
         let tray_sw = sw.clone();
         tray.on_open_settings({
             let wk = wk.clone();
@@ -8319,6 +8319,12 @@ pub fn run_gui() -> Result<()> {
     {
         let open = open_syschat.clone();
         crate::platform::install_dock_reopen(Box::new(move || open()));
+    }
+    // 入口三：左键点托盘图标 → 也开对话窗（owner 2026-10-17：与气泡/Dock 同一口径；
+    // 设置窗仍从托盘菜单「设置…」进入）。
+    {
+        let open = open_syschat.clone();
+        tray.on_open_chat(move || open());
     }
     // 新建会话（保留历史，旧会话可在「会话」下拉里切回）。
     {
@@ -10751,6 +10757,38 @@ mod tests {
                 && prod.matches("refresh_bubble_visibility(&b, false)").count() >= 1
                 && prod.contains("refresh_bubble_visibility(&bubble, false)"),
             "开窗藏气泡（true）、关窗/失焦/启动显气泡（false）三条调用点必须都在"
+        );
+    }
+
+    /// 托盘左键 = 打开系统对话窗（owner 2026-10-17）；设置窗仍从菜单「设置…」进入。
+    ///
+    /// 判别力：把 `clicked` 改回 `root.open-settings()`、或把 Rust 侧 `tray.on_open_chat`
+    /// 接线删掉 ⇒ 对应断言红。（`clicked => root.open-chat()` 在气泡组件里也有一份，
+    /// 所以这里只扫 Tray 组件自身那一段。）
+    #[test]
+    fn tray_left_click_opens_chat_not_settings() {
+        let slint = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        let start = slint
+            .find("export component Tray inherits SystemTrayIcon")
+            .expect("app.slint 应有 Tray 组件");
+        let end = slint[start..]
+            .find("export struct OwnerRow")
+            .map(|i| start + i)
+            .unwrap_or(slint.len());
+        let tray = &slint[start..end];
+        assert!(
+            tray.contains("clicked => { root.open-chat(); }"),
+            "左键点托盘图标必须开对话窗（不是设置窗）"
+        );
+        assert!(
+            tray.contains("\"设置…\"; activated => { root.open-settings(); }"),
+            "菜单「设置…」仍必须开设置窗"
+        );
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
+        assert!(
+            prod.contains("tray.on_open_chat("),
+            "托盘 open-chat 必须接到 open_syschat（点气泡/点 Dock 的同一收口）"
         );
     }
 
