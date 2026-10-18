@@ -1125,11 +1125,12 @@ fn v10_metrics_match_design() {
         "发送钮内边距应 ≈14px（稿 .send{{padding:0 14px}}），实测 {pad_l}"
     );
 
-    // ── 5. 功能区：整体靠右、总宽 136px、与发送钮同一水平线 ──
+    // ── 5. 功能区：整体靠右、总宽 164px、与发送钮同一水平线 ──
+    // v21：新增第 6 枚「📌 置顶」图标钮（窗口永远置顶，持久到 config）⇒ 宽度按 6 枚算。
     assert_eq!(
         ui.get_dbg_fnbar_w(),
-        5.0 * 24.0 + 4.0 * 4.0,
-        "功能区总宽应为 5×24 + 4×4 = 136px（稿 .fnbar{{gap:4px}} + .ib{{width:24px}}）"
+        6.0 * 24.0 + 5.0 * 4.0,
+        "功能区总宽应为 6×24 + 5×4 = 164px（稿 .fnbar{{gap:4px}} + .ib{{width:24px}}）"
     );
     assert_eq!(ui.get_dbg_fnbar_h(), 24.0, "图标钮高应为 24px（稿 .ib）");
     assert_eq!(
@@ -1155,7 +1156,7 @@ fn v10_metrics_match_design() {
         "功能区应整体靠右（左侧占空 {}px）",
         ui.get_dbg_fnbar_x()
     );
-    // 像素交叉验证：整行行带里的暗列 = 五枚图标的左右描边 ⇒ 首尾之间正好 136px。
+    // 像素交叉验证：整行行带里的暗列 = 六枚图标的左右描边 ⇒ 首尾之间正好 164px。
     let cols: Vec<u32> = (left_border + 3..send_box_l)
         .filter(|&x| (send_top..=send_bottom).any(|y| is_dark(f.px(x, y))))
         .collect();
@@ -1163,8 +1164,8 @@ fn v10_metrics_match_design() {
     let fnbar_r = *cols.last().expect("找不到功能区右缘");
     assert_eq!(
         fnbar_r - fnbar_l + 1,
-        5 * 24 + 4 * 4,
-        "功能区总宽（像素量）应为 136px"
+        6 * 24 + 5 * 4,
+        "功能区总宽（像素量）应为 164px"
     );
     assert_eq!(
         send_box_l - fnbar_r - 1,

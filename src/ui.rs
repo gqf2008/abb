@@ -554,6 +554,9 @@ fn show_window_and_focus<W: slint::ComponentHandle + 'static>(w: &W) {
     bring_app_to_front();
     let _ = w.show();
     w.window().request_redraw();
+    // Windows：把窗口提到前台（macOS 已由 `bring_app_to_front` 的 NSApp activate 完成）。
+    #[cfg(target_os = "windows")]
+    raise_window_when_ready(w);
     // 缩放（2026-10-15 更正）：**不需要**在 `show()` 之后补一刀 `winit set_resizable(true)`——
     // 那既是无效时机、也没有必要：
     //   1. `show()` **不同步建原生窗**。`set_visible` 发现 `winit_window()` 还是 `None` 时，只把
@@ -2769,6 +2772,57 @@ fn win32_hwnd(window: &slint::winit_030::winit::window::Window) -> Option<*mut s
     }
 }
 
+/// Windows：把具体 HWND 提到前台（`ShowWindow(SW_RESTORE)` → `BringWindowToTop` →
+/// `SetForegroundWindow`）。macOS 走 [`bring_app_to_front`] 的 NSApp activate；
+/// Windows 没有「进程级激活」，只能按窗口句柄提。
+#[cfg(target_os = "windows")]
+fn raise_window_to_front(hwnd: *mut std::ffi::c_void) {
+    use std::ffi::c_void;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn ShowWindow(hwnd: *mut c_void, cmd: i32) -> i32;
+        fn BringWindowToTop(hwnd: *mut c_void) -> i32;
+        fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
+    }
+    const SW_RESTORE: i32 = 9;
+    // SAFETY: hwnd 取自 winit 窗口；三个调用都是标准 Win32 前台操作。
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
+    }
+}
+
+/// 在 `show()` 之后把窗口提到前台（Windows）。
+///
+/// 为什么要补两拍：`show()` **不同步建原生窗**（见 [`show_window_and_focus`] 的注释），
+/// 首次打开时 `with_winit_window` 还是 `None`。立即提一次 + 80ms/300ms 各补一次，
+/// 覆盖「原生窗刚建好」的时机；窗口已经存在时后两拍是幂等的。
+///
+/// 与置顶（`always-on-top`）的区别：这只是一次性置前，不改持久状态。
+#[cfg(target_os = "windows")]
+fn raise_window_when_ready<W: slint::ComponentHandle + 'static>(w: &W) {
+    use slint::winit_030::WinitWindowAccessor;
+
+    fn raise_now<W: slint::ComponentHandle>(w: &W) {
+        let _ = w.window().with_winit_window(|win| {
+            if let Some(hwnd) = win32_hwnd(win) {
+                raise_window_to_front(hwnd);
+            }
+        });
+    }
+
+    raise_now(w);
+    for delay in [80u64, 300] {
+        let weak = w.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(delay), move || {
+            if let Some(w) = weak.upgrade() {
+                raise_now(&w);
+            }
+        });
+    }
+}
+
 /// 删掉本进程所有顶层窗口的任务栏按钮（`ITaskbarList::DeleteTab`），幂等。
 ///
 /// 为什么不能用 `WS_EX_TOOLWINDOW`/winit 的 `skip_taskbar`：
@@ -3757,6 +3811,25 @@ fn cmd_v_action(
     }
 }
 
+/// 从消息块上报的**字节偏移**里切出选中文本（划词工具条）。
+///
+/// Slint 的 `TextInput` 选区偏移是 UTF-8 字节偏移（`*-position-byte-offset`），但偏移可能
+/// 落在多字节字符中间（文本刚变更 / 越界）⇒ 双向夹取到最近的字符边界，**绝不 panic**。
+/// `anchor`/`focus` 的顺序只表示选区方向，取两者之间的文本，与方向无关。
+fn selection_text(body: &str, anchor: i32, focus: i32) -> String {
+    fn boundary(body: &str, at: i32) -> usize {
+        let mut i = (at.max(0) as usize).min(body.len());
+        while i > 0 && !body.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    }
+    let a = boundary(body, anchor);
+    let f = boundary(body, focus);
+    let (lo, hi) = if a <= f { (a, f) } else { (f, a) };
+    body[lo..hi].to_string()
+}
+
 pub fn run_gui() -> Result<()> {
     configure_backend()?;
 
@@ -3849,6 +3922,10 @@ pub fn run_gui() -> Result<()> {
     // 气泡只在托盘进程运行时存在——ABB 无头（`--service`）时不实例化任何窗口，
     // 那时与 ABB 对话只能走 IM bot（产品里本就如此）。
     let syschat_win = SystemChatWindow::new()?;
+    // 置顶是**持久**状态：建窗即从 config 读入（`always-on-top` 绑定在 .slint 侧）。
+    // 与「点托盘图标」区分：托盘点击只做一次性的前端置前（见 [`show_window_and_focus`]），
+    // 不修改这里的状态，也不会被写进 config。
+    syschat_win.set_pinned(Config::load().map(|c| c.syschat_pinned).unwrap_or(false));
     // 缩放：Windows/Linux 仍接 winit 的 `drag_resize_window`（`impl_resize_ui!` 提供回调实现）；
     // macOS 上那条路是死的（返回 `NotSupported`），改走**自管缩放**（见 [`SelfResize`]）。
     // 两边都要接：`on_begin_resize` 是单槽回调，`install_window_resize` 在 macOS 上装上也无害
@@ -4543,6 +4620,14 @@ pub fn run_gui() -> Result<()> {
             let Some(w) = cw.upgrade() else { return };
             match crate::syschat::land_attachments(&paths) {
                 Ok(landed) => {
+                    // 粘贴落出来的临时 PNG/TIFF（platform::pasteboard_image_path）只是中转：
+                    // 附件已复制进工作区，原件没有别的消费者 ⇒ 删掉，免得长期 Ctrl+V 把
+                    // 系统临时目录堆满。只认 `<temp>/abb-paste-*`，用户自己的文件不碰。
+                    for src in &paths {
+                        if crate::platform::is_paste_temp_path(src) {
+                            let _ = std::fs::remove_file(src);
+                        }
+                    }
                     let n = landed.len();
                     atts.borrow_mut().extend(landed);
                     refresh_syschat_atts(&w, &atts, &pending, &split);
@@ -8326,6 +8411,30 @@ pub fn run_gui() -> Result<()> {
         let open = open_syschat.clone();
         tray.on_open_chat(move || open());
     }
+    // 置顶开关（📌）：**持久**到 config.json，重启后仍生效。
+    // 与上面的托盘点击区分：托盘点击只调用 `open_syschat`（一次性置前），不改置顶状态。
+    {
+        let cw = syschat_win.as_weak();
+        syschat_win.on_toggle_pin(move || {
+            let Some(w) = cw.upgrade() else { return };
+            let on = !w.get_pinned();
+            if crate::config::Config::set_syschat_pinned(on) {
+                w.set_pinned(on);
+                w.set_status_is_error(false);
+                w.set_status_line(
+                    if on {
+                        "已置顶窗口（重启后保持）。"
+                    } else {
+                        "已取消置顶。"
+                    }
+                    .into(),
+                );
+            } else {
+                w.set_status_is_error(true);
+                w.set_status_line("置顶设置保存失败：config.json 不可写。".into());
+            }
+        });
+    }
     // 新建会话（保留历史，旧会话可在「会话」下拉里切回）。
     {
         let cw = syschat_win.as_weak();
@@ -8663,6 +8772,122 @@ pub fn run_gui() -> Result<()> {
                         );
                     }
                 }
+            }
+        });
+    }
+    // ── 划词工具条（类似飞书的划词菜单）────────────────────────────────────
+    // 选区上报来自 Slint 全局 `TextSelection.moved`（消息块的只读 TextInput 在光标/选区
+    // 变化时发出）。这里做三件事：切文本、**防抖**、落位；三个按钮的动作各自接一条回调。
+    //
+    // 为什么要防抖：拖选过程中鼠标每移动一次都会上报，立刻弹条会跟着鼠标抖、且每次拖动都
+    // 闪一下。等 180ms 没有新事件再弹（与飞书的手感一致）。
+    let sc_selection: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    {
+        use slint::Global as _;
+        let cw = syschat_win.as_weak();
+        let text = sc_selection.clone();
+        let timer = Rc::new(slint::Timer::default());
+        TextSelection::get(&syschat_win).on_moved(move |body, anchor, focus, x, y| {
+            let Some(w) = cw.upgrade() else { return };
+            let sel = selection_text(body.as_str(), anchor, focus);
+            if sel.is_empty() {
+                // 点一下（无选区）/ 选区被清掉 ⇒ 立刻收起，并取消待弹的定时器。
+                *text.borrow_mut() = String::new();
+                timer.stop();
+                w.set_sel_toolbar_visible(false);
+                return;
+            }
+            *text.borrow_mut() = sel;
+            let cw2 = cw.clone();
+            let text2 = text.clone();
+            timer.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_millis(180),
+                move || {
+                    let Some(w) = cw2.upgrade() else { return };
+                    // 窗口在这期间被藏掉 ⇒ 不弹（否则下次打开会带着旧选区冒出来）。
+                    if !w.window().is_visible() || text2.borrow().is_empty() {
+                        return;
+                    }
+                    w.set_sel_toolbar_x(x);
+                    w.set_sel_toolbar_y(y);
+                    w.set_sel_toolbar_visible(true);
+                },
+            );
+        });
+    }
+    {
+        let cw = syschat_win.as_weak();
+        let text = sc_selection.clone();
+        syschat_win.on_sel_copy(move || {
+            let Some(w) = cw.upgrade() else { return };
+            let t = text.borrow().clone();
+            if t.is_empty() {
+                return;
+            }
+            if crate::platform::copy_to_clipboard(&t) {
+                w.set_status_is_error(false);
+                w.set_status_line(format!("已复制选中的 {} 字。", t.chars().count()).into());
+            } else {
+                w.set_status_is_error(true);
+                w.set_status_line("复制失败：没能写入系统剪贴板。".into());
+            }
+        });
+    }
+    {
+        let cw = syschat_win.as_weak();
+        let text = sc_selection.clone();
+        syschat_win.on_sel_quote(move || {
+            let Some(w) = cw.upgrade() else { return };
+            let t = text.borrow().clone();
+            if t.is_empty() {
+                return;
+            }
+            // 引用 = 逐行加 `> ` 追加进草稿（不清空用户已输入的内容）。
+            let quoted = t
+                .lines()
+                .map(|l| format!("> {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut next = w.get_draft().trim_end().to_string();
+            if !next.is_empty() {
+                next.push('\n');
+            }
+            next.push_str(&quoted);
+            next.push('\n');
+            w.set_draft(next.into());
+            w.set_status_is_error(false);
+            w.set_status_line(format!("已引用选中的 {} 字到输入框。", t.chars().count()).into());
+        });
+    }
+    {
+        let cw = syschat_win.as_weak();
+        let text = sc_selection.clone();
+        let speaker = sc_speaker.clone();
+        syschat_win.on_sel_speak(move || {
+            let Some(w) = cw.upgrade() else { return };
+            let t = text.borrow().clone();
+            if t.is_empty() {
+                return;
+            }
+            // 与整轮朗读共用同一个 Speaker：同一时刻只允许一段朗读。
+            speaker.borrow_mut().stop();
+            if speaker.borrow_mut().speak(&t) {
+                // 片段朗读不对应某一轮 ⇒ 不点亮任何整轮按钮。
+                w.set_speaking_turn(-2);
+                w.set_status_is_error(false);
+                w.set_status_line(SPEAKING_HINT.into());
+            } else {
+                w.set_speaking_turn(-2);
+                w.set_status_is_error(true);
+                w.set_status_line(
+                    if cfg!(target_os = "macos") {
+                        "朗读失败：没能启动系统 say。"
+                    } else {
+                        "朗读不可用：本平台没有内置朗读命令（当前仅 macOS 支持）。"
+                    }
+                    .into(),
+                );
             }
         });
     }
@@ -9292,7 +9517,13 @@ pub fn run_gui() -> Result<()> {
                 }
             }
             if let WindowEvent::ModifiersChanged(m) = ev {
+                // 粘贴修饰键：macOS 是 ⌘（super），Windows / Linux 是 Ctrl。
+                // 以前只记 super_key ⇒ Windows 上 Ctrl+V 根本进不了下面的拦截分支，
+                // 剪贴板里的文件/图片永远落不成待发附件（文本粘贴由 Slint 自己处理，看不出来）。
+                #[cfg(target_os = "macos")]
                 super_held.set(m.state().super_key());
+                #[cfg(not(target_os = "macos"))]
+                super_held.set(m.state().control_key());
             }
             if let WindowEvent::KeyboardInput { event, .. } = ev {
                 // 稿 v16：输入框**为空**时按 ⌫ ⇒ 删掉**最后一个**待发附件（再按继续往前删）。
@@ -10554,6 +10785,22 @@ mod tests {
         }
     }
 
+    /// 划词工具条：字节偏移切片必须钳到字符边界，方向与越界都不能 panic。
+    ///
+    /// 判别力：不夹取非字符边界 ⇒ `"你好"` 那条 panic；不看方向 ⇒ 反向选区为空；
+    /// 不夹上下界 ⇒ 越界那条 panic。
+    #[test]
+    fn selection_text_clamps_boundaries_and_ignores_direction() {
+        assert_eq!(selection_text("abc", 1, 2), "b");
+        assert_eq!(selection_text("abc", 2, 1), "b", "反向选区");
+        assert_eq!(selection_text("abc", 2, 2), "", "无选区");
+        assert_eq!(selection_text("你好世界", 0, 6), "你好");
+        assert_eq!(selection_text("你好世界", 6, 0), "你好", "反向多字节");
+        assert_eq!(selection_text("abc", -5, 99), "abc", "越界夹取");
+        // 「你」的第二个字节（1）不是字符边界 ⇒ 回退到 0，不能 panic
+        assert_eq!(selection_text("你好", 1, 6), "你好");
+    }
+
     /// C 批 O3：⌘V 的落点判据。变异点：`repeat` 不看 ⇒ `Swallow` 那条变 `Land`（红）；
     /// `has_files` 不看 ⇒ 无文件也落地（红）；`pressed`/`is_v` 不看 ⇒ `Ignore` 那批红。
     #[test]
@@ -10620,6 +10867,116 @@ mod tests {
         assert!(
             region.contains("pasteboard_file_paths"),
             "⌘V 仍须探测剪贴板里的文件：{region}"
+        );
+    }
+
+    /// 粘贴修饰键必须按平台分流：macOS 是 ⌘（super），Windows / Linux 是 Ctrl。
+    ///
+    /// 判别力：退回只记 `super_key()`（2026-10 之前的写法）⇒ 非 macOS 的断言红；
+    /// 把 macOS 也改成 Ctrl ⇒ macOS 断言红。事件层行为要真 winit 事件才能测，
+    /// 故按本仓既有做法用**源码守卫**钉住接线。
+    #[test]
+    fn paste_modifier_is_ctrl_off_macos() {
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
+        let at = prod
+            .find("WindowEvent::ModifiersChanged")
+            .expect("⌘V/Ctrl+V 需要跟踪修饰键");
+        // 取到下一个事件分支为止，而不是数固定字节数：注释一改长，固定窗口就会
+        // 把 control_key() 截在外面，让正确的接线也变红。
+        let end = prod[at..]
+            .find("WindowEvent::KeyboardInput")
+            .map(|i| at + i)
+            .expect("修饰键分支后应紧跟按键分支");
+        let region = &prod[at..end];
+        let mac_cfg = region
+            .find("#[cfg(target_os = \"macos\")]")
+            .expect("macOS 分支应显式按 super 判定");
+        let ctrl_cfg = region
+            .find("#[cfg(not(target_os = \"macos\"))]")
+            .expect("非 macOS 分支应显式按 Ctrl 判定");
+        let super_at = region.find("super_key()").expect("macOS 用 ⌘（super）");
+        let control_at = region.find("control_key()").expect("非 macOS 用 Ctrl");
+        assert!(
+            mac_cfg < super_at && super_at < ctrl_cfg && ctrl_cfg < control_at,
+            "平台分支接反了：macOS 必须是 super_key()，非 macOS 必须是 control_key()：{region}"
+        );
+    }
+
+    /// 粘贴中转文件必须在落地成功后删除（否则临时目录无限增长）。
+    ///
+    /// 行为层要真附件落地才能测，按本仓惯例用源码守卫钉住接线；判据本身由
+    /// `platform::clipboard_tests::paste_temp_path_requires_both_temp_dir_and_prefix` 覆盖。
+    #[test]
+    fn landing_cleans_paste_temp_files() {
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
+        assert!(
+            prod.contains("is_paste_temp_path"),
+            "附件落地后必须清理粘贴中转文件，否则系统临时目录会被截图堆满"
+        );
+    }
+
+    /// 划词工具条的接线必须齐：全局选区回调 → Rust（切片/防抖/落位）、三个动作回调、
+    /// 以及 .slint 侧的可见性/位置属性。事件层行为要真窗口事件才能测，按本仓惯例用
+    /// 源码守卫钉住接线；切片判据由 `selection_text_clamps_boundaries_and_ignores_direction` 覆盖。
+    #[test]
+    fn selection_toolbar_is_fully_wired() {
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
+        for needle in [
+            "TextSelection::get(&syschat_win).on_moved(",
+            "set_sel_toolbar_visible(true)",
+            "on_sel_copy(",
+            "on_sel_quote(",
+            "on_sel_speak(",
+        ] {
+            assert!(prod.contains(needle), "划词工具条缺少接线：{needle}");
+        }
+        let ui = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        for needle in [
+            "export global TextSelection",
+            "cursor-position-changed(pos)",
+            "component SelectionToolbar",
+            "callback toggle-pin()",
+            "always-on-top: root.pinned",
+        ] {
+            assert!(ui.contains(needle), ".slint 侧缺少：{needle}");
+        }
+    }
+
+    /// 置顶是**持久**状态（写 config），且与「点托盘图标提到前台」是两条独立路径：
+    /// - 切换置顶 → `Config::set_syschat_pinned`；
+    /// - 托盘点击 → `show_window_and_focus` → Windows 的 `raise_window_when_ready`（一次性置前）。
+    ///
+    /// 判别力：把置顶改成只 `set_pinned` 不落盘、或把托盘点击接到置顶开关 ⇒ 对应断言红。
+    #[test]
+    fn pin_is_persisted_and_distinct_from_tray_raise() {
+        let src = crate::platform::src_lf(include_str!("ui.rs"));
+        let prod = &src[..src.find("mod tests {").expect("ui.rs 应有测试模块")];
+        // 截窗必须落在字符边界（源码里有中文注释，按字节数硬截会 panic）。
+        fn window(src: &str, start: usize, max: usize) -> &str {
+            let mut end = (start + max).min(src.len());
+            while end > start && !src.is_char_boundary(end) {
+                end -= 1;
+            }
+            &src[start..end]
+        }
+        let pin_at = prod.find("on_toggle_pin(").expect("置顶开关回调必须接线");
+        let pin_region = window(prod, pin_at, 900);
+        assert!(
+            pin_region.contains("set_syschat_pinned"),
+            "置顶切换必须写 config（重启后保持）"
+        );
+        let show_at = prod.find("fn show_window_and_focus").expect("应有开窗收口");
+        let show_region = window(prod, show_at, 2500);
+        assert!(
+            show_region.contains("raise_window_when_ready"),
+            "Windows 点托盘后必须把窗口提到前台（一次性置前，与置顶无关）"
+        );
+        assert!(
+            !show_region.contains("set_syschat_pinned"),
+            "托盘点击不得修改持久的置顶状态"
         );
     }
 

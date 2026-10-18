@@ -1056,6 +1056,12 @@ pub struct Config {
     /// AI 对话框）。默认 true（owner 决策 2026-10-12）；关掉后可从托盘菜单重新打开。
     #[serde(default = "default_true")]
     pub syschat_bubble: bool,
+    /// 系统对话窗「置顶」（always-on-top）：true = 窗口始终浮在其它窗口之上。
+    ///
+    /// 与「点托盘图标把窗口提到前台」是两件事：**置顶是持久窗口属性**（写这里，重启后
+    /// 仍生效）；托盘点击只是一次性的置前（见 `ui::show_window_and_focus`）。默认 false。
+    #[serde(default)]
+    pub syschat_pinned: bool,
     /// 「启动 / 停止 / 重启服务」的管理密码（2026-10-04 owner 要求：统一由 ABB 管理密码控制）。
     ///
     /// 存加盐迭代 SHA-256 记录（`sha256$<iters>$<salt_hex>$<hash_hex>`，见 `admin_pass`），
@@ -1108,6 +1114,7 @@ impl Default for Config {
             cross_delivery_enabled: false,
             workspace_git_enabled: true,    // #209 工作区版本管理默认开
             syschat_bubble: true,           // 全局锚点气泡默认常驻（系统级对话入口）
+            syschat_pinned: false,          // 对话窗默认不置顶（用户显式开）
             admin_password: String::new(),  // 未设置（首次服务动作时由 UI 引导设置）
             context_compress_enabled: true, // #130 超长自动压缩默认开
             context_keep_recent: default_ctx_keep_recent(),
@@ -1831,6 +1838,27 @@ impl Config {
             Ok(()) => true,
             Err(e) => {
                 crate::log!("[config] 保存 syschat_bubble 失败: {e:#}");
+                false
+            }
+        }
+    }
+
+    /// 系统对话窗置顶开关（持久）：与 [`Config::set_syschat_bubble`] 同款的
+    /// 「写锁 + load + set + 变化才落盘」。返回 true = 已落盘（或值未变化）。
+    pub fn set_syschat_pinned(on: bool) -> bool {
+        let _g = CONFIG_WRITE_LOCK.lock().unwrap();
+        let Ok(mut c) = Config::load() else {
+            crate::log!("[config] 加载 config 失败，无法保存 syschat_pinned");
+            return false;
+        };
+        if c.syschat_pinned == on {
+            return true;
+        }
+        c.syschat_pinned = on;
+        match c.save() {
+            Ok(()) => true,
+            Err(e) => {
+                crate::log!("[config] 保存 syschat_pinned 失败: {e:#}");
                 false
             }
         }
@@ -2967,6 +2995,24 @@ mod tests {
         assert!(s.contains("\"syschat_bubble\":false"), "{s}");
         let back2: Config = serde_json::from_str(&s).unwrap();
         assert!(!back2.syschat_bubble);
+    }
+
+    #[test]
+    fn syschat_pinned_defaults_false_and_roundtrip() {
+        // 对话窗置顶：默认关（用户显式开）；旧 config 无字段按默认关。
+        assert!(!Config::default().syschat_pinned);
+        let old = r#"{"bots":[{"name":"legacy","kind":"feishu"}]}"#;
+        let back: Config = serde_json::from_str(old).unwrap();
+        assert!(!back.syschat_pinned, "旧文件兼容缺省 = 不置顶");
+        // 开启后往返不丢。
+        let c = Config {
+            syschat_pinned: true,
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(s.contains("\"syschat_pinned\":true"), "{s}");
+        let back2: Config = serde_json::from_str(&s).unwrap();
+        assert!(back2.syschat_pinned);
     }
 
     #[test]

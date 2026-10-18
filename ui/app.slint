@@ -47,6 +47,14 @@ export global UiTokens {
     in property <color> text-disabled: PixelTheme.scheme == "dark" ? #6b6b6b : #9a9a9a;   // 停用/禁用态（弱化）
 }
 
+// 划词（文本选区）信号总线：消息块里的只读 `TextInput` 在光标/选区变化时把
+// （正文、anchor 字节偏移、focus 字节偏移、窗内坐标）发给对话窗。
+// 用 global 而不是在每个 `ConvoSelectableText` 使用点各接一条线：消息区有 7 处实例化。
+// 偏移是 **UTF-8 字节偏移**（Slint 内置属性 `*-position-byte-offset`），Rust 侧按字节切片。
+export global TextSelection {
+    callback moved(string, int, int, length, length);
+}
+
 export struct BotMenuRow {
     title: string,
     icon: image,
@@ -3235,6 +3243,19 @@ component ConvoSelectableText inherits TextInput {
     width: root.avail;
     selection-background-color: PixelTheme.accent;
     selection-foreground-color: PixelTheme.text;
+
+    // 划词（类似飞书的划词菜单）：光标/选区一变就上报。
+    // - 拖选过程中会连续触发；是否弹条由 Rust 侧**防抖**决定（见 ui.rs 的 on_text_selected）；
+    // - 坐标 = 本元素在窗口里的绝对位置 + 光标在元素内的位置 ⇒ 工具条可贴着选区落位。
+    cursor-position-changed(pos) => {
+        TextSelection.moved(
+            root.body,
+            root.anchor-position-byte-offset,
+            root.cursor-position-byte-offset,
+            root.absolute-position.x + pos.x,
+            root.absolute-position.y + pos.y,
+        );
+    }
 }
 
 // 等宽变体（代码块 / 思考块）：只多一行 `font-family`——不给非等宽块写空族名。
@@ -3697,10 +3718,70 @@ component ActsIcon inherits Rectangle {
     Tooltip { text: @markdown("\{root.tip}"); }
 }
 
+// 划词工具条的单颗按钮：小号、纯文字，hover 高亮。
+component SelToolbarBtn inherits Rectangle {
+    in property <string> caption: "";
+    callback clicked;
+    width: max(34px, txt.preferred-width + 14px);
+    height: 26px;
+    border-radius: 4px;
+    background: hit.has-hover ? PixelTheme.hover : transparent;
+    txt := Text {
+        width: 100%;
+        height: 100%;
+        text: root.caption;
+        font-size: 12px;
+        color: PixelTheme.text;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 划词工具条（类似飞书的划词菜单）：选中消息正文后浮在选区旁。
+// 显隐/锚点由 Rust 写（拖选防抖后）；条外点击由根组件里的透明吸收层收起。
+component SelectionToolbar inherits Rectangle {
+    in property <length> anchor-x: 0px;
+    in property <length> anchor-y: 0px;
+    // 可用宽（= 窗口宽）：组件定义里拿不到 `parent`，由实例处传。
+    in property <length> avail-width: 0px;
+    callback copy-clicked();
+    callback quote-clicked();
+    callback speak-clicked();
+    callback close-clicked();
+
+    width: bar.preferred-width;
+    height: bar.preferred-height;
+    background: PixelTheme.panel;
+    border-width: 2px;
+    border-color: PixelTheme.edge;
+    border-radius: 8px;
+    // 贴着选区：优先放上方 10px；上方不够就放下方；左右夹在窗内（8px 边距）。
+    x: min(max(root.anchor-x - self.width / 2, 8px), root.avail-width - self.width - 8px);
+    y: root.anchor-y > self.height + 18px
+        ? root.anchor-y - self.height - 10px
+        : root.anchor-y + 18px;
+
+    bar := HorizontalLayout {
+        padding: 3px;
+        spacing: 2px;
+        SelToolbarBtn { caption: "复制"; clicked => { root.copy-clicked(); } }
+        SelToolbarBtn { caption: "引用"; clicked => { root.quote-clicked(); } }
+        SelToolbarBtn { caption: "朗读"; clicked => { root.speak-clicked(); } }
+        Rectangle { width: 1px; height: 100%; background: PixelTheme.edge; }
+        SelToolbarBtn { caption: "×"; clicked => { root.close-clicked(); } }
+    }
+}
+
 component ComposerIcon inherits Rectangle {
     in property <string> icon: "";
     in property <string> tip: "";
     in property <bool> enabled: true;
+    // 开关型按钮（置顶）的选中态：accent 底，一眼看出当前是开还是关。
+    in property <bool> active: false;
     callback clicked();
     // 24px（稿 `.ib`）。
     width: 24px;
@@ -3712,7 +3793,9 @@ component ComposerIcon inherits Rectangle {
         y: hit.pressed ? 1px : 0px;
         width: parent.width;
         height: parent.height;
-        background: hit.has-hover ? PixelTheme.hover : PixelTheme.panel;
+        background: root.active
+            ? PixelTheme.accent
+            : (hit.has-hover ? PixelTheme.hover : PixelTheme.panel);
         border-width: 2px;
         border-color: PixelTheme.edge;
         border-radius: 6px;
@@ -3806,6 +3889,10 @@ export component SystemChatWindow inherits Window {
     max-height: 100000px;
     // 圆角靠根 Rectangle 的两层填充画（外层黑 + 内层面板）；窗口本身透明，否则四角会露白。
     background: transparent;
+    // 置顶（always-on-top）：**持久**状态，Rust 从 config.syschat_pinned 读入并回写。
+    // 与「点托盘图标把窗口提到前台」区分：那是一次性置前，不改这个状态。
+    always-on-top: root.pinned;
+    in-out property <bool> pinned: false;
 
     in property <[SysChatBlockRow]> blocks: [];
     in property <bool> busy: false;
@@ -3822,6 +3909,16 @@ export component SystemChatWindow inherits Window {
     property <bool> stick-latch: false;
     // 输入框内容（与 PixelTextInput.text 双向绑定；发送后 Rust 置空）
     in-out property <string> draft: "";
+
+    // 划词工具条（类似飞书）：选中消息正文后在选区旁浮出。
+    // 可见性/坐标由 Rust 在**防抖后**写（拖选过程中不弹，见 ui.rs 的 on_text_selected）。
+    // 面板（表情/会话/模型/更多）打开时临时不显示（见 `sel-toolbar-shown`），避免叠在一起。
+    in-out property <bool> sel-toolbar-visible: false;
+    in-out property <length> sel-toolbar-x: 0px;
+    in-out property <length> sel-toolbar-y: 0px;
+    property <bool> sel-toolbar-shown: root.sel-toolbar-visible
+        && !root.emoji-open && !root.more-open
+        && !root.session-menu-open && !root.model-menu-open;
 
     // D 批待发附件（3+N chips，稿 `.pending`）：`attach-count` = 完整待发数（>0 才渲染附件行），
     // `pending-rows` = Rust 按折叠态裁好的**可见**行（≤3 或展开后全部），`pending-more` = 折叠数 N。
@@ -3912,6 +4009,11 @@ export component SystemChatWindow inherits Window {
     callback copy-turn(int);     // ⧉ 复制（整轮正文 → 系统剪贴板）
     callback regen-turn(int);    // ⟳ 重新生成（用该轮的用户提示重跑，落历史、可停止）
     callback speak-turn(int);    // 🔊/⏹ 朗读（macOS `say`；再点一次 = 停止）
+    // 划词工具条：选中文本由全局 `TextSelection.moved` 直接交给 Rust（见 ui.rs），
+    // 这里只声明工具条按钮的三个动作。
+    callback sel-copy();         // 复制选中文字 → 系统剪贴板
+    callback sel-quote();        // 引用到输入框（逐行加 `> `）
+    callback sel-speak();        // 朗读选中文字
     // 正在朗读的助手轮序号：`-2` = 没有朗读在跑。**UI 状态哨兵**（与动作行的 `turn` 无关：
     // 真实下标从 0 起，-1 不会被当作合法轮号），由 Rust 写。
     // 名字不能叫 `speak-turn`：Slint 不允许 callback 与属性同名（`callback speak-turn(int)`
@@ -3922,6 +4024,7 @@ export component SystemChatWindow inherits Window {
     callback attach-remove(int);   // 按完整列表下标移除单个待发附件（✕）
     callback pending-toggle();     // 展开/收起 +N
     callback reset-history();
+    callback toggle-pin();       // 置顶开关（持久：写 config.json，重启后保持）
     callback close-window();
     callback open-settings();   // ③ ⚙设置：唤起既有设置窗（D2 稿需求 #3）
     // 输入区占位按钮（稿 v9 第 2 条）：只剩 ✂ 截图仍是「有反馈的占位」——按下走既有
@@ -5380,6 +5483,17 @@ export component SystemChatWindow inherits Window {
                                             root.more-opened();
                                         }
                                     }
+                                    // 📌 置顶：always-on-top，**持久**（写 config.json）。
+                                    // 注意与「点托盘图标」的区别：托盘点击只把窗口提到前台一次，
+                                    // 不改变这里的置顶状态（见 ui.rs 的 show_window_and_focus）。
+                                    ComposerIcon {
+                                        icon: "📌";
+                                        active: root.pinned;
+                                        tip: root.pinned
+                                            ? "取消置顶（当前已置顶）"
+                                            : "置顶窗口（重启后保持）";
+                                        clicked => { root.toggle-pin(); }
+                                    }
                                 }
                                 // 发送按钮（稿 v10 `.send{height:30px;padding:0 14px;font-size:12px;
                                 // border-radius:6px}`）：内边距 14×2 ⇒ 宽 = 文案宽 + 28。
@@ -5527,6 +5641,32 @@ export component SystemChatWindow inherits Window {
         // `clicked` 在**松开**才到 → 「再点按钮」永远只会重开、收不起来（实测语义，不是猜）。
         // 改成「面板 + 一层整窗透明 TouchArea」：点面板外（含按钮本身）→ 关；再点按钮时
         // 已无遮挡 → 正常打开。两面板互斥由按钮处理器保证。
+        // ── 划词工具条（类似飞书）：整窗透明吸收层 + 工具条本体 ──────────────────
+        // 放在面板 backdrop **之前** ⇒ 表情/会话面板打开时画在工具条之上，不会被盖住；
+        // 工具条自身在吸收层之后 ⇒ 条上的点击不会被吸收层吃掉。
+        if root.sel-toolbar-shown: Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            background: transparent;
+            // 点条外任意处 = 收起（与飞书一致；不改变文本选区，用户可以继续操作）。
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => { root.sel-toolbar-visible = false; }
+            }
+        }
+        if root.sel-toolbar-shown: SelectionToolbar {
+            anchor-x: root.sel-toolbar-x;
+            anchor-y: root.sel-toolbar-y;
+            avail-width: root.width;
+            copy-clicked => { root.sel-toolbar-visible = false; root.sel-copy(); }
+            quote-clicked => { root.sel-toolbar-visible = false; root.sel-quote(); }
+            speak-clicked => { root.sel-toolbar-visible = false; root.sel-speak(); }
+            close-clicked => { root.sel-toolbar-visible = false; }
+        }
+
         if root.emoji-open || root.more-open || root.session-menu-open || root.model-menu-open: Rectangle {
             x: 0px;
             y: 0px;
@@ -5812,6 +5952,12 @@ export component SystemChatWindow inherits Window {
         // （实测 326−1460 = −1134）。写成正数会被夹回 0 = 等于没滚（上一版就是这么错的一次）。
         root.stick-latch = true;
         flick.content-y = min(0px, flick.height - flick.content-height);
+    }
+    // 消息区一滚，工具条就离开选区了 ⇒ 直接收起（与飞书一致）。
+    // `changed` 只能盯单个属性，故用 watch 单值转接（同 `titlebar-watch` 的手法）。
+    property <length> sel-scroll-watch: flick.content-y;
+    changed sel-scroll-watch => {
+        root.sel-toolbar-visible = false;
     }
     changed follow-epoch => {
         root.stick-latch = flick.content-y <= flick.height - flick.content-height + 8px;

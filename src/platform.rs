@@ -177,7 +177,7 @@ pub fn copy_to_clipboard(text: &str) -> bool {
 /// macOS 走 `NSPasteboard`：`[[NSImage alloc] initWithContentsOfFile:]` → `writeObjects:@[img]`
 /// （`NSImage` 符 `NSPasteboardWriting`，粘贴到其他 App 就是图片本身）。与
 /// [`pasteboard_file_paths`] 同款「手写 objc_msgSend FFI、不引 objc crate」的口径。**主线程**调。
-/// 非 macOS 暂不支持（返回 false，调用方给状态行）。
+/// Windows 有同语义实现（见下方 `cfg(target_os = "windows")` 版本）；其余平台返回 false。
 #[cfg(target_os = "macos")]
 pub fn copy_image_to_clipboard(path: &std::path::Path) -> bool {
     use std::ffi::{c_char, c_void};
@@ -248,7 +248,48 @@ pub fn copy_image_to_clipboard(path: &std::path::Path) -> bool {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows：把图片文件写进系统剪贴板（图片右键「复制」）。
+///
+/// 同时放两种格式，覆盖面最大：
+/// - `CF_DIB`（32 位 BI_RGB）：Office / 微信 / 飞书等通用格式，Windows 还能据此合成
+///   `CF_BITMAP`、`CF_DIBV5`；
+/// - 注册格式 `PNG`：浏览器等现代应用优先取它（无损，含透明）。
+///
+/// 解码直接用 Slint 的图片加载器（与缩略图/消息内图片同一套解码器，png/jpeg/svg 都认），
+/// 不额外引解码依赖。**主线程**调（调用点在 Slint 右键回调）。
+#[cfg(target_os = "windows")]
+pub fn copy_image_to_clipboard(path: &std::path::Path) -> bool {
+    let Ok(img) = slint::Image::load_from_path(path) else {
+        return false;
+    };
+    let Some(px) = img.to_rgba8() else {
+        return false;
+    };
+    let (width, height) = (px.width(), px.height());
+    let Some(dib) = rgba_to_dib(width, height, px.as_bytes()) else {
+        return false;
+    };
+    let png = encode_png_rgba(width, height, px.as_bytes());
+
+    let Some(_clipboard) = win_clipboard::open_with_owner(win_clipboard::clipboard_owner()) else {
+        return false;
+    };
+    if !win_clipboard::empty() {
+        return false;
+    }
+    let dib_ok = win_clipboard::set_bytes(win_clipboard::CF_DIB, &dib);
+    let png_ok = match png.as_deref() {
+        Some(png) => {
+            let format = win_clipboard::register_format(&win_clipboard::PNG_FORMAT_NAME);
+            format != 0 && win_clipboard::set_bytes(format, png)
+        }
+        None => false,
+    };
+    // 任一种格式写成功，接收方就有得取。
+    dib_ok || png_ok
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn copy_image_to_clipboard(_path: &std::path::Path) -> bool {
     false
 }
@@ -354,9 +395,538 @@ pub fn pasteboard_image_path() -> Option<std::path::PathBuf> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+// ───────────── Windows：剪贴板（零依赖 Win32 FFI，对应上面的 macOS NSPasteboard 段）─────────────
+//
+// macOS 走 NSPasteboard；Windows 此前只有「非 mac 返回空」的 stub，于是「复制一张图 →
+// 在输入框 Ctrl+V」什么都不会发生（文本粘贴是 Slint `TextInput` 自己做的，图片/文件没有
+// 对应的文本形态）。这里补齐两件事：
+//   ① CF_HDROP（资源管理器里复制的**文件**）→ 路径列表；
+//   ② 注册格式 "PNG" / CF_DIBV5 / CF_DIB / CF_BITMAP（截图工具、浏览器「复制图片」放的
+//      **位图数据**）→ 临时 PNG 文件。
+// 位图必须落成文件：待发附件链路（`land_attachments`）只收路径，📎 / 拖放 / 截屏都走它。
+// 反方向（图片右键「复制到剪贴板」）由 [`copy_image_to_clipboard`] 的 Windows 版负责：
+// 写 CF_DIB + 注册格式 PNG（系统会据此合成 CF_BITMAP / CF_DIBV5）。
+#[cfg(target_os = "windows")]
+mod win_clipboard {
+    use std::ffi::c_void;
+
+    pub const CF_BITMAP: u32 = 2;
+    pub const CF_DIB: u32 = 8;
+    pub const CF_HDROP: u32 = 15;
+    pub const CF_DIBV5: u32 = 17;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenClipboard(hwnd: *mut c_void) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+        fn GetClipboardData(format: u32) -> *mut c_void;
+        fn SetClipboardData(format: u32, mem: *mut c_void) -> *mut c_void;
+        fn RegisterClipboardFormatW(name: *const u16) -> u32;
+        fn GetActiveWindow() -> *mut c_void;
+        fn GetForegroundWindow() -> *mut c_void;
+        fn GetDesktopWindow() -> *mut c_void;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
+        fn GlobalFree(mem: *mut c_void) -> *mut c_void;
+        fn GlobalLock(mem: *mut c_void) -> *mut c_void;
+        fn GlobalUnlock(mem: *mut c_void) -> i32;
+        fn GlobalSize(mem: *mut c_void) -> usize;
+    }
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn DragQueryFileW(hdrop: *mut c_void, ifile: u32, path: *mut u16, cch: u32) -> u32;
+    }
+
+    /// 剪贴板占用守卫：离开作用域即 `CloseClipboard`（提前 return / panic 都不会漏关）。
+    pub struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // SAFETY: 守卫只在 `OpenClipboard` 成功后构造。
+            unsafe {
+                CloseClipboard();
+            }
+        }
+    }
+
+    /// 注册格式名 `PNG`（NUL 结尾的 UTF-16）。读、写两侧共用，避免两处字面量漂移。
+    pub const PNG_FORMAT_NAME: [u16; 4] = [b'P' as u16, b'N' as u16, b'G' as u16, 0];
+
+    /// 打开剪贴板（**只读**用）。别的进程正占着时短暂重试（复制动作刚结束时很常见）。
+    /// `NULL` = 关联当前任务；返回 `None` = 重试仍拿不到，调用方按「剪贴板里没有东西」处理。
+    pub fn open() -> Option<Guard> {
+        open_with_owner(std::ptr::null_mut())
+    }
+
+    /// 以指定窗口为 owner 打开剪贴板（**写**剪贴板必须走这条）。
+    ///
+    /// 为什么写不能传 `NULL`：`OpenClipboard(NULL)` 之后 `EmptyClipboard` 会把 clipboard
+    /// owner 置为 `NULL`，随后的 `SetClipboardData` **必然失败**（MSDN `EmptyClipboard` /
+    /// `SetClipboardData` 的 Remarks 明说）。读不要求 owner，所以读仍可用 `NULL`。
+    pub fn open_with_owner(owner: *mut c_void) -> Option<Guard> {
+        for _ in 0..10 {
+            // SAFETY: 标准 Win32 调用；owner 为 NULL 或真实 HWND 都是合法入参。
+            if unsafe { OpenClipboard(owner) } != 0 {
+                return Some(Guard);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// 写剪贴板时用的 owner 窗口：优先本线程的活动窗，其次前台窗，最后桌面窗
+    /// （桌面窗永不销毁；它是兜底，保证 `SetClipboardData` 不会因 owner 为 NULL 而失败）。
+    pub fn clipboard_owner() -> *mut c_void {
+        // SAFETY: 三个调用都只查询窗口句柄。
+        unsafe {
+            let active = GetActiveWindow();
+            if !active.is_null() {
+                return active;
+            }
+            let foreground = GetForegroundWindow();
+            if !foreground.is_null() {
+                return foreground;
+            }
+            GetDesktopWindow()
+        }
+    }
+
+    pub fn available(format: u32) -> bool {
+        // SAFETY: 纯查询，无副作用。
+        unsafe { IsClipboardFormatAvailable(format) != 0 }
+    }
+
+    /// 清空剪贴板（写新内容前的第一步）。必须在 [`open`] 的守卫存活期间调。
+    pub fn empty() -> bool {
+        // SAFETY: 剪贴板已打开。
+        unsafe { EmptyClipboard() != 0 }
+    }
+
+    /// 把一段字节作为指定格式写进剪贴板（复制图片用）。
+    ///
+    /// 系统在 `SetClipboardData` 成功后接管这块全局内存，不能再 `GlobalFree`；
+    /// 失败时所有权仍在我们手里，必须自己释放。
+    pub fn set_bytes(format: u32, data: &[u8]) -> bool {
+        // SAFETY: 剪贴板已打开；GMEM_MOVEABLE(0x2) 是 SetClipboardData 的要求。
+        unsafe {
+            let handle = GlobalAlloc(0x0002, data.len());
+            if handle.is_null() {
+                return false;
+            }
+            let ptr = GlobalLock(handle);
+            if ptr.is_null() {
+                GlobalFree(handle);
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
+            GlobalUnlock(handle);
+            if SetClipboardData(format, handle).is_null() {
+                GlobalFree(handle);
+                return false;
+            }
+            true
+        }
+    }
+
+    /// 取注册格式 id（0 = 失败）。调用方保证 `name` 以 0 结尾。
+    pub fn register_format(name: &[u16]) -> u32 {
+        // SAFETY: `name` 是调用方持有的 NUL 结尾 UTF-16 串。
+        unsafe { RegisterClipboardFormatW(name.as_ptr()) }
+    }
+
+    /// 读一个剪贴板格式的全局内存块（拷成 `Vec<u8>`）。格式缺失/空块 ⇒ `None`。
+    /// 必须在 [`open`] 的守卫存活期间调。
+    pub fn read_bytes(format: u32) -> Option<Vec<u8>> {
+        // SAFETY: 剪贴板已打开；句柄归系统所有，只读不释放。
+        unsafe {
+            let handle = GetClipboardData(format);
+            if handle.is_null() {
+                return None;
+            }
+            let len = GlobalSize(handle);
+            if len == 0 {
+                return None;
+            }
+            let ptr = GlobalLock(handle) as *const u8;
+            if ptr.is_null() {
+                return None;
+            }
+            let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+            GlobalUnlock(handle);
+            Some(bytes)
+        }
+    }
+
+    /// 剪贴板里的文件路径（CF_HDROP）。没有文件 ⇒ 空 vec。
+    /// 必须在 [`open`] 的守卫存活期间调。
+    pub fn file_paths() -> Vec<std::path::PathBuf> {
+        if !available(CF_HDROP) {
+            return Vec::new();
+        }
+        // SAFETY: 剪贴板已打开；HDROP 句柄归系统所有，Dragging 查询只读。
+        unsafe {
+            let handle = GetClipboardData(CF_HDROP);
+            if handle.is_null() {
+                return Vec::new();
+            }
+            // 0xFFFFFFFF = 问个数；返回 0 时下面循环自然为空。
+            let count = DragQueryFileW(handle, 0xFFFF_FFFF, std::ptr::null_mut(), 0);
+            let mut out = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                // 先问长度（不含结尾 NUL），再按长度收。
+                let len = DragQueryFileW(handle, i, std::ptr::null_mut(), 0);
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u16; len as usize + 1];
+                let n = DragQueryFileW(handle, i, buf.as_mut_ptr(), buf.len() as u32);
+                if n == 0 {
+                    continue;
+                }
+                buf.truncate(n as usize);
+                out.push(std::path::PathBuf::from(String::from_utf16_lossy(&buf)));
+            }
+            out
+        }
+    }
+
+    /// 剪贴板里的 GDI 位图（CF_BITMAP）→ 标准 32 位 DIB 字节（40 字节头 + 自下而上 BGRA），
+    /// 交给 [`super::dib_to_rgba`] 统一解码。
+    ///
+    /// 系统通常会把 CF_BITMAP 自动合成成 CF_DIB（优先走上面那条路），这里兜的是
+    /// 「只放 CF_BITMAP、合成不出来」的老式工具。必须在这个模块的剪贴板守卫存活期间调。
+    pub fn bitmap_dib() -> Option<Vec<u8>> {
+        #[repr(C)]
+        struct Bitmap {
+            bm_type: i32,
+            bm_width: i32,
+            bm_height: i32,
+            bm_width_bytes: i32,
+            bm_planes: u16,
+            bm_bits_pixel: u16,
+            bm_bits: *mut c_void,
+        }
+        #[repr(C)]
+        struct BitmapInfoHeader {
+            bi_size: u32,
+            bi_width: i32,
+            bi_height: i32,
+            bi_planes: u16,
+            bi_bit_count: u16,
+            bi_compression: u32,
+            bi_size_image: u32,
+            bi_x_pels: i32,
+            bi_y_pels: i32,
+            bi_clr_used: u32,
+            bi_clr_important: u32,
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetDC(hwnd: *mut c_void) -> *mut c_void;
+            fn ReleaseDC(hwnd: *mut c_void, hdc: *mut c_void) -> i32;
+        }
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn CreateCompatibleDC(hdc: *mut c_void) -> *mut c_void;
+            fn DeleteDC(hdc: *mut c_void) -> i32;
+            fn GetObjectW(h: *mut c_void, c: i32, pv: *mut c_void) -> i32;
+            fn GetDIBits(
+                hdc: *mut c_void,
+                hbm: *mut c_void,
+                start: u32,
+                lines: u32,
+                bits: *mut c_void,
+                bmi: *mut BitmapInfoHeader,
+                usage: u32,
+            ) -> i32;
+        }
+
+        // SAFETY: 剪贴板已打开；HBITMAP 归系统所有，只读查询。
+        unsafe {
+            let hbm = GetClipboardData(CF_BITMAP);
+            if hbm.is_null() {
+                return None;
+            }
+            let mut bm: Bitmap = std::mem::zeroed();
+            let bm_size = std::mem::size_of::<Bitmap>() as i32;
+            if GetObjectW(hbm, bm_size, &mut bm as *mut _ as *mut c_void) == 0 {
+                return None;
+            }
+            if bm.bm_width <= 0 || bm.bm_height == 0 {
+                return None;
+            }
+            let (width, height) = (bm.bm_width as usize, bm.bm_height.unsigned_abs() as usize);
+            let stride = width.checked_mul(4)?;
+            let mut pixels = vec![0u8; stride.checked_mul(height)?];
+            let mut bih = BitmapInfoHeader {
+                bi_size: 40,
+                bi_width: bm.bm_width,
+                // 与源位图同向：负数=自上而下，正数=自下而上，`dib_to_rgba` 两种都认。
+                bi_height: bm.bm_height,
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: 0, // BI_RGB
+                bi_size_image: pixels.len() as u32,
+                bi_x_pels: 0,
+                bi_y_pels: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            };
+            let screen = GetDC(std::ptr::null_mut());
+            if screen.is_null() {
+                return None;
+            }
+            let mem = CreateCompatibleDC(screen);
+            let _ = ReleaseDC(std::ptr::null_mut(), screen);
+            if mem.is_null() {
+                return None;
+            }
+            let got = GetDIBits(
+                mem,
+                hbm,
+                0,
+                height as u32,
+                pixels.as_mut_ptr() as *mut c_void,
+                &mut bih as *mut _,
+                0, // DIB_RGB_COLORS
+            );
+            let _ = DeleteDC(mem);
+            if got <= 0 || got as usize != height {
+                return None;
+            }
+            let mut dib = Vec::with_capacity(40 + pixels.len());
+            dib.extend_from_slice(&bih.bi_size.to_le_bytes());
+            dib.extend_from_slice(&bih.bi_width.to_le_bytes());
+            dib.extend_from_slice(&bih.bi_height.to_le_bytes());
+            dib.extend_from_slice(&bih.bi_planes.to_le_bytes());
+            dib.extend_from_slice(&bih.bi_bit_count.to_le_bytes());
+            dib.extend_from_slice(&bih.bi_compression.to_le_bytes());
+            dib.extend_from_slice(&bih.bi_size_image.to_le_bytes());
+            dib.extend_from_slice(&bih.bi_x_pels.to_le_bytes());
+            dib.extend_from_slice(&bih.bi_y_pels.to_le_bytes());
+            dib.extend_from_slice(&bih.bi_clr_used.to_le_bytes());
+            dib.extend_from_slice(&bih.bi_clr_important.to_le_bytes());
+            dib.extend_from_slice(&pixels);
+            Some(dib)
+        }
+    }
+}
+
+/// Windows：剪贴板里的**位图数据**（截图工具 / 浏览器「复制图片」）⇒ 临时 PNG 路径。
+///
+/// 优先用应用自己注册的 `PNG` 格式（原样落盘、无损），没有才把 CF_DIBV5 / CF_DIB /
+/// CF_BITMAP 解成 RGBA 再编码。没有图片返回 `None`（文本粘贴仍由 Slint `TextInput` 处理）。**主线程**调
+/// （调用点在 Slint 的 winit 事件钩子，与 macOS 侧同一条约束）。
+#[cfg(target_os = "windows")]
+pub fn pasteboard_image_path() -> Option<std::path::PathBuf> {
+    let _clipboard = win_clipboard::open()?;
+
+    // ① 应用注册的 PNG 格式：浏览器 / 部分截图工具会放一份原图。
+    let png_format = win_clipboard::register_format(&win_clipboard::PNG_FORMAT_NAME);
+    if png_format != 0 && win_clipboard::available(png_format) {
+        let path = win_clipboard::read_bytes(png_format)
+            .filter(|b| crate::screenshot::looks_like_png(b))
+            .and_then(|b| write_temp_png(&b));
+        if let Some(p) = path {
+            return Some(p);
+        }
+    }
+
+    // ② DIBV5（带 alpha）优先于 DIB。
+    for format in [win_clipboard::CF_DIBV5, win_clipboard::CF_DIB] {
+        if !win_clipboard::available(format) {
+            continue;
+        }
+        let path = win_clipboard::read_bytes(format)
+            .and_then(|dib| dib_to_rgba(&dib))
+            .and_then(|(w, h, rgba)| encode_png_rgba(w, h, &rgba))
+            .and_then(|png| write_temp_png(&png));
+        if let Some(p) = path {
+            return Some(p);
+        }
+    }
+
+    // ③ 只放了 CF_BITMAP 的老式工具（系统通常能合成 CF_DIB，但不保证）。
+    if win_clipboard::available(win_clipboard::CF_BITMAP) {
+        let path = win_clipboard::bitmap_dib()
+            .and_then(|dib| dib_to_rgba(&dib))
+            .and_then(|(w, h, rgba)| encode_png_rgba(w, h, &rgba))
+            .and_then(|png| write_temp_png(&png));
+        if let Some(p) = path {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn pasteboard_image_path() -> Option<std::path::PathBuf> {
     None
+}
+
+/// RGBA 像素 → PNG 字节（`image` 只开了 png 特性，够用）。
+#[cfg(any(target_os = "windows", test))]
+fn encode_png_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    use image::ImageEncoder;
+
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
+        .ok()?;
+    Some(png)
+}
+
+/// 把 PNG 字节落到临时文件（与 macOS 侧同名口径：`abb-paste-<pid>-<毫秒>.png`）。
+#[cfg(target_os = "windows")]
+fn write_temp_png(bytes: &[u8]) -> Option<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("abb-paste-{}-{stamp}.png", std::process::id()));
+    std::fs::write(&path, bytes).ok()?;
+    Some(path)
+}
+
+/// 剪贴板位图（CF_DIB / CF_DIBV5 的字节）→ `(宽, 高, RGBA 像素)`。
+///
+/// 只接实际会出现在剪贴板里的组合：24/32 位 + BI_RGB / BI_BITFIELDS（截图工具、浏览器
+/// 「复制图片」都是这些）。调色板位图（≤ 8 位）等少见形态返回 `None` —— 上层据此落回
+/// 「剪贴板里没有图片」，文本粘贴不受影响。纯函数，判据在单测里。
+#[cfg(any(target_os = "windows", test))]
+fn dib_to_rgba(dib: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    const BI_RGB: u32 = 0;
+    const BI_BITFIELDS: u32 = 3;
+
+    let u32_at = |o: usize| Some(u32::from_le_bytes(dib.get(o..o + 4)?.try_into().ok()?));
+    let i32_at = |o: usize| Some(i32::from_le_bytes(dib.get(o..o + 4)?.try_into().ok()?));
+    let u16_at = |o: usize| Some(u16::from_le_bytes(dib.get(o..o + 2)?.try_into().ok()?));
+
+    let header_size = u32_at(0)? as usize;
+    if header_size < 40 || header_size > dib.len() {
+        return None;
+    }
+    let width = i32_at(4)?;
+    let height_raw = i32_at(8)?;
+    let bit_count = u16_at(14)?;
+    let compression = u32_at(16)?;
+    if width <= 0 || height_raw == 0 || !matches!(bit_count, 24 | 32) {
+        return None;
+    }
+    // 方向：正高 = 自下而上（DIB 的老规矩），负高 = 自上而下。
+    let (width, height, top_down) = (
+        width as usize,
+        height_raw.unsigned_abs() as usize,
+        height_raw < 0,
+    );
+
+    // 通道掩码：24/32 位 BI_RGB 用标准 BGR(A) 布局；BI_BITFIELDS 的掩码在 V4/V5 头里自带
+    // （≥ 52 字节头），否则紧随 40 字节头之后的 3 个 DWORD。
+    let (r_mask, g_mask, b_mask, a_mask, pixels_at) = match (compression, bit_count) {
+        (BI_RGB, 24) => (0x00FF_0000, 0x0000_FF00, 0x0000_00FF, 0, header_size),
+        // BI_RGB 的 32 位不定义 alpha（第 4 字节按规范是「未使用」）：一律按不透明解。
+        // 截图/办公工具常在这里留下 0 或 0xCD 之类的垃圾值，当真用会让整张图发虚透底；
+        // 真要透明度的来源会用 BI_BITFIELDS（V4/V5 头带 alpha 掩码）或注册格式 PNG。
+        (BI_RGB, 32) => (0x00FF_0000, 0x0000_FF00, 0x0000_00FF, 0, header_size),
+        (BI_BITFIELDS, _) if header_size >= 52 => (
+            u32_at(40)?,
+            u32_at(44)?,
+            u32_at(48)?,
+            if header_size >= 56 { u32_at(52)? } else { 0 },
+            header_size,
+        ),
+        (BI_BITFIELDS, _) => (u32_at(40)?, u32_at(44)?, u32_at(48)?, 0, 52),
+        _ => return None,
+    };
+
+    let stride = width.checked_mul(bit_count as usize)?.checked_add(31)? / 32 * 4;
+    if pixels_at.checked_add(stride.checked_mul(height)?)? > dib.len() {
+        return None;
+    }
+
+    // 掩码 → 8 位：按掩码最低位对齐后线性拉伸（非标准掩码也能正确取色）。
+    let channel = |value: u32, mask: u32| -> u8 {
+        if mask == 0 {
+            return 0;
+        }
+        let shift = mask.trailing_zeros();
+        let max = mask >> shift;
+        let raw = (value & mask) >> shift;
+        ((raw as u64 * 255 + (max as u64) / 2) / max as u64) as u8
+    };
+
+    let bpp = (bit_count / 8) as usize;
+    let mut rgba = vec![0u8; width * height * 4];
+    for y in 0..height {
+        let src_y = if top_down { y } else { height - 1 - y };
+        let row = &dib[pixels_at + src_y * stride..pixels_at + (src_y + 1) * stride];
+        let dst = &mut rgba[y * width * 4..(y + 1) * width * 4];
+        for x in 0..width {
+            let px = &row[x * bpp..x * bpp + bpp];
+            let value = if bpp == 4 {
+                u32::from_le_bytes([px[0], px[1], px[2], px[3]])
+            } else {
+                u32::from_le_bytes([px[0], px[1], px[2], 0])
+            };
+            let o = x * 4;
+            dst[o] = channel(value, r_mask);
+            dst[o + 1] = channel(value, g_mask);
+            dst[o + 2] = channel(value, b_mask);
+            dst[o + 3] = if a_mask != 0 {
+                channel(value, a_mask)
+            } else {
+                255
+            };
+        }
+    }
+    Some((width as u32, height as u32, rgba))
+}
+
+/// RGBA 像素 → 标准 32 位 CF_DIB 字节（40 字节头 + 自下而上 BGRA），供「复制图片」写剪贴板。
+///
+/// alpha 一律写 255：CF_DIB 的 `BI_RGB` 32 位格式里 alpha 是未定义位，填 0 会让一部分
+/// 接收方把整张图当透明。要与 [`dib_to_rgba`] 保持双向可逆（单测钉住）。
+#[cfg(any(target_os = "windows", test))]
+fn rgba_to_dib(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let (w, h) = (width as usize, height as usize);
+    let needed = w.checked_mul(h)?.checked_mul(4)?;
+    if w == 0 || h == 0 || rgba.len() < needed {
+        return None;
+    }
+    let stride = w * 4;
+    let mut dib = Vec::with_capacity(40 + stride * h);
+    dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+    dib.extend_from_slice(&(width as i32).to_le_bytes());
+    dib.extend_from_slice(&(height as i32).to_le_bytes()); // 正数 = 自下而上
+    dib.extend_from_slice(&1u16.to_le_bytes()); // planes
+    dib.extend_from_slice(&32u16.to_le_bytes()); // bit count
+    dib.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+    dib.extend_from_slice(&((stride * h) as u32).to_le_bytes()); // sizeImage
+    dib.extend_from_slice(&[0u8; 16]); // ppm ×2 / clrUsed / clrImportant
+    for y in (0..h).rev() {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            dib.extend_from_slice(&[rgba[i + 2], rgba[i + 1], rgba[i], 255]);
+        }
+    }
+    Some(dib)
+}
+
+/// 这是不是 [`pasteboard_image_path`] 落出来的粘贴中转文件？
+///
+/// 判定同时看**目录**与**命名**：`<系统临时目录>/abb-paste-<pid>-<毫秒>.{png,tiff}`。
+/// 附件落地是「复制进工作区」，原件没有别的消费者 ⇒ 落地成功后调用方可以删掉它，
+/// 否则长期 Ctrl+V 会把系统临时目录堆满。用户自己的文件（哪怕同名）绝不能被这个判据命中。
+pub fn is_paste_temp_path(path: &std::path::Path) -> bool {
+    path.parent() == Some(std::env::temp_dir().as_path())
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("abb-paste-"))
 }
 
 /// 当前可执行文件路径（GUI 本体）。
@@ -988,8 +1558,18 @@ pub fn pasteboard_file_paths() -> Vec<PathBuf> {
     }
 }
 
-/// 非 macOS：剪贴板文件读取未实现，返回空（文本粘贴仍由 Slint TextInput 自己处理）。
-#[cfg(not(target_os = "macos"))]
+/// Windows：剪贴板里的**文件**（资源管理器 Ctrl+C）⇒ 路径列表。
+/// 纯图片数据（CF_DIB / PNG）不在这里，由 [`pasteboard_image_path`] 兜底。
+#[cfg(target_os = "windows")]
+pub fn pasteboard_file_paths() -> Vec<PathBuf> {
+    let Some(_clipboard) = win_clipboard::open() else {
+        return Vec::new();
+    };
+    win_clipboard::file_paths()
+}
+
+/// 非 macOS / Windows：剪贴板文件读取未实现，返回空（文本粘贴仍由 Slint TextInput 自己处理）。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn pasteboard_file_paths() -> Vec<PathBuf> {
     Vec::new()
 }
@@ -3378,5 +3958,138 @@ mod tts_speaker_tests {
         let mut sp = Speaker::new();
         assert!(!sp.speak("不该出声"));
         assert!(!sp.is_speaking());
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::{dib_to_rgba, encode_png_rgba, rgba_to_dib};
+
+    /// 拼一个最小 BITMAPINFOHEADER + 像素的 DIB（只造剪贴板里真实会出现的 24/32 位形态）。
+    fn make_dib(width: i32, height: i32, bit_count: u16, compress: u32, pixels: &[u8]) -> Vec<u8> {
+        let mut d = Vec::with_capacity(40 + pixels.len());
+        d.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        d.extend_from_slice(&width.to_le_bytes());
+        d.extend_from_slice(&height.to_le_bytes());
+        d.extend_from_slice(&1u16.to_le_bytes()); // planes
+        d.extend_from_slice(&bit_count.to_le_bytes());
+        d.extend_from_slice(&compress.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes()); // sizeImage
+        d.extend_from_slice(&[0u8; 16]); // ppm ×2 / clrUsed / clrImportant
+        d.extend_from_slice(pixels);
+        d
+    }
+
+    /// 32 位 BI_RGB：BGRA 字节序 + 自下而上的行序；alpha 字节按规范未定义，
+    /// 无论填 0 还是垃圾值（这里用 0xCD）都必须按不透明解。
+    ///
+    /// 判别力：行序不翻转 ⇒ 红/蓝与绿/白两排互换（红）；把 alpha 当真 ⇒ 四项全红。
+    #[test]
+    fn dib32_rgb_is_bottom_up_and_ignores_undefined_alpha() {
+        let mut px = Vec::new();
+        // 内存里的第一行 = 画面最下面一行：红、蓝（alpha 故意填 0）
+        px.extend_from_slice(&[0, 0, 255, 0]);
+        px.extend_from_slice(&[255, 0, 0, 0]);
+        // 第二行 = 画面上面一行：绿、白（alpha 故意填垃圾值）
+        px.extend_from_slice(&[0, 255, 0, 0xCD]);
+        px.extend_from_slice(&[255, 255, 255, 0x7F]);
+        let dib = make_dib(2, 2, 32, 0, &px);
+        let (w, h, rgba) = dib_to_rgba(&dib).expect("32 位 BI_RGB 应能解析");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(
+            rgba,
+            vec![
+                0, 255, 0, 255, // 上排左：绿
+                255, 255, 255, 255, // 上排右：白
+                255, 0, 0, 255, // 下排左：红
+                0, 0, 255, 255, // 下排右：蓝
+            ]
+        );
+    }
+
+    /// 24 位 + 负高（自上而下）：行序不翻转，且行尾 4 字节对齐的填充不能读进像素。
+    ///
+    /// 判别力：按正高处理 ⇒ 红/绿互换（红）；stride 用 width*3 ⇒ 第二行起点错位（红）。
+    #[test]
+    fn dib24_top_down_keeps_row_order_and_stride() {
+        let dib = make_dib(1, -2, 24, 0, &[0, 0, 255, 0xAA, 0, 255, 0, 0xBB]);
+        let (w, h, rgba) = dib_to_rgba(&dib).expect("24 位应能解析");
+        assert_eq!((w, h), (1, 2));
+        assert_eq!(
+            rgba,
+            vec![255, 0, 0, 255, 0, 255, 0, 255],
+            "第一行红、第二行绿"
+        );
+    }
+
+    /// 不常见/坏数据必须返回 None（调用方据此落回「没有图片」），而不是 panic 或乱读。
+    #[test]
+    fn dib_rejects_unsupported_or_truncated_data() {
+        assert!(dib_to_rgba(&[]).is_none(), "空数据");
+        let eight = make_dib(1, 1, 8, 0, &[0, 0, 0, 0]);
+        assert!(dib_to_rgba(&eight).is_none(), "8 位调色板不接");
+        // 头说 2 行、实际只给了 1 行 ⇒ 越界，必须拒绝
+        let mut truncated = make_dib(1, 2, 24, 0, &[0, 0, 255, 0]);
+        truncated.truncate(40 + 4);
+        assert!(dib_to_rgba(&truncated).is_none(), "像素不够长");
+    }
+
+    /// 编码出的 PNG 能被解码器读回（缩略图/落地链路依赖这个）。
+    #[test]
+    fn encoded_png_roundtrips_rgba() {
+        let png = encode_png_rgba(1, 1, &[1, 2, 3, 4]).expect("PNG 编码应成功");
+        let img = image::load_from_memory(&png).expect("PNG 应能解码");
+        assert_eq!(img.to_rgba8().get_pixel(0, 0).0, [1, 2, 3, 4]);
+    }
+
+    /// 「复制图片」的编码：RGBA → CF_DIB → 解码回 RGBA。颜色与行序必须不变；
+    /// alpha 统一按不透明写（CF_DIB 的 alpha 位未定义，0 会被部分接收方当全透明）。
+    ///
+    /// 判别力：行序不翻转 ⇒ 上下两排互换（红）；alpha 不补 255 ⇒ 绿/自定义色两项红。
+    #[test]
+    fn rgba_dib_roundtrip_keeps_colors_and_forces_opaque() {
+        let rgba = vec![
+            255, 0, 0, 255, // 上排左：红
+            0, 255, 0, 128, // 上排右：绿（半透明也按不透明写）
+            0, 0, 255, 255, // 下排左：蓝
+            10, 20, 30, 40, // 下排右：自定义色
+        ];
+        let dib = rgba_to_dib(2, 2, &rgba).expect("应能编码");
+        let (w, h, back) = dib_to_rgba(&dib).expect("应能解码");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(
+            back,
+            vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 10, 20, 30, 255,]
+        );
+    }
+
+    /// 尺寸与缓冲区不一致必须拒绝（防越界读写）。
+    #[test]
+    fn rgba_to_dib_rejects_short_buffer() {
+        assert!(rgba_to_dib(0, 1, &[]).is_none(), "零宽");
+        assert!(rgba_to_dib(2, 2, &[0; 8]).is_none(), "2x2 需要 16 字节");
+        assert!(
+            rgba_to_dib(1, 1, &[1, 2, 3, 4]).is_some(),
+            "1x1 恰好 4 字节"
+        );
+    }
+
+    /// 粘贴中转文件的判据：**临时目录 + `abb-paste-` 前缀**，两条缺一不可。
+    /// 判据过宽会删用户文件，过窄则临时文件继续堆积。
+    #[test]
+    fn paste_temp_path_requires_both_temp_dir_and_prefix() {
+        let tmp = std::env::temp_dir();
+        assert!(super::is_paste_temp_path(
+            &tmp.join("abb-paste-123-456.png")
+        ));
+        assert!(super::is_paste_temp_path(&tmp.join("abb-paste-9-1.tiff")));
+        assert!(
+            !super::is_paste_temp_path(&tmp.join("photo.png")),
+            "前缀不对"
+        );
+        assert!(
+            !super::is_paste_temp_path(std::path::Path::new("/elsewhere/abb-paste-123-456.png")),
+            "目录不对"
+        );
     }
 }
