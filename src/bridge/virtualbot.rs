@@ -23,6 +23,17 @@ impl Bridge {
     }
 }
 
+/// 带进批次的桥侧代际（= 本轮 `sessions.json` 里的 session_id）。
+///
+/// 单独立成函数只为一个目的（评审 BLOCKING-2）：**接线可测**。
+/// `/new` 与 `$ABB_BIN session reset` 换的是这个值；执行层看不见它、只按 channel_id
+/// 复用 ACP 会话，所以必须每轮把它带出去让 pool 比对。若哪天被写成
+/// `String::new()`（功能静默失效、`/new` 又变回假的），下面 `bridge_generation_`
+/// 用例会当场红，而不是四门禁全绿。
+fn bridge_generation_for(session_id: &str) -> String {
+    session_id.to_string()
+}
+
 /// #206：runtime 通道资格预检的失败面（dispatch 与 /cancel 共用判据、各自表述
 /// 文案——判据只有一处，杜绝两处预检漂移）。P2.2 起角色不再是拒绝理由而是实例
 /// 选择器（granted → 受限实例）；/cancel 与 dispatch 均按角色选实例，判据一致。
@@ -966,7 +977,7 @@ impl Bridge {
                     // 执行层按 channel_id 复用 ACP 会话，看不见 `/new` 换的桥侧 UUID，
                     // 于是「全新上下文」是假的。带上寄送时的 sid，pool 见代际不符即
                     // 失效重建——`/new` 与跨进程 `$ABB_BIN session reset` 一并覆盖。
-                    bridge_generation: session_id.clone(),
+                    bridge_generation: bridge_generation_for(&session_id),
                 },
             ) {
                 if let Err(e) = self
@@ -1642,5 +1653,75 @@ mod send_failure_keeps_pending_guard_tests {
             src.contains("回复发送失败，保留 pending 以便重启补发"),
             "失败分支必须留痕并保留条目"
         );
+    }
+}
+
+/// 桥侧代际接线的回归（评审 BLOCKING-2）。
+///
+/// 这是 `/new` 整条链的**入口**：它一旦失效（返回空串），执行层的代际比对就整段
+/// 短路（空串 = 不校验），`/new` 又变回「只换桥侧 UUID、上下文照旧」。
+///
+/// 用**真实 `SessionStore`** 驱动，而不是拿字符串假装：只有真的把 `/new` 走的
+/// `reset_session` 跑一遍，才能钉住「下一条消息带的是**新** sid」这个语义。
+#[cfg(test)]
+mod bridge_generation_tests {
+    use super::bridge_generation_for;
+
+    /// `/new` 之后，下一条消息携带的代际必须与之前**不同**。
+    ///
+    /// 变异：把 `bridge_generation_for` 改成返回 `String::new()` ⇒ 两条相等 ⇒ 红。
+    #[test]
+    fn new_session_yields_a_different_generation() {
+        let dir = std::env::temp_dir().join(format!(
+            "abb-vb-gen-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let store = crate::sessions::SessionStore::at(dir.join("sessions.json"));
+
+        let (sid_before, _) = store.ensure_with_started("oc_gen");
+        let gen_before = bridge_generation_for(&sid_before);
+
+        // `/new` 的真实路径（src/bridge/virtualbot.rs 的 /new 分支调的就是它）。
+        let sid_after = store.reset_session("oc_gen");
+        let gen_after = bridge_generation_for(&sid_after);
+
+        assert_ne!(
+            gen_before, gen_after,
+            "/new 之后代际必须变，否则执行层看不出要重建会话"
+        );
+        assert_eq!(
+            gen_after, sid_after,
+            "带出去的代际必须就是当前桥侧 session_id 本身"
+        );
+        assert_eq!(
+            store.ensure_with_started("oc_gen").0,
+            sid_after,
+            "reset 后的槽位值应与带出去的代际一致（同一真相源）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同一会话的消息代际稳定（否则每轮都会丢上下文重建）。
+    #[test]
+    fn same_session_yields_the_same_generation() {
+        let dir = std::env::temp_dir().join(format!(
+            "abb-vb-gen-stable-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let store = crate::sessions::SessionStore::at(dir.join("sessions.json"));
+
+        let (sid, _) = store.ensure_with_started("oc_stable");
+        assert_eq!(
+            bridge_generation_for(&sid),
+            bridge_generation_for(&store.ensure_with_started("oc_stable").0),
+            "同一会话轮次之间代际不得变动"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

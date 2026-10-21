@@ -277,6 +277,39 @@ fn forget_source(registry: &SessionRegistry, agent_index: usize, source: &Prompt
     }
 }
 
+/// 批次携带的桥侧代际：取**最后一条非空**值。
+///
+/// 为什么不是第一条：批次可能跨越 `/new`（队列里既有旧代际也有新代际的消息），
+/// 最终会跑到的是新代际，按它为谁判才不会「重建完又立刻再重建一次」。
+/// 全空（oneshot / 内部构造路径）⇒ `None` = 不校验。
+fn last_non_empty_generation(batch: &FlushBatch) -> Option<&str> {
+    batch
+        .events
+        .iter()
+        .rev()
+        .map(|e| e.msg.bridge_generation.as_str())
+        .find(|g| !g.is_empty())
+}
+
+/// 该频道的执行层会话是不是**陈旧**的（需失效重建）。
+///
+/// 桥侧 `/new` / `$ABB_BIN session reset` 换的是 `sessions.json` 里的 UUID，而执行层
+/// 按 `channel_id` 复用 ACP 会话——两套账。`want`（本批带来的桥侧代际）与建会话时
+/// 记下的不一致 ⇒ 用户已经要了新会话，这份必须丢。
+///
+/// 为何是独立函数而不是内联：评审 BLOCKING-1——单测若自己重写一遍判定，断言的
+/// 是**拷贝**而非生产路径（实测：把生产侧改成恒 `false`，拷贝式单测仍全绿）。
+/// 生产与单测共用此函数，变异才能咬得住。
+pub(crate) fn is_stale_session(state: &SessionState, channel_id: Uuid, want: &str) -> bool {
+    match state.generations.get(&channel_id) {
+        Some(have) => have != want,
+        // 没记过代际的**存量会话**（升级前建的）：判陈旧一次，让它在下一批重建。
+        // 取舍：宁可丢一次上下文，也不让旧上下文冒充新会话。
+        // 无会话时返回 false——没东西可丢（真正的会话在下面建立时补记代际）。
+        None => state.sessions.contains_key(&channel_id),
+    }
+}
+
 pub struct AgentPool {
     agents: Vec<Option<OwnedAgent>>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
@@ -1203,29 +1236,19 @@ pub async fn run_prompt_task(
         None
     };
 
+    let batch_generation = last_non_empty_generation(&batch);
+
     // 桥侧代际变更检测（卡 abb-new-does-not-reset-agent-20261021）：`/new` 与
     // `$ABB_BIN session reset` 换的只是桥侧 UUID（`sessions.json`），而执行层按
     // `agent.state.sessions[channel_id]` 复用 ACP 会话——两者是两套账。代际不符即
     // 失效重建，否则「✅ 已新建会话，下一条消息开始全新上下文」是一句假话，且旧上下文
     // 里的图片 base64 会把这个频道的请求体持绡撑到上游 413（另一张卡）。
     //
-    // 取**批内最后一条非空代际**：批次可能跨越 `/new`（队列里既有新代际的也有旧代际的
-    // 消息），最终会跑到的是新代际，按它判定才不会重建完又立刻再重建一次。
-    // 空串（oneshot / 内部构造路径）不参与比对——语义与改造前一致。
-    let batch_generation = batch
-        .events
-        .iter()
-        .rev()
-        .map(|e| e.msg.bridge_generation.as_str())
-        .find(|g| !g.is_empty());
+    // 判据抽成 [`is_stale_session`]：生产代码与单测**共同调用**它。评审 BLOCKING-1
+    // 指出的正事：之前单测把判定逻辑拄了一份拷贝，断言的是拷贝而不是生产路径，
+    // 改生产也测不出来。
     if let Some(want) = batch_generation {
-        let have = agent.state.generations.get(&batch.channel_id);
-        let stale = match have {
-            Some(have) => have != want,
-            // 没记过代际的存量会话：只在有会话时才可能不一致（全新会话在下面建立时补记）。
-            None => agent.state.sessions.contains_key(&batch.channel_id),
-        };
-        if stale {
+        if is_stale_session(&agent.state, batch.channel_id, want) {
             crate::log!(
                 "[bridge] 桥侧会话代际已变，失效执行层会话重建 channel={}",
                 batch.channel_id
@@ -2046,7 +2069,9 @@ mod bridge_generation_tests {
     /// `/new` 换桥侧 UUID 后，执行层那份会话必须被判陈旧（卡
     /// `abb-new-does-not-reset-agent-20261021` 的根因回归）。
     ///
-    /// 判别力：去掉 `stale` 判定（改成恒 false）⇒ 本条红。
+    /// **调用生产函数 `is_stale_session`**，不再自己抄一份判定（评审 BLOCKING-1：
+    /// 抄一份的话，把生产侧改成恒 `false` 本条仍绿）。
+    /// 变异：`is_stale_session` 改为恒 `false` ⇒ 本条红。
     #[test]
     fn changed_generation_marks_session_stale() {
         let ch = Uuid::new_v4();
@@ -2055,14 +2080,10 @@ mod bridge_generation_tests {
         state.generations.insert(ch, "sid-old".to_string());
 
         // 桥侧已换 UUID（/new）⇒ 批次带来的代际与记录不符。
-        let want = "sid-new";
-        let have = state.generations.get(&ch);
-        assert_eq!(have.map(String::as_str), Some("sid-old"));
-        let stale = match have {
-            Some(have) => have != want,
-            None => state.sessions.contains_key(&ch),
-        };
-        assert!(stale, "代际不符必须判陈旧");
+        assert!(
+            is_stale_session(&state, ch, "sid-new"),
+            "代际不符必须判陈旧"
+        );
     }
 
     /// 同一代际的后续批次不得反复重建（否则每轮都在丢上下文）。
@@ -2073,30 +2094,29 @@ mod bridge_generation_tests {
         state.sessions.insert(ch, "exec-abb-2".to_string());
         state.generations.insert(ch, "sid-same".to_string());
 
-        let want = "sid-same";
-        let have = state.generations.get(&ch);
-        let stale = match have {
-            Some(have) => have != want,
-            None => state.sessions.contains_key(&ch),
-        };
-        assert!(!stale, "代际相同必须复用");
+        assert!(
+            !is_stale_session(&state, ch, "sid-same"),
+            "代际相同必须复用"
+        );
     }
 
     /// 存量会话（升级前建的、没记过代际）遇上有代际的批次 ⇒ 判陈旧重建一次。
-    /// 这是「宁可重建一次，也不能让旧上下文冒充新会话」的取舍。
+    /// 这是「宁可重建一次，也不能让旧上下文冒充新会话」的取舍（评审 NB-2）。
     #[test]
     fn legacy_session_without_recorded_generation_is_stale() {
         let ch = Uuid::new_v4();
         let mut state = SessionState::default();
         state.sessions.insert(ch, "exec-abb-1".to_string());
 
-        let want = "sid-any";
-        let have = state.generations.get(&ch);
-        let stale = match have {
-            Some(have) => have != want,
-            None => state.sessions.contains_key(&ch),
-        };
-        assert!(stale);
+        assert!(is_stale_session(&state, ch, "sid-any"));
+    }
+
+    /// 该频道压根没有会话 ⇒ 不陈旧（没东西可丢；会话在下面建立时补记代际）。
+    #[test]
+    fn channel_without_session_is_not_stale() {
+        let ch = Uuid::new_v4();
+        let state = SessionState::default();
+        assert!(!is_stale_session(&state, ch, "sid-any"));
     }
 
     /// `/new` 之后失效：代际记录随会话一起清掉，不留陈旧条目。
@@ -2110,5 +2130,44 @@ mod bridge_generation_tests {
         assert!(state.invalidate_channel(&ch));
         assert!(!state.generations.contains_key(&ch), "代际记录须同生共死");
         assert!(!state.sessions.contains_key(&ch));
+    }
+
+    /// `last_non_empty_generation`：批次跨越 `/new` 时取**最后一条非空**代际。
+    ///
+    /// 为什么不能取第一条：队列里可能既有旧代际也有新代际的消息，最终会跑到的是
+    /// 新代际；按旧的判会「重建完又立刻再重建一次」。
+    /// 变异：改成 `.find()` 正序 ⇒ 本条红。
+    #[test]
+    fn batch_generation_takes_the_last_non_empty() {
+        use crate::runtime::queue::{BatchEvent, InboundMsg};
+
+        let ch = Uuid::new_v4();
+        let mk = |gen: &str, id: &str| BatchEvent {
+            msg: InboundMsg {
+                id_hex: id.to_string(),
+                author_role: "user".to_string(),
+                text: "x".to_string(),
+                ts_secs: 0,
+                prompt_tag: "channel_message".to_string(),
+                bridge_generation: gen.to_string(),
+            },
+            received_at: std::time::Instant::now(),
+        };
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![mk("sid-old", "a"), mk("", "b"), mk("sid-new", "c")],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        assert_eq!(last_non_empty_generation(&batch), Some("sid-new"));
+
+        // 全空（oneshot / 内部构造路径）⇒ None = 不校验。
+        let empty = FlushBatch {
+            channel_id: ch,
+            events: vec![mk("", "d")],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        assert_eq!(last_non_empty_generation(&empty), None);
     }
 }
