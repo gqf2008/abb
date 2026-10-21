@@ -1,0 +1,49 @@
+[
+  {
+    "entry": {
+      "kind": "issue",
+      "id": "t",
+      "actor": "author",
+      "ts": 100,
+      "body": {
+        "title": "t",
+        "body": "b"
+      }
+    },
+    "oid": "i1",
+    "principal": "author",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "patch",
+      "id": "t",
+      "actor": "abb-coordinator",
+      "ts": 1000000,
+      "body": {
+        "title": "fix",
+        "body": "x",
+        "state": "needs-review"
+      }
+    },
+    "oid": "p1",
+    "principal": "abb-coordinator",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "review",
+      "id": "t",
+      "actor": "abb-coordinator",
+      "ts": 1000001,
+      "body": {
+        "decision": "approve",
+        "agent": "abb-coordinator",
+        "note": "findings: blocking=0 non-blocking=1\n\n- [non-blocking] n1\n"
+      }
+    },
+    "oid": "r1",
+    "principal": "abb-coordinator",
+    "verified": true
+  }
+]

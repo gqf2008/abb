@@ -42,14 +42,15 @@ echo "── check_review_cadence 自测（contract-ts=${ts}）"
 
 # ── 合规样本（rc=0）─────────────────────────────────────────────────────────
 for s in ok_basic ok_comment_exempt ok_comment_exempt_blocking ok_no_reviews ok_merge_resolved ok_historical_missing \
-         ok_unknown_decision_historical; do
+         ok_unknown_decision_historical ok_same_reviewer_multi_round ok_unverified_comment; do
   expect_rc "合规：$s" 0 "$check" --json "$samples/$s.json" --contract-ts "$ts"
 done
 
 # ── 违规样本（rc=1）─────────────────────────────────────────────────────────
 for s in bad_missing_after_threshold bad_missing_at_threshold bad_label_mismatch \
          bad_clean_but_request_changes bad_blocking_but_approve bad_three_rounds \
-         bad_merge_unresolved bad_premerge_unresolved bad_unknown_decision_after_threshold; do
+         bad_merge_unresolved bad_premerge_unresolved bad_unknown_decision_after_threshold \
+         bad_self_review bad_final_review_by_merger bad_unverified_patch; do
   expect_rc "违规：$s" 1 "$check" --json "$samples/$s.json" --contract-ts "$ts"
 done
 
