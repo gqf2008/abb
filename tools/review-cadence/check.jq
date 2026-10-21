@@ -117,7 +117,7 @@ def label_counts:
           | map(select(.ts >= $contract_ts
                        and (.decision == "approve" or .decision == "request_changes"))) ) as $post
         | if ($post | length) > 0 then
-            ($post[-1]) as $v
+            ($post | max_by(.ts)) as $v
             | if ($v.decision != "approve"
                   or ($v.contract != null and $v.contract.blocking > 0)) then
                 "thread 最后一条判决类 review（\($v.oid)）不是 blocking=0 的 approve（decision=\($v.decision)）⇒ 不得合并"
@@ -141,12 +141,16 @@ def label_counts:
       #     的历史是「coordinator 自审 → 被发现 → patch 重签为真实作者 → 另人 approve」，
       #     若逐条判则那条已纠正的自审会永久锁死该卡。历史自审改由 summary 里的
       #     `self_reviews_historical` 计数上报（告警，不阻塞）。
+      #     **取 max_by(.ts) 而不是数组末元素**（评审 abb-reviewer-141 的 NB-1）：
+      #     thread JSON 是 parent-ordered，数组顺序不等于 ts 顺序；而 `ts` 由客户端在
+      #     签名时写入、不是服务端盖章 ⇒ 构造「self 的 review ts 更晚却排在数组前面」
+      #     即可绕过。同一条 thread 里 (c)/(e) 也一律改用 max_by(.ts)。
       #     口径：只看 ts ≥ 契约阈值的 review（历史条目豁免，与 (a) 同口径）。
       ( ( $reviews
           | map(select(.ts >= $contract_ts
                        and (.decision == "approve" or .decision == "request_changes"))) ) as $judged
         | if ($judged | length) > 0 then
-            ($judged[-1]) as $r
+            ($judged | max_by(.ts)) as $r
             | ( $patches | map(select(.ts < $r.ts)) | last ) as $p
             | if $p != null and $p.actor != null and $r.actor == $p.actor then
                 "\($r.oid): 最后一条判决类 review 的 actor=\($r.actor) 也是它所审 patch \($p.oid) 的作者 ⇒ 自审不算独立评审（§0b）"
@@ -162,7 +166,7 @@ def label_counts:
                          and (.decision == "approve" or .decision == "request_changes"))) ) as $post2
           | ($merge_items[-1]) as $m
           | if ($post2 | length) > 0 then
-              ($post2[-1]) as $last
+              ($post2 | max_by(.ts)) as $last
               | if ($m.actor != null and $last.actor != null and $m.actor == $last.actor) then
                   "\($last.oid): 终审 review 与 merge_result(\($m.oid)) 同为 \($m.actor) ⇒ 终审不得与合并者同人（§4）"
                 else empty end

@@ -51,7 +51,7 @@ for s in bad_missing_after_threshold bad_missing_at_threshold bad_label_mismatch
          bad_clean_but_request_changes bad_blocking_but_approve bad_three_rounds \
          bad_merge_unresolved bad_premerge_unresolved bad_unknown_decision_after_threshold \
          bad_self_review bad_final_review_by_merger bad_unverified_patch \
-         bad_decoy_patch_after_self_review; do
+         bad_decoy_patch_after_self_review bad_review_array_order_bypass; do
   expect_rc "违规：$s" 1 "$check" --json "$samples/$s.json" --contract-ts "$ts"
 done
 
