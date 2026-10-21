@@ -67,7 +67,6 @@ def label_counts:
 # 结构性判据（§0b/§4）需要看“谁签的”：patch 作者、merge 执行者、以及每条 review 的 actor。
 | [ $items[] | select(.e.kind == "patch") | {oid, actor: (.e.actor // null), ts: (.e.ts // 0)} ] as $patches
 | [ $items[] | select(.e.kind == "merge_result" and (.e.body.merged == true)) | {oid, actor: (.e.actor // null), ts: (.e.ts // 0)} ] as $merge_items
-| ($patches | map(.actor) | unique) as $patch_actors
 | [ $items[] | select(.e.kind == "merge_result" and (.e.body.merged == true)) | .idx ] as $merges
 | ($reviews | map(select(.decision != "comment" and .contract != null and .contract.blocking > 0)) | length) as $blocking_rounds
 | ($reviews | map(select((.decision == "approve" or .decision == "request_changes")
@@ -117,16 +116,24 @@ def label_counts:
               else empty end
           else empty end ),
 
-      # (d) 独立评审（§0b）：判决类 review 的 actor 不得与本 thread 任何 patch 的 actor 相同。
+      # (d) 独立评审（§0b）：判决类 review 的 actor 不得与**最新一条 patch** 的 actor 相同。
       #     为什么必须机检：自审可以签出一条完全合法的 approve（契约行、标签、轮次全都对），
       #     上面 (a)-(c) 一条都拦不住；而 author 自己的 approve 从不算满足闸门。
+      #
+      #     **只比最新 patch，不是全部 patch**（评审 abb-reviewer-141 的 BLOCKING-2）：
+      #     本仓真实存在「自审被发现 → patch 重签为真实作者 → 另人 approve」的自我纠正形态
+      #     （卡 abb-channel-mcp-remaining-injection-surfaces-20261012）。若拿 review 去比全
+      #     部历史 patch 的 actor 集合，那条**已被取代**的自审会永久触发 ⇒ 卡再也合不了，
+      #     无论后面怎么改。按最新 patch 判：换人接管/重签后旧条目自然失效，符合“账以最新为准”。
       #     口径：只看 ts ≥ 契约阈值的 review（历史条目豁免，与 (a) 同口径）。
-      ( $reviews[] | . as $r
-        | select($r.ts >= $contract_ts
-                 and ($r.decision == "approve" or $r.decision == "request_changes")
-                 and $r.actor != null
-                 and ($patch_actors | index($r.actor)) != null)
-        | "\($r.oid): review 的 actor=\($r.actor) 同时是本 thread 的 patch 作者 ⇒ 自审不算独立评审（§0b）" ),
+      ( ($patches | last) as $p
+        | if $p != null and $p.actor != null then
+            ( $reviews[] | . as $r
+              | select($r.ts >= $contract_ts
+                       and ($r.decision == "approve" or $r.decision == "request_changes")
+                       and $r.actor == $p.actor)
+              | "\($r.oid): review 的 actor=\($r.actor) 同时是**最新 patch** \($p.oid) 的作者 ⇒ 自审不算独立评审（§0b）" )
+          else empty end ),
 
       # (e) 终审不得与合并者同人（§4）：已合并的 thread，最后一条判决类 review 与 merge_result 的 actor 必须不同。
       #     注意：同一个人多轮评审（request_changes → approve）是**合法**的，不在这里拦；只有
@@ -144,13 +151,19 @@ def label_counts:
             else empty end
         else empty end ),
 
-      # (f) 签名未验签的**判决性**条目不得参与合并：patch / review / merge_result / card_claim。
+      # (f) 签名未验签的**判决性**条目不得参与合并：patch / review / merge_result。
       #     为什么只算判决性条目：`comment` 上的未验签往往只是“写错身份重签”的记录，
       #     它污染的是审计叙述，不是代码授权；拿它堵住整张卡会让事故记录变成永久阻塞。
+      #
+      #     `card_claim` 也**不列入**（评审 abb-reviewer-141 的 BLOCKING-1）：claim 授权的是
+      #     “谁占着这张卡干活”，不是“谁的代码可以合入”。本仓真实存在这样的死结（卡
+      #     abb-413-body-limit-20261020）：用错密钥签的 claim 被作者按 append-only 口径
+      #     **原样复原**后，若 claim 参与判定，则“删掉它”（违规）才能合、“保留它”（正确）
+      #     永远不能合。同 thread 已有 verified 的 claim，足以证明认领发生过。
       ( $items[]
         | select(.verified == false
                  and (.e.kind == "patch" or .e.kind == "review"
-                      or .e.kind == "merge_result" or .e.kind == "card_claim")
+                      or .e.kind == "merge_result")
                  and (.e.ts // 0) >= $contract_ts)
         | "\(.oid): \(.e.kind) 条目签名验不过（verified=false）⇒ 不得据它合并" )
     ]
