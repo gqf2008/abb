@@ -2003,17 +2003,31 @@ fn handle_prompt_result(l: &mut Loop, handle: &RuntimeHandle, mut result: Prompt
                 );
                 let invalidated = result.agent.state.invalidate_channel(&batch.channel_id);
                 l.registry.forget_channel(agent_index, batch.channel_id);
+                // 评审 NB-2：上面只清了**这份 checked-out agent**（它不在池里，helper 管不到），
+                // 但其余**空闲槽位**也可能持有该频道会话（`invalidate_channel_sessions` 的
+                // 文档明写它不碰 in-flight 的那一个）——两边都做才盖全，否则别的空闲槽位
+                // 仍可能拿旧上下文接下一批。
+                let invalidated_idle = l.pool.invalidate_channel_sessions(batch.channel_id);
                 crate::log!(
-                    "[harness] 死信（请求体超上游上限 413）：channel={} 已失效该频道执行层会话={} → 下一条消息重建上下文",
+                    "[harness] 死信（请求体超上游上限 413）：channel={} 已失效该频道执行层会话={}（另有空闲槽位 {} 个）→ 下一条消息重建上下文",
                     batch.channel_id,
-                    invalidated
+                    invalidated,
+                    invalidated_idle
                 );
+                // 评审 NB-1：文案不得无条件宣称「已重置」——若两处都没命中（该频道在该
+                // agent 上本就无会话），事实是「没得重置」，说「已重置」是骗人。
+                let hint = if invalidated || invalidated_idle > 0 {
+                    "已为你重置本会话上下文，请重发这条消息。"
+                } else {
+                    "请重发这条消息；若仍失败，请减少一次发送的图片数量。"
+                };
                 notify_channel(
                     l,
                     handle,
                     &batch,
-                    "⚠️ 处理失败：本会话的请求体已超过上游上限（多为图片在上下文里累积）。已为你重置本会话上下文，请重发这条消息。"
-                        .to_string(),
+                    format!(
+                        "⚠️ 处理失败：本会话的请求体已超过上游上限（多为图片在上下文里累积）。{hint}"
+                    ),
                 );
             } else if let Some(dead) = l.queue.requeue(batch) {
                 let reason =
