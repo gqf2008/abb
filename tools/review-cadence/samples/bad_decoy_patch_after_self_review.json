@@ -1,0 +1,51 @@
+[
+  {
+    "entry": {
+      "kind": "issue",
+      "id": "t",
+      "ts": 100,
+      "body": {
+        "title": "t"
+      },
+      "actor": "author"
+    },
+    "oid": "i1",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "patch",
+      "id": "t",
+      "ts": 1000000,
+      "body": {},
+      "actor": "self"
+    },
+    "oid": "p1",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "review",
+      "id": "t",
+      "ts": 1000001,
+      "body": {
+        "decision": "approve",
+        "note": "findings: blocking=0 non-blocking=0\n"
+      },
+      "actor": "self"
+    },
+    "oid": "r1",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "patch",
+      "id": "t",
+      "ts": 1000002,
+      "body": {},
+      "actor": "other"
+    },
+    "oid": "p2",
+    "verified": true
+  }
+]

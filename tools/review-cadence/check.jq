@@ -69,6 +69,14 @@ def label_counts:
 | [ $items[] | select(.e.kind == "merge_result" and (.e.body.merged == true)) | {oid, actor: (.e.actor // null), ts: (.e.ts // 0)} ] as $merge_items
 | [ $items[] | select(.e.kind == "merge_result" and (.e.body.merged == true)) | .idx ] as $merges
 | ($reviews | map(select(.decision != "comment" and .contract != null and .contract.blocking > 0)) | length) as $blocking_rounds
+# 历史自审（告警，不阻塞）：逐条比对该 review 之前的最新 patch。只用于 summary 上报，
+# 让「曾经自审过、后来被纠正」这件事仍可审计 —— 但不进 violations，否则自我纠正的
+# 真实卡会被永久锁死（见 (d) 的注释）。
+| ( [ $reviews[] | . as $r
+      | select($r.decision == "approve" or $r.decision == "request_changes")
+      | ( $patches | map(select(.ts < $r.ts)) | last ) as $p
+      | select($p != null and $p.actor != null and $r.actor == $p.actor)
+      | $r.oid ] ) as $self_reviews_all
 | ($reviews | map(select((.decision == "approve" or .decision == "request_changes")
                          and .contract == null and .ts < $contract_ts)) | length) as $skipped
 # 未知 decision 的历史豁免也计入同一个计数：两者都是「契约前、口径未定型」的条目。
@@ -116,23 +124,33 @@ def label_counts:
               else empty end
           else empty end ),
 
-      # (d) 独立评审（§0b）：判决类 review 的 actor 不得与**最新一条 patch** 的 actor 相同。
+      # (d) 独立评审（§0b）：**最后一条判决类 review** 的 actor 不得与**它所审的那份 patch**
+      #     （即该 review 之前 ts 最新的 patch）的 actor 相同。
+      #
       #     为什么必须机检：自审可以签出一条完全合法的 approve（契约行、标签、轮次全都对），
       #     上面 (a)-(c) 一条都拦不住；而 author 自己的 approve 从不算满足闸门。
       #
-      #     **只比最新 patch，不是全部 patch**（评审 abb-reviewer-141 的 BLOCKING-2）：
-      #     本仓真实存在「自审被发现 → patch 重签为真实作者 → 另人 approve」的自我纠正形态
-      #     （卡 abb-channel-mcp-remaining-injection-surfaces-20261012）。若拿 review 去比全
-      #     部历史 patch 的 actor 集合，那条**已被取代**的自审会永久触发 ⇒ 卡再也合不了，
-      #     无论后面怎么改。按最新 patch 判：换人接管/重签后旧条目自然失效，符合“账以最新为准”。
+      #     为什么是「该 review 之前的最新 patch」而不是「全 thread 最后一条 patch」
+      #     （评审 abb-reviewer-141 的 BLOCKING-1，第 3 轮）：后者可被 decoy 绕过——
+      #     构造 `patch(self) → review(self, approve) → patch(other)` 时，「最后一条 patch」
+      #     是 other ⇒ 自审被洗白。而 decoy patch 甚至可以是空的，不需要真改任何东西。
+      #     闸门要回答的是「放行这一次批准」，所以必须对齐「这份 review 在审谁」。
+      #
+      #     为什么只看最后一条 review：更早的判决类 review 已被后续 review 取代，其价值是
+      #     历史记录而非合并授权。真实卡 abb-channel-mcp-remaining-injection-surfaces-20261012
+      #     的历史是「coordinator 自审 → 被发现 → patch 重签为真实作者 → 另人 approve」，
+      #     若逐条判则那条已纠正的自审会永久锁死该卡。历史自审改由 summary 里的
+      #     `self_reviews_historical` 计数上报（告警，不阻塞）。
       #     口径：只看 ts ≥ 契约阈值的 review（历史条目豁免，与 (a) 同口径）。
-      ( ($patches | last) as $p
-        | if $p != null and $p.actor != null then
-            ( $reviews[] | . as $r
-              | select($r.ts >= $contract_ts
-                       and ($r.decision == "approve" or $r.decision == "request_changes")
-                       and $r.actor == $p.actor)
-              | "\($r.oid): review 的 actor=\($r.actor) 同时是**最新 patch** \($p.oid) 的作者 ⇒ 自审不算独立评审（§0b）" )
+      ( ( $reviews
+          | map(select(.ts >= $contract_ts
+                       and (.decision == "approve" or .decision == "request_changes"))) ) as $judged
+        | if ($judged | length) > 0 then
+            ($judged[-1]) as $r
+            | ( $patches | map(select(.ts < $r.ts)) | last ) as $p
+            | if $p != null and $p.actor != null and $r.actor == $p.actor then
+                "\($r.oid): 最后一条判决类 review 的 actor=\($r.actor) 也是它所审 patch \($p.oid) 的作者 ⇒ 自审不算独立评审（§0b）"
+              else empty end
           else empty end ),
 
       # (e) 终审不得与合并者同人（§4）：已合并的 thread，最后一条判决类 review 与 merge_result 的 actor 必须不同。
@@ -171,5 +189,6 @@ def label_counts:
     summary: { reviews: ($reviews | length),
                blocking_rounds: $blocking_rounds,
                skipped_historical: $skipped,
-               merges: ($merges | length) },
+               merges: ($merges | length),
+               self_reviews_historical: ($self_reviews_all | length) },
     reviews: [ $reviews[] | {oid, ts, decision, contract} ] }
