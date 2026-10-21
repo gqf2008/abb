@@ -240,6 +240,7 @@ async fn generate_team_plan_with(
         text: prompt,
         ts_secs: crate::chrono_lite::unix_secs() as i64,
         prompt_tag: "team_plan".to_string(),
+        bridge_generation: String::new(),
     };
     let text = match crate::runtime::oneshot::oneshot_turn(
         agent_cfg,

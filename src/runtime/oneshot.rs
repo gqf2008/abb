@@ -299,6 +299,7 @@ mod tests {
             text: text.to_string(),
             ts_secs: 0,
             prompt_tag: "oneshot_test".to_string(),
+            bridge_generation: String::new(),
         }
     }
 

@@ -74,6 +74,21 @@ pub struct InboundMsg {
     pub ts_secs: i64,
     /// Tag identifying which rule (or mode) matched this message.
     pub prompt_tag: String,
+    /// 寄送时桥侧会话代际（= `sessions.json` 里该 chat 的 `session_id`）。
+    ///
+    /// 存在的理由：执行层的 ACP 会话与桥侧会话**是两套账**。`/new` 与
+    /// `$ABB_BIN session reset` 只换桥侧 UUID、清历史，而执行层按
+    /// `agent.state.sessions[channel_id]` 复用会话（`pool.rs`），于是「全新上下文」
+    /// 是假的——旧上下文（含累积的图片 base64）被原样续用（卡
+    /// `abb-new-does-not-reset-agent-20261021`）。
+    ///
+    /// 让**每个批次自带一份寄送时的代际快照**，pool 在建/复用会话时比对：不符即
+    /// 失效重建。选批次携带而不是「桥在 /new 时通知 harness」，是因为批次值与消息
+    /// 同生共死——① 不与在跑批次竞态（旧批次带着它自己的旧代际，不会被新代际误杀）；
+    /// ② 跨进程的 CLI reset 也能覆盖（值来自每轮 `refresh()` 后的盘上真值）。
+    ///
+    /// **空串 = 不校睑**（测试与内部构造路径不必逐个填值，语义与改造前一致）。
+    pub bridge_generation: String,
 }
 
 /// A message waiting in the queue.
@@ -1299,6 +1314,7 @@ mod tests {
                 text: format!("text-{id}"),
                 ts_secs: 0,
                 prompt_tag: tag.to_string(),
+                bridge_generation: String::new(),
             },
             received_at: Instant::now(),
         }
@@ -1390,6 +1406,7 @@ mod tests {
                 text: format!("text-{id}"),
                 ts_secs: 0,
                 prompt_tag: tag.to_string(),
+                bridge_generation: String::new(),
             },
             received_at: Instant::now(),
         }

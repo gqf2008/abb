@@ -628,6 +628,7 @@ pub(crate) async fn run_attempt(
         text: task.payload.prompt.clone(),
         ts_secs: started as i64,
         prompt_tag: TASK_PROMPT_TAG.to_string(),
+        bridge_generation: String::new(),
     };
     let budget = task
         .timeout()

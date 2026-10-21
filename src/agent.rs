@@ -616,6 +616,7 @@ async fn generate_role_prompt_with(
         text: full,
         ts_secs: crate::chrono_lite::unix_secs() as i64,
         prompt_tag: "role_prompt".to_string(),
+        bridge_generation: String::new(),
     };
     let outcome = crate::runtime::oneshot::oneshot_turn(
         agent_cfg,

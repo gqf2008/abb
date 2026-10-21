@@ -1330,6 +1330,7 @@ fn resource_update_message(update: &ResourceUpdate) -> InboundMsg {
         ),
         ts_secs: chrono::Utc::now().timestamp(),
         prompt_tag: "mcp:resource".to_string(),
+        bridge_generation: String::new(),
     }
 }
 
@@ -2602,6 +2603,7 @@ mod resource_event_tests {
                     text: "先跑一轮".to_string(),
                     ts_secs: 0,
                     prompt_tag: "test".to_string(),
+                    bridge_generation: String::new(),
                 },
             ),
             "句柄应在跑（push_message 返回 true）"
@@ -3094,6 +3096,7 @@ mod resource_event_tests {
                 text: "第一轮".to_string(),
                 ts_secs: 0,
                 prompt_tag: "test".to_string(),
+                bridge_generation: String::new(),
             },
         ));
         // 等第一条投递
@@ -3112,6 +3115,7 @@ mod resource_event_tests {
                 text: "第二轮".to_string(),
                 ts_secs: 0,
                 prompt_tag: "test".to_string(),
+                bridge_generation: String::new(),
             },
         ));
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -3197,6 +3201,7 @@ mod resource_event_tests {
                 text: "跑一轮".to_string(),
                 ts_secs: 0,
                 prompt_tag: "test".to_string(),
+                bridge_generation: String::new(),
             },
         ));
         // 等 3 条通知都发出去（假 agent 侧记录），再给 ABB 一点投递时间
@@ -3383,6 +3388,7 @@ mod spawn_lifecycle_tests {
                     text: "hi".to_string(),
                     ts_secs: 0,
                     prompt_tag: "test".to_string(),
+                    bridge_generation: String::new(),
                 },
                 std::time::Duration::from_secs(30),
             )
@@ -3493,6 +3499,7 @@ mod spawn_lifecycle_tests {
                     text: "hi".to_string(),
                     ts_secs: 0,
                     prompt_tag: "test".to_string(),
+                    bridge_generation: String::new(),
                 },
                 std::time::Duration::from_secs(30),
             )
@@ -3627,6 +3634,7 @@ mod channel_info_tests {
                     text: "x".to_string(),
                     ts_secs: 0,
                     prompt_tag: "test".to_string(),
+                    bridge_generation: String::new(),
                 },
                 std::time::Duration::from_secs(60),
             )
@@ -3664,6 +3672,7 @@ mod channel_info_tests {
                         text: "x".to_string(),
                         ts_secs: 0,
                         prompt_tag: "test".to_string(),
+                        bridge_generation: String::new(),
                     },
                     std::time::Duration::from_secs(3600),
                 )

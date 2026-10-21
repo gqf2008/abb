@@ -3042,6 +3042,7 @@ pub fn steer_inbound(text: &str) -> InboundMsg {
         text: text.to_string(),
         ts_secs: crate::chrono_lite::unix_secs() as i64,
         prompt_tag: "syschat".to_string(),
+        bridge_generation: String::new(),
     }
 }
 
@@ -3346,6 +3347,7 @@ async fn turn_with_stream(
         text: prompt,
         ts_secs: crate::chrono_lite::unix_secs() as i64,
         prompt_tag: "syschat".to_string(),
+        bridge_generation: String::new(),
     };
     let (chunk_tx, cancel, steer) = match stream {
         Some(w) => (Some(w.chunks), Some(w.cancel), w.steer),

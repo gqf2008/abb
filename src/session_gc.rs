@@ -110,6 +110,7 @@ impl Summarizer for ServiceSummarizer {
             text: prompt.to_string(),
             ts_secs: crate::chrono_lite::unix_secs() as i64,
             prompt_tag: "gc_summary".to_string(),
+            bridge_generation: String::new(),
         };
         // 外部取消只 watch，oneshot 绝不反 cancel（#69 关停联动）。
         match crate::runtime::oneshot::oneshot_turn(

@@ -98,6 +98,12 @@ pub struct SessionState {
     /// 该渠道会话必须失效重建——下一次 `session/new` 才会重连新的 MCP 子进程。
     /// `None` = 建会话时该渠道没有 `mcp.json`。
     pub mcp_stamp: HashMap<Uuid, Option<u64>>,
+    /// 建会话时那条消息携带的桥侧代际（= `sessions.json` 的 session_id 快照）。
+    ///
+    /// 与 `sessions` 同生共死：批次带来的代际与这里不符 ⇒ `/new` 或 CLI
+    /// `session reset` 已经把桥侧会话换掉 ⇒ 执行层这份会话是陈旧的，必须失效重建
+    /// （卡 `abb-new-does-not-reset-agent-20261021`）。缺条目 = 存量会话，按不符处理。
+    pub generations: HashMap<Uuid, String>,
 }
 
 impl SessionState {
@@ -116,6 +122,7 @@ impl SessionState {
         self.turn_counts.remove(channel_id);
         self.deliveries.remove(channel_id);
         self.mcp_stamp.remove(channel_id);
+        self.generations.remove(channel_id);
         self.sessions.remove(channel_id).is_some()
     }
 
@@ -125,6 +132,7 @@ impl SessionState {
         self.turn_counts.clear();
         self.deliveries.clear();
         self.mcp_stamp.clear();
+        self.generations.clear();
     }
 
     pub(crate) fn mark_channel_delivery_success(
@@ -1195,6 +1203,37 @@ pub async fn run_prompt_task(
         None
     };
 
+    // 桥侧代际变更检测（卡 abb-new-does-not-reset-agent-20261021）：`/new` 与
+    // `$ABB_BIN session reset` 换的只是桥侧 UUID（`sessions.json`），而执行层按
+    // `agent.state.sessions[channel_id]` 复用 ACP 会话——两者是两套账。代际不符即
+    // 失效重建，否则「✅ 已新建会话，下一条消息开始全新上下文」是一句假话，且旧上下文
+    // 里的图片 base64 会把这个频道的请求体持绡撑到上游 413（另一张卡）。
+    //
+    // 取**批内最后一条非空代际**：批次可能跨越 `/new`（队列里既有新代际的也有旧代际的
+    // 消息），最终会跑到的是新代际，按它判定才不会重建完又立刻再重建一次。
+    // 空串（oneshot / 内部构造路径）不参与比对——语义与改造前一致。
+    let batch_generation = batch
+        .events
+        .iter()
+        .rev()
+        .map(|e| e.msg.bridge_generation.as_str())
+        .find(|g| !g.is_empty());
+    if let Some(want) = batch_generation {
+        let have = agent.state.generations.get(&batch.channel_id);
+        let stale = match have {
+            Some(have) => have != want,
+            // 没记过代际的存量会话：只在有会话时才可能不一致（全新会话在下面建立时补记）。
+            None => agent.state.sessions.contains_key(&batch.channel_id),
+        };
+        if stale {
+            crate::log!(
+                "[bridge] 桥侧会话代际已变，失效执行层会话重建 channel={}",
+                batch.channel_id
+            );
+            agent.state.invalidate_channel(&batch.channel_id);
+        }
+    }
+
     let (session_id, is_new_session) = {
         if let Some(sid) = agent.state.sessions.get(&batch.channel_id) {
             (sid.clone(), false)
@@ -1222,6 +1261,19 @@ pub async fn run_prompt_task(
                         batch.channel_id
                     );
                     agent.state.sessions.insert(batch.channel_id, sid.clone());
+                    // 代际与 mcp 指纹同生命期：记下本会话是哪个桥侧代际建的，后续批次
+                    // 比对这个值就能发现 `/new` / CLI reset（见上方代际检测）。空串不记。
+                    match batch_generation {
+                        Some(g) => {
+                            agent
+                                .state
+                                .generations
+                                .insert(batch.channel_id, g.to_string());
+                        }
+                        None => {
+                            agent.state.generations.remove(&batch.channel_id);
+                        }
+                    }
                     registry.register(agent.index, &sid, batch.channel_id);
                     agent
                         .state
@@ -1984,5 +2036,79 @@ mod isolation_policy_tests {
         p.push_slot();
         assert_eq!(p.slot_count(), 3, "追加两个空槽位");
         assert_eq!(p.idle_count(), 0, "空槽位不算空闲 agent");
+    }
+}
+
+#[cfg(test)]
+mod bridge_generation_tests {
+    use super::*;
+
+    /// `/new` 换桥侧 UUID 后，执行层那份会话必须被判陈旧（卡
+    /// `abb-new-does-not-reset-agent-20261021` 的根因回归）。
+    ///
+    /// 判别力：去掉 `stale` 判定（改成恒 false）⇒ 本条红。
+    #[test]
+    fn changed_generation_marks_session_stale() {
+        let ch = Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(ch, "exec-abb-2".to_string());
+        state.generations.insert(ch, "sid-old".to_string());
+
+        // 桥侧已换 UUID（/new）⇒ 批次带来的代际与记录不符。
+        let want = "sid-new";
+        let have = state.generations.get(&ch);
+        assert_eq!(have.map(String::as_str), Some("sid-old"));
+        let stale = match have {
+            Some(have) => have != want,
+            None => state.sessions.contains_key(&ch),
+        };
+        assert!(stale, "代际不符必须判陈旧");
+    }
+
+    /// 同一代际的后续批次不得反复重建（否则每轮都在丢上下文）。
+    #[test]
+    fn same_generation_keeps_session() {
+        let ch = Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(ch, "exec-abb-2".to_string());
+        state.generations.insert(ch, "sid-same".to_string());
+
+        let want = "sid-same";
+        let have = state.generations.get(&ch);
+        let stale = match have {
+            Some(have) => have != want,
+            None => state.sessions.contains_key(&ch),
+        };
+        assert!(!stale, "代际相同必须复用");
+    }
+
+    /// 存量会话（升级前建的、没记过代际）遇上有代际的批次 ⇒ 判陈旧重建一次。
+    /// 这是「宁可重建一次，也不能让旧上下文冒充新会话」的取舍。
+    #[test]
+    fn legacy_session_without_recorded_generation_is_stale() {
+        let ch = Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(ch, "exec-abb-1".to_string());
+
+        let want = "sid-any";
+        let have = state.generations.get(&ch);
+        let stale = match have {
+            Some(have) => have != want,
+            None => state.sessions.contains_key(&ch),
+        };
+        assert!(stale);
+    }
+
+    /// `/new` 之后失效：代际记录随会话一起清掉，不留陈旧条目。
+    #[test]
+    fn invalidate_clears_generation_record() {
+        let ch = Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(ch, "exec-abb-2".to_string());
+        state.generations.insert(ch, "sid-old".to_string());
+
+        assert!(state.invalidate_channel(&ch));
+        assert!(!state.generations.contains_key(&ch), "代际记录须同生共死");
+        assert!(!state.sessions.contains_key(&ch));
     }
 }

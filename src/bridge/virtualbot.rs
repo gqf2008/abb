@@ -962,6 +962,11 @@ impl Bridge {
                     ts_secs: ev.ts,
                     // ABB 会话面扁平：无话题维；话题隔离走频道维（topic_channel_uuid）。
                     prompt_tag: "channel_message".to_string(),
+                    // 桥侧代际快照（本卡 abb-new-does-not-reset-agent-20261021）：
+                    // 执行层按 channel_id 复用 ACP 会话，看不见 `/new` 换的桥侧 UUID，
+                    // 于是「全新上下文」是假的。带上寄送时的 sid，pool 见代际不符即
+                    // 失效重建——`/new` 与跨进程 `$ABB_BIN session reset` 一并覆盖。
+                    bridge_generation: session_id.clone(),
                 },
             ) {
                 if let Err(e) = self

@@ -4016,6 +4016,7 @@ mod tests {
                     text: "占住频道".to_string(),
                     ts_secs: 0,
                     prompt_tag: "user_message".to_string(),
+                    bridge_generation: String::new(),
                 }
             ),
             "占位消息应能入队"
@@ -4040,6 +4041,7 @@ mod tests {
                     text: "QUEUED_JOB_PAYLOAD_7f3a".to_string(),
                     ts_secs: 0,
                     prompt_tag: crate::schedule::JOB_PROMPT_TAG.to_string(),
+                    bridge_generation: String::new(),
                 },
                 std::time::Duration::from_secs(600),
             )
