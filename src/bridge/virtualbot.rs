@@ -30,6 +30,10 @@ impl Bridge {
 /// 复用 ACP 会话，所以必须每轮把它带出去让 pool 比对。若哪天被写成
 /// `String::new()`（功能静默失效、`/new` 又变回假的），下面 `bridge_generation_`
 /// 用例会当场红，而不是四门禁全绿。
+///
+/// ⚠️ **不要把它内联回调用点**（评审 R2 NB-1）。这层“无逻辑转发”看起来像无谓包装，
+/// 但它正是变异测试的**抓手**：删掉它、直接在调用点写 `session_id.clone()`，就再也
+/// 没法用“把入口改成空串”这个变异去验证接线是否还活着。保留它 = 保留可验证性。
 fn bridge_generation_for(session_id: &str) -> String {
     session_id.to_string()
 }
