@@ -4106,6 +4106,9 @@ pub fn run_gui() -> Result<()> {
     // 开窗尺寸夹到 min，而标题栏控件条的首帧是按默认宽算的（D 批那个坑）。仅断言，不参与逻辑。
     // 同样改成**编译期**断言（两个操作数都是 const ⇒ 运行期 `debug_assert!` 恒真，
     // 且只在 debug 生效；编译期断言在 release 也成立，且破不变式的人当场编不过）。
+    // 注意副作用：`const _` 会在**任何**编译单元求值 —— 所以改坏常量的表现是
+    // `cargo build` 就失败，而不只是「跑测试才红」。这是想要的（更早、更硬），
+    // 但别有人以为是测试专用断言。
     const _: () = assert!(crate::syschat::SYSCHAT_PREFERRED_WIDTH >= crate::syschat::SYSCHAT_MIN_W);
     const _: () = assert!(crate::syschat::SYSCHAT_DEFAULT_H >= crate::syschat::SYSCHAT_MIN_H);
     // **对照实验**（`ABB_VERIFY_SETTINGS=1`）：对**设置窗**做与对话窗一模一样的写入实验。
