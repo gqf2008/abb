@@ -187,7 +187,7 @@ pub fn dev_tools(
             create_write_tool(&context),
             "write",
             Guard::WritePath {
-                deny_channel_mcp: shell_restricted,
+                deny_bridge_state: shell_restricted,
             },
             workspace,
         ));
@@ -195,7 +195,7 @@ pub fn dev_tools(
             create_edit_tool(&context),
             "edit",
             Guard::WritePath {
-                deny_channel_mcp: shell_restricted,
+                deny_bridge_state: shell_restricted,
             },
             workspace,
         ));
@@ -246,12 +246,18 @@ enum Guard {
     None,
     /// 写类工具：把 `path` 限定到会话工作区内（见 [`confine_write_path`]）。
     ///
-    /// `deny_channel_mcp` = **受限（授权者）会话**专用的加码：拒写渠道级 MCP 配置 `mcp.json`。
-    /// 为什么（卡 `abb-channel-mcp-write-escalation-20261012`）：该文件声明的是"abb-agent 要起的
-    /// MCP 子进程"，而子进程**不按会话档位沙箱运行**（白名单 env 含 `HOME`/`$ABB_BIN`）⇒ 受限会话
-    /// 若能写它，下一条 **owner** 消息重建会话时就会以用户身份无沙箱执行 ⇒ 受限→owner 提权。
-    /// owner 会话**不受此限**：那份配置本来就该由 owner 会话/人工维护。
-    WritePath { deny_channel_mcp: bool },
+    /// `deny_bridge_state` = **受限（授权者）会话**专用的加码：拒写渠道「状态面」文件——
+    /// 即那些**会被下一轮会话当成可信输入**读回去的路径（见 [`deny_bridge_state_path`] 的名单）。
+    /// 为什么：这些面全是「受限会话写一次，owner 会话读一次」的提权链——
+    /// ① `mcp.json` / `.mcp.json` 声明的是 abb-agent 要起的 MCP 子进程，子进程**不按会话档位沙箱运行**
+    ///   （白名单 env 含 `HOME`/`$ABB_BIN`）⇒ 下一条 owner 消息重建会话即以用户身份无沙箱执行；
+    /// ② `.agents/skills/**` 的技能 `name`/`description`/正文由 `hints.rs` 注入 owner 的系统提示
+    ///   （`.goose/skills`、`.claude/skills` 同理）= 提示词注入；
+    /// ③ `AGENTS.md` / `CLAUDE.md` 被 `ensure_workspace_guide` 以「不含 GUIDE_MARKER 才重写」判定，
+    ///   而 marker 就印在 agent 提示词里 ⇒ 伪造 marker 就能让注入持久化；
+    /// ④ `sessions.json` / `history/**`（虚拟 Bot 群会话里渠道目录即 vb 目录）= 会话槽位与历史注入面。
+    /// owner 会话**不受此限**：这些本来就该由 owner 会话/人工维护。
+    WritePath { deny_bridge_state: bool },
     /// 读类工具：把 `path` 限定到**会话工作区或附加只读根**内（见 [`confine_read_path`]）。
     /// 仅受限会话套用；owner 全权限用 `None`（对齐参照物 FullAccess 读任意路径）。
     /// 括号里是附加只读根（如 bot 级 `attachments/`）——它们是**读**域，仍不能写。
@@ -429,9 +435,9 @@ impl AgentTool for Exposed {
     ) -> Result<AgentToolResult, AgentError> {
         let params = match &self.guard {
             Guard::None => params,
-            Guard::WritePath { deny_channel_mcp } => {
-                if *deny_channel_mcp {
-                    deny_channel_mcp_config(&params)?;
+            Guard::WritePath { deny_bridge_state } => {
+                if *deny_bridge_state {
+                    deny_bridge_state_path(&params)?;
                 }
                 self.confine(&params).await?
             }
@@ -517,29 +523,79 @@ fn rename_timeout_param(params: Value) -> Value {
 /// 与参照物的一处**有意更紧**：本包允许**落在工作区内的**绝对路径（参照物一律拒绝绝对
 /// 路径），因为 rpi 的 write/edit 会把相对路径先解成绝对路径再落盘，不给它绝对路径反而
 /// 会破坏正常写入——「不得出工作区」这条本身没有放宽。
-/// 受限会话不得改写渠道级 MCP 配置（`mcp.json`）——见 [`Guard::WritePath`] 的字段说明。
+/// 受限会话不得改写渠道「状态面」——即会被下一轮会话当成可信输入读回去的路径。
 ///
-/// 判定按**最终文件名**（大小写不敏感、并剥离尾随 `.`/空格——APFS/NTFS 会剥离它们，
-/// 与 `src/guard.rs::is_bridge_state_path` 同款口径）；`sub/../mcp.json` 这类穿越的最终
-/// 组件同样是 `mcp.json`，自然被覆盖。
-fn deny_channel_mcp_config(params: &Value) -> Result<(), AgentError> {
+/// 名单与 `src/guard.rs::is_bridge_state_path` **同口径**（那边是 claude 腿，这边是生产
+/// 执行层；两处都有单测锁住同一批变体）。原先这里只判一个字面名 `mcp.json`，于是
+/// 技能目录 / `AGENTS.md` / `sessions.json` 三条面在生产路径上**完全没有名单**（卡
+/// `abb-channel-mcp-remaining-injection-surfaces-20261012` 的三条 finding）。
+///
+/// 判定分两层：
+/// 1. **最终文件名**（大小写不敏感、剥离尾随 `.`/空格——APFS/NTFS 会剥，不剥就能用
+///    `AGENTS.md.` 绕过）；`sub/../AGENTS.md` 这类穿越的最终组件同样是目标名，自然覆盖。
+/// 2. **路径组件**：`.agents`/`.goose`/`.claude` 是技能根（`skills.rs::SKILL_DIRS`——
+///    `name`/`description` 进系统提示，正文由 `load_skill` 读），另外 `.git`、`summaries`、
+///    `history` 是桥自身状态。按**组件**判而不是按前缀字符串判，是为了同时挡住
+///    `skills/x` 与 `sub/skills/x` 这类子目录写法。
+fn deny_bridge_state_path(params: &Value) -> Result<(), AgentError> {
     let Some(raw) = params.get("path").and_then(Value::as_str) else {
         return Ok(());
     };
-    let name = std::path::Path::new(raw)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    let name = name.trim_end_matches(['.', ' ', '\t', '\r']).to_string();
-    if name == "mcp.json" {
-        return Err(AgentError::Tool(
-            "受限会话不能改写渠道的 MCP 配置（mcp.json）：它声明的是以 agent 身份、**无沙箱**运行的 \
-             MCP server（白名单 env 含 HOME/$ABB_BIN），写它等于把代码塞进下一条 owner 会话执行。\
-             请让 owner 会话或人工维护该文件（卡 abb-channel-mcp-write-escalation-20261012）。"
-                .to_string(),
-        ));
+    if !is_bridge_state_path(raw) {
+        return Ok(());
     }
-    Ok(())
+    Err(AgentError::Tool(
+        "受限会话不能改写渠道的状态文件或技能目录：它们是**下一条会话的可信输入**\
+         （MCP 配置会被无沙箱起、技能/AGENTS.md 会进系统提示、sessions.json/history 是会话槽位与历史注入面），\
+         写它等于把内容塞进后面的 owner 会话执行。请让 owner 会话或人工维护\
+         （卡 abb-channel-mcp-remaining-injection-surfaces-20261012）。"
+            .to_string(),
+    ))
+}
+
+/// 文件名名单：会进提示词/被信任状态的单文件。
+const DENIED_FILE_NAMES: &[&str] = &[
+    "jobs.json",
+    "pending.json",
+    "sessions.json",
+    "claude.md",
+    "agents.md",
+    ".mcp.json",
+    "mcp.json",
+];
+
+/// 路径组件名单：技能根与桥自身状态目录。`.claude` 同时覆盖 `.claude/skills`。
+const DENIED_COMPONENTS: &[&str] = &[
+    ".claude",
+    ".agents",
+    ".goose",
+    "summaries",
+    "history",
+    ".git",
+];
+
+/// 纯判据（无 IO）：与 `src/guard.rs::is_bridge_state_path` 同一套规则。
+fn is_bridge_state_path(p: &str) -> bool {
+    // APFS/NTFS 会剥离文件名/组件末尾的 '.' 与空格（`AGENTS.md.` 落盘即 `AGENTS.md`）：
+    // 判定前按同样规则剪掉，否则尾随点就是一条绕过路径。
+    let trim_trail = |s: &str| -> String { s.trim_end_matches(['.', ' ', '\t', '\r']).to_string() };
+    let path = std::path::Path::new(p);
+    if let Some(name) = path.file_name() {
+        let name = trim_trail(&name.to_string_lossy().to_ascii_lowercase());
+        if DENIED_FILE_NAMES.contains(&name.as_str())
+            || name.starts_with("jobs.json.migrated")
+            || name.ends_with(".agents.md")
+            || name.ends_with(".claude.md")
+        {
+            return true;
+        }
+    }
+    path.components().any(|c| {
+        let s = trim_trail(&c.as_os_str().to_string_lossy());
+        DENIED_COMPONENTS
+            .iter()
+            .any(|denied| s.eq_ignore_ascii_case(denied))
+    })
 }
 
 async fn confine_write_path(workspace: &Path, raw: &str) -> Result<PathBuf, String> {
@@ -1151,8 +1207,8 @@ mod tests {
                 .await
                 .expect_err(&format!("受限会话写 {bad} 必须被拒"));
             assert!(
-                err.to_string().contains("MCP 配置"),
-                "{bad} 的拒绝理由应说明是 MCP 配置：{err}"
+                err.to_string().contains("状态文件或技能目录"),
+                "{bad} 的拒绝理由应说明是状态面：{err}"
             );
         }
 
@@ -1164,6 +1220,86 @@ mod tests {
 
         // 普通文件不受影响（负向对照：别把受限会话的写全拦了）
         call(write_tool(true), "note.txt")
+            .await
+            .expect("受限会话写普通文件应仍允许");
+    }
+
+    /// 卡 `abb-channel-mcp-remaining-injection-surfaces-20261012` 的三条 finding：
+    /// 技能目录 / `AGENTS.md` / `sessions.json` 在**生产执行层**上也必须被拒。
+    ///
+    /// 判别力：把 `DENIED_COMPONENTS` 或 `DENIED_FILE_NAMES` 删项 ⇒ 对应用例红；
+    /// 把尾随点剪裁去掉 ⇒ `AGENTS.md.` 一类变体红。
+    #[tokio::test]
+    async fn restricted_session_cannot_write_bridge_state_surfaces() {
+        let workspace = temp_workspace("state-deny");
+        let write_tool = |restricted: bool| -> Arc<dyn AgentTool> {
+            dev_tools(&workspace, SandboxMode::WorkspaceWrite, restricted, &[])
+                .into_iter()
+                .find(|t| t.schema().name == "dev__write")
+                .expect("dev__write 存在（WorkspaceWrite 档）")
+        };
+        let call = |tool: Arc<dyn AgentTool>, path: &str| {
+            let path = path.to_string();
+            async move {
+                tool.execute(
+                    "call",
+                    serde_json::json!({ "path": path, "content": "x" }),
+                    CancellationToken::new(),
+                    Arc::new(|_| {}),
+                )
+                .await
+            }
+        };
+
+        // 三条 finding 各自的面 + 既有状态文件；每条带大小写/尾随点/子目录/穿越变体。
+        // 子目录与穿越是**承重**变体：名单若写成 `starts_with` 或只比对原始字符串，这两类会漏。
+        for bad in [
+            ".agents/skills/pwn/SKILL.md",
+            ".goose/skills/pwn/SKILL.md",
+            ".claude/skills/pwn/SKILL.md",
+            "AGENTS.md",
+            "agents.md.",
+            "CLAUDE.md",
+            "sub/AGENTS.md",
+            "sessions.json",
+            "SESSIONS.JSON",
+            "history/abc.jsonl",
+            "jobs.json",
+            "pending.json",
+            ".mcp.json",
+            ".git/config",
+        ] {
+            let err = call(write_tool(true), bad)
+                .await
+                .expect_err(&format!("受限会话写 {bad} 必须被拒（放行即提权链）"));
+            assert!(
+                err.to_string().contains("状态文件或技能目录"),
+                "{bad} 的拒绝理由应说明是状态面：{err}"
+            );
+        }
+
+        // 纯判据直喂（不经工具层）：确认「组件名单」不只靠路径整体相等，
+        // 且普通技能内容的写不在名单内（否则会把正常写全拦掉）。
+        assert!(is_bridge_state_path(".agents/skills/x/SKILL.md"));
+        assert!(is_bridge_state_path("a/.goose/skills/y/SKILL.md"));
+        assert!(is_bridge_state_path("AGENTS.md."), "尾随点必须被剪裁后再判");
+        assert!(
+            !is_bridge_state_path("skills/x/SKILL.md"),
+            "无点前缀不是技能根"
+        );
+        assert!(!is_bridge_state_path("note.txt"));
+
+        // owner 档同面可写（负向对照：只挡受限会话）
+        call(write_tool(false), ".agents/skills/pwn/SKILL.md")
+            .await
+            .expect("owner 会话应仍可维护技能目录");
+        assert!(
+            workspace.join(".agents/skills/pwn/SKILL.md").exists(),
+            "owner 写入应真的落盘"
+        );
+
+        // 普通文件不受影响（负向对照：别把受限会话的写全拦了）
+        call(write_tool(true), "notes/plain.txt")
             .await
             .expect("受限会话写普通文件应仍允许");
     }
