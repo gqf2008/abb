@@ -15,6 +15,14 @@
 #   (b) 同一 thread 的 blocking 轮数（契约行 blocking>0 的**判决类** review 条数）≤ 2。
 #   (c) thread 内最后一条（ts ≥ contract_ts）判决类 review 必须是 blocking=0 的 approve；
 #       否则判红。该判据在**合并前**即可判定（不依赖是否已有 merge_result）。
+#   (d) 独立评审（§0b）：判决类 review 的 actor 不得与本 thread 任何 patch 的 actor 相同。
+#       自审可以签出完全合法的 approve（契约行/标签/轮次全部合规），(a)-(c) 一条都拦不住。
+#   (e) 终审不得与合并者同人（§4）：已合并的 thread，最后一条判决类 review 的 actor
+#       与 merge_result 的 actor 必须不同。**同一个人多轮评审是合法的**，不在此拦。
+#   (f) 签名验不过（verified=false）的**判决性**条目（patch/review/merge_result/card_claim）
+#       不得参与合并。`comment` 上的未验签不算：那通常是“写错身份后重签”的记录，
+#       污染的是审计叙述而不是代码授权，拿它堵整张卡会让事故记录变成永久阻塞。
+#   (d)(e)(f) 同样只看 ts ≥ contract_ts 的条目（历史豁免，与 (a) 同口径）。
 #   `decision=="comment"` 的 review 不参与上述判定（既不被要求带契约行、也不计 blocking 轮）。
 #
 # 输出：{violations:[...], summary:{...}, reviews:[...]}
@@ -41,17 +49,34 @@ def label_counts:
       else . end);
 
 . as $raw
-| [range(0; ($raw | length)) | {idx: ., oid: $raw[.].oid, e: $raw[.].entry}] as $items
+# 注意：不能用 `verified // true` —— jq 的 `//` 把 false 也当“缺失”，
+# 会把 verified=false 悄悄翻成 true，让 (f) 判据永远不触发（selftest 逮到过）。
+| [range(0; ($raw | length))
+   | {idx: ., oid: $raw[.].oid, e: $raw[.].entry,
+      verified: (if ($raw[.] | has("verified")) then $raw[.].verified else true end)}] as $items
 | [ $items[]
     | select(.e.kind == "review")
     | { idx: .idx,
         oid: .oid,
         ts: (.e.ts // 0),
+        actor: (.e.actor // null),
+        verified: .verified,
         decision: (.e.body.decision // null),
         contract: ((.e.body.note // "") | contract_of),
         labels: ((.e.body.note // "") | label_counts) } ] as $reviews
+# 结构性判据（§0b/§4）需要看“谁签的”：patch 作者、merge 执行者、以及每条 review 的 actor。
+| [ $items[] | select(.e.kind == "patch") | {oid, actor: (.e.actor // null), ts: (.e.ts // 0)} ] as $patches
+| [ $items[] | select(.e.kind == "merge_result" and (.e.body.merged == true)) | {oid, actor: (.e.actor // null), ts: (.e.ts // 0)} ] as $merge_items
 | [ $items[] | select(.e.kind == "merge_result" and (.e.body.merged == true)) | .idx ] as $merges
 | ($reviews | map(select(.decision != "comment" and .contract != null and .contract.blocking > 0)) | length) as $blocking_rounds
+# 历史自审（告警，不阻塞）：逐条比对该 review 之前的最新 patch。只用于 summary 上报，
+# 让「曾经自审过、后来被纠正」这件事仍可审计 —— 但不进 violations，否则自我纠正的
+# 真实卡会被永久锁死（见 (d) 的注释）。
+| ( [ $reviews[] | . as $r
+      | select($r.decision == "approve" or $r.decision == "request_changes")
+      | ( $patches | map(select(.ts < $r.ts)) | last ) as $p
+      | select($p != null and $p.actor != null and $r.actor == $p.actor)
+      | $r.oid ] ) as $self_reviews_all
 | ($reviews | map(select((.decision == "approve" or .decision == "request_changes")
                          and .contract == null and .ts < $contract_ts)) | length) as $skipped
 # 未知 decision 的历史豁免也计入同一个计数：两者都是「契约前、口径未定型」的条目。
@@ -92,17 +117,82 @@ def label_counts:
           | map(select(.ts >= $contract_ts
                        and (.decision == "approve" or .decision == "request_changes"))) ) as $post
         | if ($post | length) > 0 then
-            ($post[-1]) as $v
+            ($post | max_by(.ts)) as $v
             | if ($v.decision != "approve"
                   or ($v.contract != null and $v.contract.blocking > 0)) then
                 "thread 最后一条判决类 review（\($v.oid)）不是 blocking=0 的 approve（decision=\($v.decision)）⇒ 不得合并"
               else empty end
-          else empty end )
+          else empty end ),
+
+      # (d) 独立评审（§0b）：**最后一条判决类 review** 的 actor 不得与**它所审的那份 patch**
+      #     （即该 review 之前 ts 最新的 patch）的 actor 相同。
+      #
+      #     为什么必须机检：自审可以签出一条完全合法的 approve（契约行、标签、轮次全都对），
+      #     上面 (a)-(c) 一条都拦不住；而 author 自己的 approve 从不算满足闸门。
+      #
+      #     为什么是「该 review 之前的最新 patch」而不是「全 thread 最后一条 patch」
+      #     （评审 abb-reviewer-141 的 BLOCKING-1，第 3 轮）：后者可被 decoy 绕过——
+      #     构造 `patch(self) → review(self, approve) → patch(other)` 时，「最后一条 patch」
+      #     是 other ⇒ 自审被洗白。而 decoy patch 甚至可以是空的，不需要真改任何东西。
+      #     闸门要回答的是「放行这一次批准」，所以必须对齐「这份 review 在审谁」。
+      #
+      #     为什么只看最后一条 review：更早的判决类 review 已被后续 review 取代，其价值是
+      #     历史记录而非合并授权。真实卡 abb-channel-mcp-remaining-injection-surfaces-20261012
+      #     的历史是「coordinator 自审 → 被发现 → patch 重签为真实作者 → 另人 approve」，
+      #     若逐条判则那条已纠正的自审会永久锁死该卡。历史自审改由 summary 里的
+      #     `self_reviews_historical` 计数上报（告警，不阻塞）。
+      #     **取 max_by(.ts) 而不是数组末元素**（评审 abb-reviewer-141 的 NB-1）：
+      #     thread JSON 是 parent-ordered，数组顺序不等于 ts 顺序；而 `ts` 由客户端在
+      #     签名时写入、不是服务端盖章 ⇒ 构造「self 的 review ts 更晚却排在数组前面」
+      #     即可绕过。同一条 thread 里 (c)/(e) 也一律改用 max_by(.ts)。
+      #     口径：只看 ts ≥ 契约阈值的 review（历史条目豁免，与 (a) 同口径）。
+      ( ( $reviews
+          | map(select(.ts >= $contract_ts
+                       and (.decision == "approve" or .decision == "request_changes"))) ) as $judged
+        | if ($judged | length) > 0 then
+            ($judged | max_by(.ts)) as $r
+            | ( $patches | map(select(.ts < $r.ts)) | last ) as $p
+            | if $p != null and $p.actor != null and $r.actor == $p.actor then
+                "\($r.oid): 最后一条判决类 review 的 actor=\($r.actor) 也是它所审 patch \($p.oid) 的作者 ⇒ 自审不算独立评审（§0b）"
+              else empty end
+          else empty end ),
+
+      # (e) 终审不得与合并者同人（§4）：已合并的 thread，最后一条判决类 review 与 merge_result 的 actor 必须不同。
+      #     注意：同一个人多轮评审（request_changes → approve）是**合法**的，不在这里拦；只有
+      #     “评审者又去合并”才是违规——这两件事极易混，样本里各有对应用例。
+      ( if ($merge_items | length) > 0 then
+          ( $reviews
+            | map(select(.ts >= $contract_ts
+                         and (.decision == "approve" or .decision == "request_changes"))) ) as $post2
+          | ($merge_items[-1]) as $m
+          | if ($post2 | length) > 0 then
+              ($post2 | max_by(.ts)) as $last
+              | if ($m.actor != null and $last.actor != null and $m.actor == $last.actor) then
+                  "\($last.oid): 终审 review 与 merge_result(\($m.oid)) 同为 \($m.actor) ⇒ 终审不得与合并者同人（§4）"
+                else empty end
+            else empty end
+        else empty end ),
+
+      # (f) 签名未验签的**判决性**条目不得参与合并：patch / review / merge_result。
+      #     为什么只算判决性条目：`comment` 上的未验签往往只是“写错身份重签”的记录，
+      #     它污染的是审计叙述，不是代码授权；拿它堵住整张卡会让事故记录变成永久阻塞。
+      #
+      #     `card_claim` 也**不列入**（评审 abb-reviewer-141 的 BLOCKING-1）：claim 授权的是
+      #     “谁占着这张卡干活”，不是“谁的代码可以合入”。本仓真实存在这样的死结（卡
+      #     abb-413-body-limit-20261020）：用错密钥签的 claim 被作者按 append-only 口径
+      #     **原样复原**后，若 claim 参与判定，则“删掉它”（违规）才能合、“保留它”（正确）
+      #     永远不能合。同 thread 已有 verified 的 claim，足以证明认领发生过。
+      ( $items[]
+        | select(.verified == false
+                 and (.e.kind == "patch" or .e.kind == "review"
+                      or .e.kind == "merge_result")
+                 and (.e.ts // 0) >= $contract_ts)
+        | "\(.oid): \(.e.kind) 条目签名验不过（verified=false）⇒ 不得据它合并" )
     ]
-  ) as $violations
-| { violations: $violations,
+  ) as $violations| { violations: $violations,
     summary: { reviews: ($reviews | length),
                blocking_rounds: $blocking_rounds,
                skipped_historical: $skipped,
-               merges: ($merges | length) },
+               merges: ($merges | length),
+               self_reviews_historical: ($self_reviews_all | length) },
     reviews: [ $reviews[] | {oid, ts, decision, contract} ] }

@@ -1,0 +1,81 @@
+[
+  {
+    "entry": {
+      "kind": "issue",
+      "id": "t",
+      "actor": "author",
+      "ts": 100,
+      "body": {
+        "title": "t",
+        "body": "b"
+      }
+    },
+    "oid": "i1",
+    "principal": "author",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "patch",
+      "id": "t",
+      "actor": "abb-worker-9",
+      "ts": 1000000,
+      "body": {
+        "title": "fix",
+        "body": "x",
+        "state": "needs-review"
+      }
+    },
+    "oid": "p1",
+    "principal": "abb-worker-9",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "review",
+      "id": "t",
+      "actor": "abb-reviewer-5",
+      "ts": 1000001,
+      "body": {
+        "decision": "request_changes",
+        "agent": "abb-reviewer-5",
+        "note": "findings: blocking=1 non-blocking=0\n"
+      }
+    },
+    "oid": "r1",
+    "principal": "abb-reviewer-5",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "review",
+      "id": "t",
+      "actor": "abb-reviewer-5",
+      "ts": 1000002,
+      "body": {
+        "decision": "approve",
+        "agent": "abb-reviewer-5",
+        "note": "findings: blocking=0 non-blocking=1\n\n- [non-blocking] n1\n"
+      }
+    },
+    "oid": "r2",
+    "principal": "abb-reviewer-5",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "merge_result",
+      "id": "t",
+      "actor": "abb-coordinator",
+      "ts": 1000003,
+      "body": {
+        "merged": true,
+        "oid": "abc",
+        "result": "merged"
+      }
+    },
+    "oid": "m1",
+    "principal": "abb-coordinator",
+    "verified": true
+  }
+]
