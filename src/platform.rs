@@ -949,6 +949,7 @@ pub fn current_exe() -> Result<PathBuf> {
 /// 2. `show()` 之后 winit 会 `makeKeyAndOrderFront:`（macOS `set_visible`，见 winit 0.30.13
 ///    `src/platform_impl/macos/window_delegate.rs:906`）——这正是 winit 自己 `focus_window()`
 ///    的两步（`activateIgnoringOtherApps` + `makeKeyAndOrderFront`，同文件 `:1573`）。
+///
 /// 另外 winit 的视图 `acceptsFirstMouse:` 默认为 true（`window_delegate.rs:73`），即使进程当时
 /// 不是激活态，点窗口那一下也会**同时**激活进程并把点击递给控件。
 ///

@@ -1212,15 +1212,15 @@ fn snap_bubble_to_dialog(bubble: &AnchorBubble, dialog: &SystemChatWindow) -> bo
     if !dialog.window().is_visible() {
         return false; // 窗没开时气泡自由摆放，不吸附
     }
-    let Some(win_rect) = logical_window_rect(&dialog.window()) else {
+    let Some(win_rect) = logical_window_rect(dialog.window()) else {
         return false; // 对话窗还没 realize：没有可依附的矩形
     };
-    let Some(bubble_rect) = logical_window_rect(&bubble.window()) else {
+    let Some(bubble_rect) = logical_window_rect(bubble.window()) else {
         return false;
     };
     // 工作区取自**对话窗所在显示器**（窗口是事实源，气泡跟着它跨屏）；拿不到再退回气泡所在显示器。
     let Some(work) =
-        monitor_work_area(&dialog.window()).or_else(|| monitor_work_area(&bubble.window()))
+        monitor_work_area(dialog.window()).or_else(|| monitor_work_area(bubble.window()))
     else {
         return false;
     };
@@ -3874,7 +3874,7 @@ pub fn run_gui() -> Result<()> {
             if let Some(win) = cw.upgrade() {
                 let w = win.window();
                 // 会话开成功才记日志（脏方向 / 窗口还没 realize ⇒ 不开，调用方无需知情）。
-                if state.begin(dir.as_str(), &w, (x, y)) {
+                if state.begin(dir.as_str(), w, (x, y)) {
                     crate::log!("[selfresize:settings] begin dir={dir} at ({x},{y})");
                 }
             }
@@ -4016,12 +4016,12 @@ pub fn run_gui() -> Result<()> {
                         #[cfg(not(target_os = "windows"))]
                         {
                             use slint::winit_030::WinitWindowAccessor;
-                            let before = live_window_rect(&w.window());
+                            let before = live_window_rect(w.window());
                             let vis = w
                                 .window()
                                 .with_winit_window(platform::visible_work_area)
                                 .flatten();
-                            let mon = monitor_work_area(&w.window());
+                            let mon = monitor_work_area(w.window());
                             crate::log!(
                                 "[verify-set-size] work-area visible={vis:?} monitor={mon:?}"
                             );
@@ -4046,7 +4046,7 @@ pub fn run_gui() -> Result<()> {
                             crate::log!("[verify-set-size] requested logical {tw}x{th}");
                         }
                     } else if k == 6 || k == 7 {
-                        let r = live_window_rect(&w.window());
+                        let r = live_window_rect(w.window());
                         crate::log!(
                             "[verify-set-size] after#{}={r:?} physical={:?}",
                             k - 5,
@@ -4081,7 +4081,7 @@ pub fn run_gui() -> Result<()> {
                     ticks.set(ticks.get() + 1);
                     let k = ticks.get();
                     if k == 5 {
-                        let before = live_window_rect(&w.window());
+                        let before = live_window_rect(w.window());
                         crate::log!("[verify-toggle-max] before={before:?}");
                         toggle_syschat_maximize(&w, &state);
                         crate::log!(
@@ -4090,7 +4090,7 @@ pub fn run_gui() -> Result<()> {
                 crate::platform::app_is_active()
             );
                     } else if k == 6 || k == 7 {
-                        let r = live_window_rect(&w.window());
+                        let r = live_window_rect(w.window());
                         crate::log!("[verify-toggle-max] after#{}={r:?}", k - 5);
                     }
                     if k >= 7 {
@@ -4104,8 +4104,13 @@ pub fn run_gui() -> Result<()> {
 
     // 不变式：默认尺寸不得小于最小尺寸（`.slint` 的 `min-*`；同值由单测钉住）。破了它，系统会把
     // 开窗尺寸夹到 min，而标题栏控件条的首帧是按默认宽算的（D 批那个坑）。仅断言，不参与逻辑。
-    debug_assert!(crate::syschat::SYSCHAT_PREFERRED_WIDTH >= crate::syschat::SYSCHAT_MIN_W);
-    debug_assert!(crate::syschat::SYSCHAT_DEFAULT_H >= crate::syschat::SYSCHAT_MIN_H);
+    // 同样改成**编译期**断言（两个操作数都是 const ⇒ 运行期 `debug_assert!` 恒真，
+    // 且只在 debug 生效；编译期断言在 release 也成立，且破不变式的人当场编不过）。
+    // 注意副作用：`const _` 会在**任何**编译单元求值 —— 所以改坏常量的表现是
+    // `cargo build` 就失败，而不只是「跑测试才红」。这是想要的（更早、更硬），
+    // 但别有人以为是测试专用断言。
+    const _: () = assert!(crate::syschat::SYSCHAT_PREFERRED_WIDTH >= crate::syschat::SYSCHAT_MIN_W);
+    const _: () = assert!(crate::syschat::SYSCHAT_DEFAULT_H >= crate::syschat::SYSCHAT_MIN_H);
     // **对照实验**（`ABB_VERIFY_SETTINGS=1`）：对**设置窗**做与对话窗一模一样的写入实验。
     // owner 的疑问「设置窗为什么可以（缩放）？」只能靠对照来回答：同样的 `set_size`，
     // 若设置窗落地、对话窗不落地 ⇒ 差别在对话窗自己的其它写方；若两边都不落地 ⇒
@@ -8335,7 +8340,7 @@ pub fn run_gui() -> Result<()> {
                 if let (Some(b), Some(d)) = (saver_bw.upgrade(), saver_cw.upgrade()) {
                     if d.window().is_visible() {
                         snap_bubble_to_dialog(&b, &d);
-                        if let Some(r) = logical_window_rect(&b.window()) {
+                        if let Some(r) = logical_window_rect(b.window()) {
                             to_save = crate::syschat::BubblePos { x: r.0, y: r.1 };
                         }
                     }

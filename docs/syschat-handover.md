@@ -105,7 +105,7 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
 6. **walgit 协作**：卡 = `walgit collab entry`；`--parent` **必须是上一条条目的真实 oid**（拿 issue oid 当 parent 会造分叉）。
 7. **提交信息不要用反引号**（bash 会当命令替换执行）⇒ 用 `git commit -F <file>`。
 8. **owner 已把单条开发的门禁+评审降档**：单条只跑 `cargo build` + 定向隔离测试；**批量交付/上线前**再统一跑四门禁（fmt / clippy `-D warnings` / `build --locked` / 隔离门禁）与独立评审。
-9. **本机 clippy 基线本已红**（rustc/clippy 1.99）：只保证**零新增 lint**（与 base 比对 lint 多重集）。
+9. **clippy 门禁是绝对量，不再接受「零新增」**：工具链已钉在 `rust-toolchain.toml`（1.99.0），`cargo clippy --all-targets -- -D warnings` 必须 **exit 0**。历史：2026-10-11 修绿 → 10-14～10-17 又攒出 25 条 → 期间每张卡自述「零新增 lint」，红色因此只累积不清（卡 `abb-clippy-gate-red-on-main-20261022`）。「零新增」是相对量，只能证明「没更差」，不能证明「门禁是绿的」。
 10. **发版/安装**（`scripts/build.sh` 硬编码 `target/`，会落到启动卷 ⇒ 用手动组装）：
    见 §7 附录的安装命令（release 构建 → 组 bundle → `agent-bridge-dev` 签名 + `app-assets/abb.entitlements` → `tools/check_entitlements.sh` → 装 `/Applications/ABB.app`）。
 
