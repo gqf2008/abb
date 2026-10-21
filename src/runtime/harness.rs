@@ -1988,6 +1988,33 @@ fn handle_prompt_result(l: &mut Loop, handle: &RuntimeHandle, mut result: Prompt
                     &batch,
                     format!("⚠️ 暂时不再重试：{msg}。稍后（约一分钟后）再发即可。"),
                 );
+            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_body_too_large(e)) {
+                // 请求体超上游上限：重试不会让请求体变小 ⇒ 当场死信。
+                //
+                // 光提示「请 /new」是不够的：撑爆请求体的是**执行层会话里累积的图片
+                // part**（`dev__read` 读图 → base64 上限 4.5MB/张，每轮随请求重发），
+                // 而桥侧 `/new` 换的只是桥侧 UUID，执行层会话照旧复用（另见卡
+                // `abb-new-does-not-reset-agent-20261021`）。所以这里**顺手失效该频道
+                // 的执行层会话**：下一条消息必然走 `session/new`，上下文回到基线——
+                // 否则「请重发」是一句空话，用户只能重启整个进程。
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    "dead-lettering batch — request body exceeds upstream limit (413)"
+                );
+                let invalidated = result.agent.state.invalidate_channel(&batch.channel_id);
+                l.registry.forget_channel(agent_index, batch.channel_id);
+                crate::log!(
+                    "[harness] 死信（请求体超上游上限 413）：channel={} 已失效该频道执行层会话={} → 下一条消息重建上下文",
+                    batch.channel_id,
+                    invalidated
+                );
+                notify_channel(
+                    l,
+                    handle,
+                    &batch,
+                    "⚠️ 处理失败：本会话的请求体已超过上游上限（多为图片在上下文里累积）。已为你重置本会话上下文，请重发这条消息。"
+                        .to_string(),
+                );
             } else if let Some(dead) = l.queue.requeue(batch) {
                 let reason =
                     dead_letter_reason(&result.outcome, result.agent.acp.stderr_tail().as_deref());
@@ -2266,6 +2293,31 @@ fn is_model_not_found(error: &AcpError) -> bool {
         return false;
     };
     *code == -32002 && message.contains("model not found")
+}
+
+/// 请求体超过上游网关的 body 上限（413）——**不可重试**：请求体不会因为重试而
+/// 变小，10 次重试必然全败，只把一条错误拖成「重试 10 次 + 死信」（卡
+/// `abb-413-body-limit-20261020`）。
+///
+/// 认的四种写法都来自实测（`api.deepseek.com/v1`，48MB 附近）：
+/// - `http error 413`：rpi/reqwest 侧的状态行；
+/// - `Failed to buffer the request body` / `length limit exceeded`：上游 axum 那层的
+///   拒绝文案（同一句话里的两段，分别匹配以防只透出一段）；
+/// - `Request Entity Too Large`：openresty 的 HTML 错误页（更外面一层的通用写法）。
+///
+/// **不用裸 `"413"` 匹配**：错误文本里可能夹着别的数字（端口、字节数、行号），
+/// 误判会把可自愈的批次当场死信。
+fn is_body_too_large(error: &AcpError) -> bool {
+    const MARKERS: &[&str] = &[
+        "http error 413",
+        "Failed to buffer the request body",
+        "length limit exceeded",
+        "Request Entity Too Large",
+    ];
+    let AcpError::AgentError { message, .. } = error else {
+        return false;
+    };
+    MARKERS.iter().any(|marker| message.contains(marker))
 }
 
 /// P2.3：受限会话被 `pool::create_session_and_apply_model` 的档位硬闸拒绝
@@ -3860,6 +3912,63 @@ mod model_not_found_tests {
             code: -32000,
             message: "model not found".to_string(),
         }));
+    }
+}
+
+#[cfg(test)]
+mod body_too_large_tests {
+    use super::*;
+
+    /// 四种实测写法（卡 `abb-413-body-limit-20261020`）都归入不可重试。
+    ///
+    /// 为什么值得单测：这条判据决定「重试 10 次后死信 + 用户看到刷屏」还是
+    /// 「一次可行动提示」；两种 413（上游 axum 层 / openresty 层）文案不同，
+    /// 漏掉任何一种都会回到旧行为。
+    #[test]
+    fn matches_every_observed_413_phrasing() {
+        for message in [
+            // rpi/reqwest 侧状态行（用户看到的那句）
+            "回合失败：http error 413: Failed to buffer the request body: length limit exceeded",
+            // 只有 axum 那层的一句话
+            "Failed to buffer the request body: length limit exceeded",
+            // openresty 的 HTML 页（另一次实测）
+            "http error 413: <html><h1>413 Request Entity Too Large</h1></html>",
+        ] {
+            assert!(
+                is_body_too_large(&AcpError::AgentError {
+                    code: -32002,
+                    message: message.to_string(),
+                }),
+                "应判为请求体超限：{message}"
+            );
+        }
+    }
+
+    /// 反面：错误文本里夹着 `413` 这个数字**不足以**判死——裸 `413` 匹配会把
+    /// 「耗时 413ms」「端口 41312」「读到 413 字节」这类可自愈的失败拖成死信。
+    #[test]
+    fn bare_413_digits_are_not_enough() {
+        for message in [
+            "回合失败：超时 413ms 无响应",
+            "http error 502: connect to 127.0.0.1:41312 failed",
+            "dev__read 读取失败：file too large, 413 bytes remaining",
+        ] {
+            assert!(
+                !is_body_too_large(&AcpError::AgentError {
+                    code: -32002,
+                    message: message.to_string(),
+                }),
+                "不应判为请求体超限：{message}"
+            );
+        }
+    }
+
+    /// 非 `AgentError` 变体一律不归这条管（保持与其它分类判据同形）。
+    #[test]
+    fn non_agent_errors_never_match() {
+        assert!(!is_body_too_large(&AcpError::SpawnRefused(
+            "熔断中".to_string()
+        )));
     }
 }
 
