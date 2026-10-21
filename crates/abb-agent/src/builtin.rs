@@ -29,7 +29,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rpi_agent::agent_tool::AgentTool;
 use rpi_agent::error::AgentError;
-use rpi_agent::types::{AgentToolResult, ToolResultPartial};
+use rpi_agent::types::{AgentToolResult, TextContentOrImage, ToolResultPartial};
 use rpi_ai::types::{Schema, Tool};
 use rpi_tools::{
     create_bash_tool, create_edit_tool, create_find_tool, create_grep_tool, create_ls_tool,
@@ -176,10 +176,26 @@ pub fn dev_tools(
             workspace,
         ));
     }
+    // read 工具：读域限定（若受限）+ **图片预算**（所有会话）。预算必须先于工具构造取好，
+    // 因为 `exposed` 把它搬进 `Guard`；`dev_tools` 每会话调一次 ⇒ 预算天然按会话隔离。
+    let image_budget = ImageBudget::from_env(&crate::provider::ProcessEnv);
+    let read_guard_for_read = match (mode.restrict_read(), image_budget.clone()) {
+        (true, Some(budget)) => Guard::ReadWithBudget {
+            roots: Some(read_roots.to_vec()),
+            budget,
+        },
+        (false, Some(budget)) => Guard::ReadWithBudget {
+            roots: None,
+            budget,
+        },
+        // 预算被显式关掉（`ABB_AGENT_IMAGE_BUDGET_BYTES=0`）⇒ 退回原来那套。
+        (true, None) => Guard::ReadPath(read_roots.to_vec()),
+        (false, None) => Guard::None,
+    };
     tools.push(exposed(
         create_read_tool(&context, Some(read_tool_options())),
         "read",
-        read_guard.clone(),
+        read_guard_for_read,
         workspace,
     ));
     if mode.allow_write() {
@@ -262,6 +278,17 @@ enum Guard {
     /// 仅受限会话套用；owner 全权限用 `None`（对齐参照物 FullAccess 读任意路径）。
     /// 括号里是附加只读根（如 bot 级 `attachments/`）——它们是**读**域，仍不能写。
     ReadPath(Vec<PathBuf>),
+    /// `read` 工具专用的**组合闸**：读域限定（同 [`Guard::ReadPath`]）+ 会话级**图片预算**（见 [`ImageBudget`]）。
+    ///
+    /// 为何不直接复用 `ReadPath` 再加一个变体：`Guard` 是**单个**字段，读工具的 `ls`/`grep`/`find`
+    /// 共用同一个 `read_guard`，而预算只属于 `read`（后三者不出图）。合成一个变体比为它们各加一层更清楚。
+    ///
+    /// `roots = None` = 不限定读域（owner 全权限），但预算**仍生效**——要防的是所有会话
+    /// 自己的图把请求体顶爆，与权限无关。
+    ReadWithBudget {
+        roots: Option<Vec<PathBuf>>,
+        budget: Arc<ImageBudget>,
+    },
     /// shell：把 schema 的 `timeout_secs` 翻回 rpi 的 `timeout`。
     ShellTimeout,
 }
@@ -321,6 +348,158 @@ pub fn image_processor_from(
             as std::sync::Arc<dyn rpi_tools::ReadImageProcessor>
     })
 }
+
+/// 会话级图片预算：控制 `dev__read` 往上下文里塞多少**图片 base64**。
+///
+/// 为什么需要（卡 `abb-413-image-budget-20261022`，为 `abb-413-body-limit-20261020` 治本）：
+/// 上游网关的请求体上限约 48MB（issue 作者实测 `api.deepseek.com/v1`）。而 `dev__read`
+/// 读图会把真 `Image` part 放进上下文，**每轮都随请求重发**，单张封顶
+/// `INLINE_IMAGE_MAX_BASE64_BYTES`（9MB/2 = 4.5MB）——十几张作业图就能把请求体顶爆。
+///
+/// 为什么是「控制塞进去的量」而不是「塞进去再裁」：两条现成路都堵死了（本回合读 rpi 源码实测）——
+/// - `rpi-agent` 的 `transform_context` 钩子（`hooks.rs:34/107`）在 `agent_loop.rs:447` 真会调，
+///   但 `agent.rs:517` 硬编码 `transform_context: None`，而 `AgentBuilder` 的 12 个公开方法里
+///   **没有 setter** ⇒ abb-agent 装不上；
+/// - `Agent::state()` 注释明写「Clones tools/messages so callers can't mutate internal state」
+///   ⇒ 运行期拿不到可变消息句柄，只能重建会话（那等于 `/new`，不是「预算内降级」）。
+///
+/// 所以唯一能真正拦住 413 的位置是**入口**：自己的 `dev__read` 不把超预算的图塞进上下文。
+///
+/// 口径与配置：预算与上限都用 **base64 字节**（与 `INLINE_IMAGE_MAX_BASE64_BYTES` 同单位）。
+/// 默认 `IMAGE_BUDGET_DEFAULT_BYTES`（32MB，按 48MB 网关上限留余量）；
+/// 环境变量 `ABB_AGENT_IMAGE_BUDGET_BYTES` 可覆盖（`0` = 不限，给排障留退路）。
+struct ImageBudget {
+    limit: usize,
+    state: std::sync::Mutex<ImageBudgetState>,
+}
+
+#[derive(Default)]
+struct ImageBudgetState {
+    /// 已进上下文的 base64 字节总计。
+    used: usize,
+    /// 已进上下文的图片指纹（`DefaultHasher(base64)` + 长度）。
+    /// 用 `(hash, len)` 而不是存整串：存整串会让内存翻倍，而预算本身就是 32MB 量级。
+    /// 碰撞后果是「一张**不同**的图被当成重复而省略」，不静默损坏数据、且提示里看得见；
+    /// 以 20 张图的规模计碰撞概率可忽略。
+    seen: std::collections::HashSet<(u64, usize)>,
+    /// 80% 水位是否已报过（只报一次，不刷屏）。
+    warned: bool,
+}
+
+/// 默认图片预算（base64 字节）。32MB ≈ 网关 48MB 上限的三分之二，留出文本与工具结果的余量。
+pub const IMAGE_BUDGET_DEFAULT_BYTES: usize = 32 * 1024 * 1024;
+
+/// 图片预算的环境变量名（与 `ABB_AGENT_IMAGE_PROCESSOR` 同惯例：绝对字节数，`0` = 不限）。
+pub const IMAGE_BUDGET_ENV: &str = "ABB_AGENT_IMAGE_BUDGET_BYTES";
+
+/// 从环境值解析预算字节数（**可注入版本**，单测不改进程全局 env）。
+///
+/// - 缺省 ⇒ [`IMAGE_BUDGET_DEFAULT_BYTES`]；
+/// - `"0"` ⇒ `None` = **不限**（排障/回退）；
+/// - 非法值 ⇒ 也回默认（这不是安全闸，容忍非法值比悄悄关掉保护更符合预期）。
+pub fn image_budget_from(value: Option<&str>) -> Option<usize> {
+    match value.map(str::trim) {
+        Some("0") => None,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => Some(IMAGE_BUDGET_DEFAULT_BYTES),
+        },
+        None => Some(IMAGE_BUDGET_DEFAULT_BYTES),
+    }
+}
+
+impl ImageBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            state: std::sync::Mutex::new(ImageBudgetState::default()),
+        }
+    }
+
+    /// 从环境源构造（`None` = 不启用预算，调用方直接用 `Guard::None` 之外的原行为）。
+    fn from_env(env: &dyn EnvSource) -> Option<Arc<Self>> {
+        image_budget_from(env.get(IMAGE_BUDGET_ENV).as_deref())
+            .map(|limit| Arc::new(Self::new(limit)))
+    }
+
+    /// 对一次 `read` 结果做**去重 + 预算降级**，返回本轮新占用的字节数。
+    ///
+    /// 逐块处理：`Image` 块按「已见过 ⇒ 省略」「超预算 ⇒ 省略」「否则保留并计入」三条走；
+    /// `Text` 块原样不动。被省略的图**换成一行动作文本**，不静默丢弃——模型要知道去哪拿图。
+    ///
+    /// 锁中毒时**不 panic**：预算不是安全闸，宁可退化成「本次不检查」也不要搞崩工具调用。
+    fn apply(&self, content: &mut [TextContentOrImage]) -> usize {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut added = 0usize;
+        for block in content.iter_mut() {
+            let TextContentOrImage::Image(image) = block else {
+                continue;
+            };
+            let fingerprint = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                image.data.hash(&mut hasher);
+                (hasher.finish(), image.data.len())
+            };
+            let bytes = image.data.len();
+            let (replacement, reason) = if state.seen.contains(&fingerprint) {
+                (
+                    format!(
+                        "[image 已省略：同一张图已在本次会话的上下文里（{}，{} 字节）；需要重新看图请用 dev__shell 处理，不要重复读入]",
+                        image.mime_type, bytes
+                    ),
+                    "duplicate",
+                )
+            } else if state.used.saturating_add(bytes) > self.limit {
+                (
+                    format!(
+                        "[image 已省略：本次会话图片预算已用尽（已用 {} / 上限 {} 字节，本图 {} 字节）。\
+                         上游请求体有上限，继续读图会导致整个请求被拒。\
+                         需要处理这张图请用 dev__shell（例如转成小尺寸后写到工作区再看局部）]",
+                        state.used, self.limit, bytes
+                    ),
+                    "over-budget",
+                )
+            } else {
+                state.seen.insert(fingerprint);
+                state.used = state.used.saturating_add(bytes);
+                added = added.saturating_add(bytes);
+                continue;
+            };
+            tracing::warn!(
+                reason,
+                mime = %image.mime_type,
+                bytes,
+                used = state.used,
+                limit = self.limit,
+                "dev__read 图片被省略（避免上游请求体超限）"
+            );
+            *block = TextContentOrImage::text(replacement);
+        }
+        // 80% 水位警告：只报一次（否则每轮读图都刷一行，反而淹没真正的越限）。
+        if !state.warned && state.used * 5 >= self.limit * 4 {
+            state.warned = true;
+            tracing::warn!(
+                used = state.used,
+                limit = self.limit,
+                "会话图片预算已用超过 80%：再读图就可能把上游请求体顶爆"
+            );
+        }
+        added
+    }
+}
+
+impl PartialEq for ImageBudget {
+    /// 只按**句柄身份**比：`Guard` 需要 `PartialEq`（`ShellTimeout` 分支在用），
+    /// 而预算的内容是可变状态，逐字段比没有意义。
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+impl Eq for ImageBudget {}
 
 fn exposed(
     inner: Arc<dyn AgentTool>,
@@ -442,11 +621,27 @@ impl AgentTool for Exposed {
                 self.confine(&params).await?
             }
             Guard::ReadPath(roots) => self.confine_read(&params, roots).await?,
+            // 读域限定与图片预算：前者改入参，后者后处理结果（见下方 `budget` 分支）。
+            Guard::ReadWithBudget { roots, .. } => match roots {
+                Some(roots) => self.confine_read(&params, roots).await?,
+                None => params,
+            },
             Guard::ShellTimeout => rename_timeout_param(params),
         };
-        self.inner
+        let mut result = self
+            .inner
             .execute(tool_call_id, params, signal, on_update)
-            .await
+            .await?;
+        if let Guard::ReadWithBudget { budget, .. } = &self.guard {
+            let added = budget.apply(&mut result.content);
+            if added > 0 {
+                // 记到 `details` 里，让上游（与人工排障）能看到本回合新增了多少图片字节。
+                if let Value::Object(map) = &mut result.details {
+                    map.insert("image_budget_added_bytes".into(), Value::from(added));
+                }
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -1437,6 +1632,162 @@ mod tests {
             "端到端：应等比缩放（原比 25.0，实际 {ratio:.2}：{}×{}）",
             decoded.width(),
             decoded.height()
+        );
+    }
+
+    // ── 会话图片预算（卡 abb-413-image-budget-20261022）────────────────────
+
+    fn image_block(data: &str) -> TextContentOrImage {
+        TextContentOrImage::Image(rpi_ai::types::ImageContent {
+            kind: rpi_ai::types::ImageContentType,
+            data: data.to_string(),
+            mime_type: "image/png".to_string(),
+        })
+    }
+
+    fn image_data_of(block: &TextContentOrImage) -> Option<&str> {
+        match block {
+            TextContentOrImage::Image(img) => Some(img.data.as_str()),
+            TextContentOrImage::Text(_) => None,
+        }
+    }
+
+    fn text_of(block: &TextContentOrImage) -> Option<&str> {
+        match block {
+            TextContentOrImage::Text(t) => Some(t.text.as_str()),
+            TextContentOrImage::Image(_) => None,
+        }
+    }
+
+    /// 预算内：图片 part **原样保留**（逐字比对，证明没有副作用）。
+    ///
+    /// 判别力：把 `apply` 里「预算内」那一支也改成替换 ⇒ 本用例红。
+    #[test]
+    fn image_budget_keeps_images_within_limit() {
+        let budget = ImageBudget::new(1000);
+        let data = "A".repeat(600);
+        let mut content = vec![image_block(&data), TextContentOrImage::text("说明")];
+        let added = budget.apply(&mut content);
+        assert_eq!(added, 600, "应记下本轮新增字节");
+        assert_eq!(
+            image_data_of(&content[0]),
+            Some(data.as_str()),
+            "预算内必须原样保留"
+        );
+        assert_eq!(text_of(&content[1]), Some("说明"), "文本块不得被动");
+    }
+
+    /// 超预算：图片 part 换成**可行动文本**（不是静默丢弃）。
+    ///
+    /// 判别力：删掉 `over-budget` 分支 ⇒ 图会漏进上下文 ⇒ 本用例红。
+    #[test]
+    fn image_budget_degrades_when_over_limit() {
+        let budget = ImageBudget::new(1000);
+        let mut content = vec![image_block(&"A".repeat(800)), image_block(&"B".repeat(400))];
+        budget.apply(&mut content);
+        assert!(
+            image_data_of(&content[0]).is_some(),
+            "第一张在预算内，应保留"
+        );
+        assert_eq!(
+            image_data_of(&content[1]),
+            None,
+            "第二张超预算，必须不再以 Image 进上下文"
+        );
+        let msg = text_of(&content[1]).expect("应换成文本");
+        assert!(msg.contains("预算已用尽"), "文案要说清是预算问题：{msg}");
+        assert!(msg.contains("dev__shell"), "必须给出可行动的后路：{msg}");
+    }
+
+    /// 同一张图重复读：只算一次，第二份换成「已在上下文里」提示。
+    ///
+    /// 判别力：删掉 `seen.contains` 分支 ⇒ 第二份会计入预算且仍为 Image ⇒ 本用例红。
+    #[test]
+    fn image_budget_dedupes_identical_images() {
+        let budget = ImageBudget::new(10_000);
+        let data = "C".repeat(500);
+        let mut first = vec![image_block(&data)];
+        assert_eq!(budget.apply(&mut first), 500);
+        assert!(image_data_of(&first[0]).is_some());
+
+        let mut second = vec![image_block(&data)];
+        assert_eq!(budget.apply(&mut second), 0, "重复图不得再占用预算");
+        assert_eq!(image_data_of(&second[0]), None, "重复图不应第二次进上下文");
+        assert!(
+            text_of(&second[0]).unwrap().contains("同一张图"),
+            "提示要说明是重复，不是超预算"
+        );
+
+        // 不同的图仍能进（证明去重没有误杀）。
+        let mut third = vec![image_block(&"D".repeat(500))];
+        assert_eq!(budget.apply(&mut third), 500, "不同图必须计入");
+        assert!(image_data_of(&third[0]).is_some());
+    }
+
+    /// 端到端接线：`dev__read` 真的走了**带预算的 Guard**。
+    ///
+    /// 为何必须有这条：上面三条是直接调 `apply()` 的 —— 把 `dev_tools` 里的接线改回
+    /// `read_guard.clone()`（即不装预算），那三条**照样全绿**。这条才会红。
+    #[tokio::test]
+    async fn read_tool_carries_image_budget_guard() {
+        let workspace = temp_workspace("img-budget-e2e");
+        let mut img = image::RgbImage::new(400, 400);
+        for (x, _y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([(x % 256) as u8, 40, 200]);
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("编码 PNG");
+        std::fs::write(workspace.join("pic.png"), png.into_inner()).expect("写测试图");
+
+        let read = dev_tools(&workspace, SandboxMode::FullAccess, false, &[])
+            .into_iter()
+            .find(|t| t.schema().name == "dev__read")
+            .expect("read 工具必须存在");
+
+        // 默认预算（32MB）下小图应正常进上下文 —— 证明预算没误伤正常路径。
+        let out = read
+            .execute(
+                "call",
+                serde_json::json!({ "path": "pic.png" }),
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("读图应成功");
+        assert!(
+            out.content.iter().any(|b| image_data_of(b).is_some()),
+            "默认预算下小图应正常进上下文"
+        );
+
+        // 同一张图再读一次：去重生效 ⇒ 不再出现 Image part（证明 Guard 真的装了预算）。
+        let again = read
+            .execute(
+                "call",
+                serde_json::json!({ "path": "pic.png" }),
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("第二次读图也应成功");
+        assert!(
+            !again.content.iter().any(|b| image_data_of(b).is_some()),
+            "同一会话重复读同一张图，第二次不应再以 Image 进上下文（否则预算没接线）"
+        );
+    }
+
+    /// 环境值解析：默认 32MB；`0` = 不限；非法值回默认（不悄悄关保护）。
+    #[test]
+    fn image_budget_env_parsing() {
+        assert_eq!(image_budget_from(None), Some(IMAGE_BUDGET_DEFAULT_BYTES));
+        assert_eq!(image_budget_from(Some("0")), None, "0 = 不限（排障退路）");
+        assert_eq!(image_budget_from(Some(" 0 ")), None, "两侧空白应被容忍");
+        assert_eq!(image_budget_from(Some("1048576")), Some(1_048_576));
+        assert_eq!(
+            image_budget_from(Some("not-a-number")),
+            Some(IMAGE_BUDGET_DEFAULT_BYTES),
+            "非法值回默认（这不是安全闸，错误不能悄悄关掉保护）"
         );
     }
 
