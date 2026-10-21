@@ -40,6 +40,29 @@ def contract_of:
              | {blocking: (.b | tonumber), nonblocking: (.nb | tonumber)})
     else null end;
 
+# 单条 review 的契约问题（空 = 无问题）。抽成函数是为了同时用于「最后一条」与「历史计数」，
+# 避免两处各写一遍正则/比较而漂移。
+def contract_problems($contract_ts):
+  . as $r
+  | if ($r.decision == "comment") then empty
+    elif ($r.decision != "approve" and $r.decision != "request_changes") then
+      (if ($r.ts >= $contract_ts) then
+         "\($r.oid): 未知 decision=\($r.decision)（ts=\($r.ts) ≥ 契约阈值 \($contract_ts)）"
+       else empty end)
+    elif ($r.contract == null) then
+      (if ($r.ts >= $contract_ts) then
+         "\($r.oid): decision=\($r.decision) 缺 findings 契约行（ts=\($r.ts) ≥ 契约阈值 \($contract_ts)）"
+       else empty end)
+    elif (($r.labels.blocking + $r.labels.nonblocking) > 0
+          and ($r.labels.blocking != $r.contract.blocking
+               or $r.labels.nonblocking != $r.contract.nonblocking)) then
+      "\($r.oid): 契约行 \($r.contract.blocking)/\($r.contract.nonblocking) 与逐条标签 \($r.labels.blocking)/\($r.labels.nonblocking) 不一致"
+    elif ($r.contract.blocking > 0 and $r.decision != "request_changes") then
+      "\($r.oid): blocking=\($r.contract.blocking) 但 decision=\($r.decision)（应 request_changes）"
+    elif ($r.contract.blocking == 0 and $r.decision != "approve") then
+      "\($r.oid): blocking=0 但 decision=\($r.decision)（应 approve）"
+    else empty end;
+
 def label_counts:
   (. // "")
   | split("\n")
@@ -83,27 +106,37 @@ def label_counts:
 | (($reviews | map(select(.decision != "comment"
                          and .decision != "approve" and .decision != "request_changes"
                          and .ts < $contract_ts)) | length) + $skipped) as $skipped
+# 历史契约不一致（告警，不阻塞）：所有判决类 review 里、除最后一条之外的那些问题条数。
+# 与 (d) 的 `self_reviews_historical` 同性质——保留可见性，但不再锁死卡片。
+| ( ( [ $reviews[] | select(.decision != "comment") ] ) as $all_judged
+    | if ($all_judged | length) > 1 then
+        ( $all_judged
+          | (max_by(.ts)) as $last
+          | map(select(.ts < $last.ts or (.ts == $last.ts and .oid != $last.oid)))
+          | map(contract_problems($contract_ts) | select(. != "")) | length )
+      else 0 end ) as $contract_mismatches_historical
 | (
     [
-      # (a) 判决类 review 的契约一致性
-      ( $reviews[] | . as $r
-        | if ($r.decision == "comment") then empty
-          elif ($r.decision != "approve" and $r.decision != "request_changes") then
-            (if ($r.ts >= $contract_ts) then
-               "\($r.oid): 未知 decision=\($r.decision)（ts=\($r.ts) ≥ 契约阈值 \($contract_ts)）"
-             else empty end)
-          elif ($r.contract == null) then
-            (if ($r.ts >= $contract_ts) then
-               "\($r.oid): decision=\($r.decision) 缺 findings 契约行（ts=\($r.ts) ≥ 契约阈值 \($contract_ts)）"
-             else empty end)
-          elif (($r.labels.blocking + $r.labels.nonblocking) > 0
-                and ($r.labels.blocking != $r.contract.blocking
-                     or $r.labels.nonblocking != $r.contract.nonblocking)) then
-            "\($r.oid): 契约行 \($r.contract.blocking)/\($r.contract.nonblocking) 与逐条标签 \($r.labels.blocking)/\($r.labels.nonblocking) 不一致"
-          elif ($r.contract.blocking > 0 and $r.decision != "request_changes") then
-            "\($r.oid): blocking=\($r.contract.blocking) 但 decision=\($r.decision)（应 request_changes）"
-          elif ($r.contract.blocking == 0 and $r.decision != "approve") then
-            "\($r.oid): blocking=0 但 decision=\($r.decision)（应 approve）"
+      # (a) 判决类 review 的契约一致性 —— **只判最后一条判决类 review**。
+      #
+      # 为什么只看最后一条（卡 abb-cadence-a-scans-all-reviews-20261022）：
+      # 本判据原先用 `$reviews[]` 扫描**全部** review，于是任何一条历史 review 的格式笔误
+      # 都会让整张卡**永久不可合并**——即使它已被后续合法 approve 取代、并在链上写了更正。
+      # 真实实例：卡 abb-413-image-budget-20261022 的第 1 轮 review 写了
+      # `findings: blocking=0` 却 `decision=request_changes`（正文说"非阻塞"，元数据说"阻塞"），
+      # 第 2 轮已合法 approve，但 (a) 仍揪住那条历史条目。
+      #
+      # 这与已经合并的 (d) 是同一设计原则：**合并闸门要回答的是"能不能放行这一次批准"**，
+      # 历史条目已被取代，不该无限追溯。历史不一致改为计数上报（见 summary 的
+      # `contract_mismatches_historical`），保留可审计性、但不阻塞。
+      #
+      # **没有放宽的证明**：最后一条判决类 review 仍逐条校验（未知 decision / 缺契约行 /
+      # 标签不符 / blocking>0 却 approve / blocking=0 却 request_changes），
+      # 且 (c) 仍要求它是 blocking=0 的 approve。样本 bad_last_review_contract_mismatch
+      # 专门钉住"最后一条本身写错必须红"。
+      ( ( $reviews | map(select(.decision != "comment")) ) as $judged
+        | if ($judged | length) > 0 then
+            ($judged | max_by(.ts)) | contract_problems($contract_ts)
           else empty end ),
 
       # (b) blocking 轮数 ≤ 2
@@ -194,5 +227,6 @@ def label_counts:
                blocking_rounds: $blocking_rounds,
                skipped_historical: $skipped,
                merges: ($merges | length),
-               self_reviews_historical: ($self_reviews_all | length) },
+               self_reviews_historical: ($self_reviews_all | length),
+               contract_mismatches_historical: $contract_mismatches_historical },
     reviews: [ $reviews[] | {oid, ts, decision, contract} ] }

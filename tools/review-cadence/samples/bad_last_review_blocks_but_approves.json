@@ -1,0 +1,38 @@
+[
+  {
+    "entry": {
+      "kind": "issue",
+      "id": "t",
+      "actor": "author",
+      "ts": 100,
+      "body": {}
+    },
+    "oid": "i1",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "patch",
+      "id": "t",
+      "actor": "abb-worker-9",
+      "ts": 1000000,
+      "body": {}
+    },
+    "oid": "p1",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "review",
+      "id": "t",
+      "actor": "abb-reviewer-5",
+      "ts": 1000001,
+      "body": {
+        "decision": "approve",
+        "note": "findings: blocking=2 non-blocking=0\n- [blocking] a\n- [blocking] b\n"
+      }
+    },
+    "oid": "r_sneak",
+    "verified": true
+  }
+]
