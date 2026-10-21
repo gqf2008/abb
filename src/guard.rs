@@ -471,7 +471,14 @@ fn is_bridge_state_path(p: &str) -> bool {
     }
     path.components().any(|c| {
         let s = trim_trail(&c.as_os_str().to_string_lossy());
+        // `.agents`/`.goose` 是**技能根**（`crates/abb-agent/src/skills.rs::SKILL_DIRS` =
+        // `.agents/skills`、`.goose/skills`、`.claude/skills`）：技能的 name/description 会被
+        // `hints.rs` 注入 owner 会话的系统提示、正文由 `load_skill` 读 ⇒ 受限会话能写它就等于
+        // 提示词注入。卡 `abb-channel-mcp-remaining-injection-surfaces-20261012` 的 finding ①。
+        // 按**组件**判（而非前缀字符串）同时挡住 `skills/x` 的子目录写法。
         s.eq_ignore_ascii_case(".claude")
+            || s.eq_ignore_ascii_case(".agents")
+            || s.eq_ignore_ascii_case(".goose")
             || s.eq_ignore_ascii_case("summaries")
             || s.eq_ignore_ascii_case("history")
             || s.eq_ignore_ascii_case(".git")
@@ -1924,6 +1931,40 @@ mod tests {
             check_file_paths("Read", &serde_json::json!({"file_path": "jobs.json"}), &ws),
             Decision::Allow
         );
+        // 技能目录是技能注入面（卡 abb-channel-mcp-remaining-injection-surfaces-20261012
+        // finding ①）：三个技能根都必须拒写。
+        //
+        // **逐个在盘上建出目录与文件**：`check_file_paths` 还有一道「工作区外」检查，
+        // 路径不存在时会抢先拒绝——那样测到的是那道闸，不是名单（变异自验会假绿）。
+        // 建出后必须由「桥状态/指令文件」那条理由拒，才说明名单真的生效。
+        for p in [
+            ".agents/skills/pwn/SKILL.md",
+            ".goose/skills/pwn/SKILL.md",
+            ".claude/skills/pwn/SKILL.md",
+            "sub/.agents/skills/pwn/SKILL.md",
+            ".AGENTS/skills/pwn/SKILL.md",
+            "agents.md",
+            "sessions.json",
+            "history/abc.jsonl",
+        ] {
+            let abs = std::path::Path::new(&ws).join(p);
+            std::fs::create_dir_all(abs.parent().expect("有父目录"))
+                .expect("建目录（让路只可能被名单拒）");
+            std::fs::write(&abs, "x").expect("建文件");
+            match check_file_paths("Write", &serde_json::json!({"file_path": p}), &ws) {
+                Decision::Deny(reason) => assert!(
+                    reason.contains("桥状态") || reason.contains("指令文件"),
+                    "{p} 应被状态名单拒，实际被别的闸拒了：{reason}"
+                ),
+                Decision::Allow => panic!("{p} 必须拒写（否则受限→owner 注入）"),
+            }
+        }
+        // 负向对照：同形状但无点前缀的 `skills/x.md` 不是技能根（建出来也不应被名单拒）。
+        assert!(
+            !is_bridge_state_path("skills/x.md"),
+            "无点前缀的同名目录不是技能根"
+        );
+        assert!(!is_bridge_state_path("notes/.agentsx/a"), "只认完整组件");
         // 普通工作区文件不受影响
         assert_eq!(
             check_file_paths("Write", &serde_json::json!({"file_path": "a.txt"}), &ws),
