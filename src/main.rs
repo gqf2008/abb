@@ -527,7 +527,8 @@ fn main() {
     //   agent-bridge job list
     //   agent-bridge job del <id前缀>
     //   agent-bridge job add (--once "YYYY-MM-DD HH:MM" | --cron "分 时 日 月 周") --prompt "做什么" [--note "原句"]
-    // chat_id 从 AGENT_BRIDGE_CHAT_ID env 读（桥 spawn claude 时注入），缺省回落主会话。
+    // chat_id 从 AGENT_BRIDGE_CHAT_ID env 读（**仅当**外部启动器显式设置时才有；
+    // 桥的 ACP 路径按 bot 长驻、无法按频道注入，见 resolve_chat_env 的说明），缺省回落主会话。
     if args.len() >= 2 && args[1] == "job" {
         std::process::exit(run_job_cli(&args[2..]));
     }
@@ -561,7 +562,7 @@ fn main() {
 
     // 会话管理 CLI（#23）：供 claude 用 Bash 调用（也可人用）。
     //   agent-bridge session reset <chat_id>
-    // bot 从 AGENT_BRIDGE_BOT_KEY env（桥注入）解析；chat_id 缺省取 AGENT_BRIDGE_CHAT_ID。
+    // bot 从 AGENT_BRIDGE_BOT_KEY env（桥**每 bot 进程**注入）解析；chat_id 缺省取 AGENT_BRIDGE_CHAT_ID。
     if args.len() >= 2 && args[1] == "session" {
         std::process::exit(run_session_cli(&args[2..]));
     }

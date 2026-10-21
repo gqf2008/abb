@@ -95,7 +95,12 @@ sleep/while 循环去等待——那会一直占着这个聊天，期间用户�
 - 不要用裸命令名 `agent-bridge` / `abb`：macOS 在 .app 内、Windows 在安装目录，都不在 PATH，
   裸调用会 command not found。`ABB_BIN` 由桥 spawn 时注入，保证调的是当前安装的同一个程序。
 
-目标会话与 bot 已由桥通过环境变量注入：`AGENT_BRIDGE_CHAT_ID`、`AGENT_BRIDGE_BOT_KEY`，CLI 会自动取用，无需手填。
+目标 bot **已由桥通过环境变量注入**：`AGENT_BRIDGE_BOT_KEY`，`task`/`job`/`deliver`
+不带 `--bot` 时会自动取用它，无需手填。
+
+但**目标会话（chat_id）不会被自动注入**：同一个 bot 有多个会话，桥无法替你选。
+要在**当前会话**回投，显式带 `--to-current`（`deliver`）或 `--to <bot_key>:<chat_id>`；
+群会话里建的任务若不带 `--to`，结果会落到该 bot 的**主会话（DM）**——群里的用户看不到。
 
 ## 后台子代理 → 长任务丢后台，别堵会话
 

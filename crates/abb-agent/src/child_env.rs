@@ -12,12 +12,15 @@
 
 /// agent 上下文标记：**必须**由我们写入，不能指望从宿主继承。
 ///
-/// abb 的真实 ACP 路径不会把 `AGENT_BRIDGE_BOT_KEY` / `CHAT_ID` / `SENDER_ROLE` 透传给
+/// abb 的真实 ACP 路径不会把 `AGENT_BRIDGE_CHAT_ID` / `SENDER_ROLE` 透传给
 /// shell（白名单把它们剥掉了），于是 abb 的 proc 闸（Q8：`--proc` 只允许 GUI/人工入口）
 /// 以这个变量作为**主判据**（`src/task_proc.rs::ACP_AGENT_CONTEXT_ENV`）。少了它，
 /// 「agent 派生的 shell 去建 `--proc` 任务」就会 fail-open 地通过。
 /// 被替代组件在同一个共享入口（`mcp::apply_passthrough_env`）里有这一步，本包照做，
 /// 且**两个消费者都写**（MCP 子进程与内置工具的 shell）。
+///
+/// 注意与 `AGENT_BRIDGE_BOT_KEY` 的区别：那个**在**白名单里（agent 要用它解析本 bot），
+/// 但两者不冲突——proc 闸只认本标记，不认 bot key。
 ///
 /// 它**不是**对敌意 owner 的安全边界（owner 本来 FullAccess、能清环境、能直接改
 /// `tasks.json`）：这是合规/纵深防御闸。
@@ -29,6 +32,12 @@ pub const PASSTHROUGH_ENV: &[&str] = &[
     // 也要用它驱动 CLI）。值由 abb 注入 agent 进程（`service.rs::abb_bin_env`），这里负责**往下透传**
     // 到 shell 工具与 MCP 子进程——缺这一项时它们在线上展开成空（卡 abb-mcp-orchestrator-p0-20261012）。
     "ABB_BIN",
+    // 当前 bot 的规范 key（由 abb 在 `service.rs::agent_bot_key_env` 注入 agent 进程）。
+    // 向下透传是为了让 `$ABB_BIN task add` / `deliver` 在 shell 里不带 `--bot` 时能解析出
+    // **本 bot**；不放行则 CLI 在多 bot 下直接报错、单 bot 下静默落到主会话（DM）——
+    // 卡 `abb-agent-env-residue-20261021`。不是凭据：bot key 就是
+    // `tasks/<key>/`、`workspaces/<key>/` 的目录名。
+    "AGENT_BRIDGE_BOT_KEY",
     // 基础
     "PATH",
     "HOME",
@@ -131,6 +140,9 @@ mod tests {
             "HTTPS_PROXY",
             // `$ABB_BIN`：agent 的 shell 与 MCP 子进程都要用它调桥（此前漏了 ⇒ 线上展开为空）
             "ABB_BIN",
+            // bot key：`$ABB_BIN task add`/`deliver` 不带 `--bot` 时靠它解析本 bot
+            // （卡 `abb-agent-env-residue-20261021`）
+            "AGENT_BRIDGE_BOT_KEY",
         ] {
             assert!(PASSTHROUGH_ENV.contains(&key), "缺 {key}：工具会瞎");
         }
