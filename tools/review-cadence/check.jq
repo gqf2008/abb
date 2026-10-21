@@ -63,6 +63,21 @@ def contract_problems($contract_ts):
       "\($r.oid): blocking=0 但 decision=\($r.decision)（应 approve）"
     else empty end;
 
+# 「最后一条判决类 review」的判定：返回 ts 最大**那一组**（可能多条）。
+#
+# 为什么是一组而不是一条（评审 abb-reviewer-142 的 BLOCKING-1）：
+# `ts` 是客户端签名时写入的，不是服务端盖章 ⇒ 两条 review 同 ts 是可构造的。而 jq 的
+# `max_by(.ts)` 在平局时返回**数组最后一个**最大值元素 ⇒ 「哪条算最后」取决于数组顺序，
+# 于是同一份内容换个顺序会得出相反结论（实测：真实 blocking 在前⇒放行、在后⇒拦截）。
+#
+# 平局本身语义含糊，**含糊时应当保守而非猜测**：所以返回整组，由调用方要求
+# 「组内任一条不干净就拦」。这样多条同 ts 只会让判定更严，不会更松。
+def final_judged:
+  if length == 0 then []
+  else (map(.ts) | max) as $max_ts
+    | map(select(.ts == $max_ts))
+  end;
+
 def label_counts:
   (. // "")
   | split("\n")
@@ -109,11 +124,13 @@ def label_counts:
 # 历史契约不一致（告警，不阻塞）：所有判决类 review 里、除最后一条之外的那些问题条数。
 # 与 (d) 的 `self_reviews_historical` 同性质——保留可见性，但不再锁死卡片。
 | ( ( [ $reviews[] | select(.decision != "comment") ] ) as $all_judged
-    | if ($all_judged | length) > 1 then
-        ( $all_judged
-          | (max_by(.ts)) as $last
-          | map(select(.ts < $last.ts or (.ts == $last.ts and .oid != $last.oid)))
-          | map(contract_problems($contract_ts) | select(. != "")) | length )
+    | if ($all_judged | length) > 0 then
+        # 排除 **ts 最大那一整组**（而不是单条）：平局时组内每条都算「最后」，
+        # 因此都不计入历史——这与 (a) 把它们全部纳入判定是互补的，不会重复也不会漏。
+        ( $all_judged | final_judged ) as $finals
+        | ( $all_judged
+            | map(select((.ts == $finals[0].ts) | not))
+            | map(contract_problems($contract_ts) | select(. != "")) | length )
       else 0 end ) as $contract_mismatches_historical
 | (
     [
@@ -135,9 +152,7 @@ def label_counts:
       # 且 (c) 仍要求它是 blocking=0 的 approve。样本 bad_last_review_contract_mismatch
       # 专门钉住"最后一条本身写错必须红"。
       ( ( $reviews | map(select(.decision != "comment")) ) as $judged
-        | if ($judged | length) > 0 then
-            ($judged | max_by(.ts)) | contract_problems($contract_ts)
-          else empty end ),
+        | ( $judged | final_judged )[] | contract_problems($contract_ts) ),
 
       # (b) blocking 轮数 ≤ 2
       ( if ($blocking_rounds > 2) then
@@ -149,12 +164,10 @@ def label_counts:
       ( ( $reviews
           | map(select(.ts >= $contract_ts
                        and (.decision == "approve" or .decision == "request_changes"))) ) as $post
-        | if ($post | length) > 0 then
-            ($post | max_by(.ts)) as $v
-            | if ($v.decision != "approve"
-                  or ($v.contract != null and $v.contract.blocking > 0)) then
-                "thread 最后一条判决类 review（\($v.oid)）不是 blocking=0 的 approve（decision=\($v.decision)）⇒ 不得合并"
-              else empty end
+        | ( $post | final_judged )[] | . as $v
+        | if ($v.decision != "approve"
+              or ($v.contract != null and $v.contract.blocking > 0)) then
+            "thread 最后一条判决类 review（\($v.oid)）不是 blocking=0 的 approve（decision=\($v.decision)）⇒ 不得合并"
           else empty end ),
 
       # (d) 独立评审（§0b）：**最后一条判决类 review** 的 actor 不得与**它所审的那份 patch**
@@ -174,20 +187,19 @@ def label_counts:
       #     的历史是「coordinator 自审 → 被发现 → patch 重签为真实作者 → 另人 approve」，
       #     若逐条判则那条已纠正的自审会永久锁死该卡。历史自审改由 summary 里的
       #     `self_reviews_historical` 计数上报（告警，不阻塞）。
-      #     **取 max_by(.ts) 而不是数组末元素**（评审 abb-reviewer-141 的 NB-1）：
+      #     **按 ts 取最大一组（final_judged）而不是数组末元素**（评审 abb-reviewer-141 的 NB-1；
+      #     平局处理见 final_judged 的注释与评审 abb-reviewer-142 的 BLOCKING-1）：
       #     thread JSON 是 parent-ordered，数组顺序不等于 ts 顺序；而 `ts` 由客户端在
       #     签名时写入、不是服务端盖章 ⇒ 构造「self 的 review ts 更晚却排在数组前面」
-      #     即可绕过。同一条 thread 里 (c)/(e) 也一律改用 max_by(.ts)。
+      #     即可绕过。同一条 thread 里 (a)/(c)/(e) 也一律走 final_judged。
       #     口径：只看 ts ≥ 契约阈值的 review（历史条目豁免，与 (a) 同口径）。
       ( ( $reviews
           | map(select(.ts >= $contract_ts
                        and (.decision == "approve" or .decision == "request_changes"))) ) as $judged
-        | if ($judged | length) > 0 then
-            ($judged | max_by(.ts)) as $r
-            | ( $patches | map(select(.ts < $r.ts)) | last ) as $p
-            | if $p != null and $p.actor != null and $r.actor == $p.actor then
-                "\($r.oid): 最后一条判决类 review 的 actor=\($r.actor) 也是它所审 patch \($p.oid) 的作者 ⇒ 自审不算独立评审（§0b）"
-              else empty end
+        | ( $judged | final_judged )[] | . as $r
+        | ( $patches | map(select(.ts < $r.ts)) | last ) as $p
+        | if $p != null and $p.actor != null and $r.actor == $p.actor then
+            "\($r.oid): 最后一条判决类 review 的 actor=\($r.actor) 也是它所审 patch \($p.oid) 的作者 ⇒ 自审不算独立评审（§0b）"
           else empty end ),
 
       # (e) 终审不得与合并者同人（§4）：已合并的 thread，最后一条判决类 review 与 merge_result 的 actor 必须不同。
@@ -198,11 +210,9 @@ def label_counts:
             | map(select(.ts >= $contract_ts
                          and (.decision == "approve" or .decision == "request_changes"))) ) as $post2
           | ($merge_items[-1]) as $m
-          | if ($post2 | length) > 0 then
-              ($post2 | max_by(.ts)) as $last
-              | if ($m.actor != null and $last.actor != null and $m.actor == $last.actor) then
-                  "\($last.oid): 终审 review 与 merge_result(\($m.oid)) 同为 \($m.actor) ⇒ 终审不得与合并者同人（§4）"
-                else empty end
+          | ( $post2 | final_judged )[] | . as $last
+          | if ($m.actor != null and $last.actor != null and $m.actor == $last.actor) then
+              "\($last.oid): 终审 review 与 merge_result(\($m.oid)) 同为 \($m.actor) ⇒ 终审不得与合并者同人（§4）"
             else empty end
         else empty end ),
 
