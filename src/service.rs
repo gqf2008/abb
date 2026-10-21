@@ -178,6 +178,26 @@ fn abb_bin_env() -> Option<(String, String)> {
         .map(|p| ("ABB_BIN".to_string(), p.display().to_string()))
 }
 
+/// `AGENT_BRIDGE_BOT_KEY` = 当前 agent 进程**所属 bot 的规范 key**。
+///
+/// 为什么需要（卡 `abb-agent-env-residue-20261021`）：agent 在 shell 里调
+/// `$ABB_BIN task add` / `deliver` 不带 `--bot` 时，CLI 按 env 解析目标 bot
+/// （`main.rs::resolve_bot_key_with`）；而 CLI 自己的报错文案就写着「桥正常调用会
+/// 注入 AGENT_BRIDGE_BOT_KEY」（`main.rs:1058`）——**设计如此，但从未接线**。
+/// 后果：多 bot 下是硬错（「有 N 个 bot 但未指定目标」），单 bot 下静默落到
+/// 「唯一 bot」，于是群会话里创建的任务会投到 bot 主会话（DM）。
+///
+/// 为什么可以按进程注入：agent 是**每 bot** 一个长驻进程
+/// （`build_bot_acp_handles` 的调用粒度），bot 在进程生命周期内不变。
+/// 与 `AGENT_BRIDGE_CHAT_ID` 不同：那个是**每频道**的，ACP 架构下桥无法按频道
+/// 注入，故不在此列（口径见 `main.rs:1066-1070`），只能靠 `--to` 显式指定。
+///
+/// 不是凭据：bot key 是目录名/路由键（`tasks/<key>/`、`workspaces/<key>/`），
+/// 不含密钥；但仍需在 abb-agent 的白名单里放行才能到 shell/MCP 子进程。
+fn agent_bot_key_env(bot: &crate::config::BotConfig) -> (String, String) {
+    ("AGENT_BRIDGE_BOT_KEY".to_string(), bot.key())
+}
+
 /// `abb_bin` = ABB 主程序路径（`$ABB_BIN` 白名单展开实体，让 agent 可 `job`/`deliver`）。
 fn granted_sandbox_profile(
     bot: &crate::config::BotConfig,
@@ -241,6 +261,9 @@ fn build_bot_acp_handles(
                     .chain(extra_env)
                     // `$ABB_BIN`（提示词/白名单都按它工作）：此前从未注入，agent 侧展开为空。
                     .chain(abb_bin_env())
+                    // `AGENT_BRIDGE_BOT_KEY`：agent 调 `$ABB_BIN task/deliver` 不带 `--bot` 时
+                    // 按它解析目标（多 bot 下缺它直接报错，单 bot 下静默落主会话）。
+                    .chain([agent_bot_key_env(bot)])
                     .collect(),
                 backend: "buzz".to_string(),
                 session_sandbox,
@@ -316,6 +339,8 @@ fn oneshot_agent_config_inner(
         vec![("PATH".to_string(), crate::deps::composed_path())];
     extra_env.extend(env);
     extra_env.extend(abb_bin_env());
+    // 与聊天路径同口径：任务/一次性回合里的 agent 也要能解析出自己属于哪个 bot。
+    extra_env.push(agent_bot_key_env(bot));
     if sandbox.is_some() {
         extra_env.extend(jev_env(cfg));
     }
@@ -1944,6 +1969,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `AGENT_BRIDGE_BOT_KEY` 必须在**两条**生产 spawn 路径上都被注入（卡 `abb-agent-env-residue-20261021`）。
+    ///
+    /// 为什么单列：CLI 自己的报错文案就写着「桥正常调用会注入 AGENT_BRIDGE_BOT_KEY」
+    /// （`main.rs:1058`），但此前 `rg AGENT_BRIDGE_BOT_KEY src/service.rs` 只命中一句日志文案
+    /// ⇒ 多 bot 下 agent 调 `task add` 直接报错，单 bot 下静默落主会话（DM）。
+    ///
+    /// 判别力：删掉 `mk` 闭包里的 `.chain([agent_bot_key_env(bot)])` 或 oneshot 的
+    /// `extra_env.push(agent_bot_key_env(bot))` ⇒ 本用例红。
+    #[test]
+    fn both_spawn_paths_inject_agent_bridge_bot_key() {
+        let cmds = ("/bin/abb-agent", "/bin/abb-agent");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let cfg = Config::default();
+        let bot = crate::config::BotConfig {
+            name: "env-bot".into(),
+            sandbox_mode: crate::config::SandboxMode::FullAccess,
+            ..crate::config::BotConfig::default()
+        };
+        let expect_key = bot.key();
+
+        // 路径 1：聊天句柄（normal 与 granted 都算生产路径）
+        let handles = build_bot_acp_handles(&bot, &cfg, cmds, stop.clone());
+        for (label, handle) in [("normal", &handles.normal), ("granted", &handles.granted)] {
+            let env = handle.extra_env_for_test();
+            let got = env
+                .iter()
+                .find(|(k, _)| k == "AGENT_BRIDGE_BOT_KEY")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| {
+                    panic!("{label} 句柄缺 AGENT_BRIDGE_BOT_KEY：agent 调 task/deliver 不带 --bot 会报错或落错会话")
+                });
+            assert_eq!(got, expect_key, "{label} 注入的必须是本 bot 的规范 key");
+        }
+
+        // 路径 2：oneshot / 任务
+        let c = oneshot_agent_config(&bot, &cfg);
+        let got = c
+            .extra_env
+            .iter()
+            .find(|(k, _)| k == "AGENT_BRIDGE_BOT_KEY")
+            .map(|(_, v)| v.clone())
+            .expect("oneshot 任务的 agent env 必须带 AGENT_BRIDGE_BOT_KEY");
+        assert_eq!(got, expect_key, "oneshot 注入的必须是本 bot 的规范 key");
     }
 
     /// **接线测试（聊天句柄路径）**：`build_bot_acp_handles` 把 owner 会话（无论档位）
