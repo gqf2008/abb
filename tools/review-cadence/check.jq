@@ -77,6 +77,9 @@ def final_judged:
   else (map(.ts) | max) as $max_ts
     | map(select(.ts == $max_ts))
   end;
+# 调用约定（评审 abb-reviewer-142 的 NB-1）：各调用方写作 `( … | final_judged )[]`。
+# 空数组的 `[]` 迭代是**零次** ⇒ 天然不产生违规，不需要额外判空。**别改成显式
+# `if length > 0` 分支**——那样平局组为空与组内多条两个边界都得各写一遍，容易写漏。
 
 def label_counts:
   (. // "")
