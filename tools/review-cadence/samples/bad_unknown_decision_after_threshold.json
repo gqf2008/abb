@@ -1,0 +1,33 @@
+[
+  {
+    "entry": {
+      "kind": "issue",
+      "id": "t",
+      "actor": "author",
+      "ts": 100,
+      "body": {
+        "title": "x",
+        "body": "y"
+      }
+    },
+    "oid": "i1",
+    "principal": "author",
+    "verified": true
+  },
+  {
+    "entry": {
+      "kind": "review",
+      "id": "t",
+      "actor": "abb-reviewer-1",
+      "ts": 1000001,
+      "body": {
+        "decision": "needs-changes",
+        "agent": "abb-reviewer-1",
+        "note": "findings: blocking=1 non-blocking=0\n契约之后仍用旧词表 needs-changes ⇒ 必须判红（否则 approve/request_changes 的契约一致性判据被绕过）"
+      }
+    },
+    "oid": "u2",
+    "principal": "abb-reviewer-1",
+    "verified": true
+  }
+]
