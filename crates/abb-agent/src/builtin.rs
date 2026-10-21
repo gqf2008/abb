@@ -410,6 +410,17 @@ pub fn image_budget_from(value: Option<&str>) -> Option<usize> {
 
 impl ImageBudget {
     fn new(limit: usize) -> Self {
+        // 把「limit 不会让 80% 水位判据里的乘法溢出」这条不变量**收在类型内部**
+        // （评审 NB-2）：`new` 是唯一构造点，调用方不必各自记得。
+        //
+        // 为什么必须夹：`limit` 来自 `ABB_AGENT_IMAGE_BUDGET_BYTES` 的 usize 解析，用户可以
+        // 设成任意值。`state.used * 5 >= self.limit * 4` 里 `limit * 4` 在
+        // `limit > usize::MAX/4` 时**debug 构建直接 panic**、release 下 wrap 成错误的水位判断
+        // （评审 NB-1，实测 `limit = usize::MAX/4 + 1` 可复现）。
+        //
+        // 夹到 `usize::MAX / 4` 的语义影响：远超任何真实预算（32MB 默认值的 1.4e11 倍），
+        // 只会把「荒谬配置」归一化成「实际上无限」，不改变任何正常路径的行为。
+        let limit = limit.min(usize::MAX / 4);
         Self {
             limit,
             state: std::sync::Mutex::new(ImageBudgetState::default()),
@@ -1774,6 +1785,29 @@ mod tests {
         assert!(
             !again.content.iter().any(|b| image_data_of(b).is_some()),
             "同一会话重复读同一张图，第二次不应再以 Image 进上下文（否则预算没接线）"
+        );
+    }
+
+    /// 荒谬的 ENV 预算不得让 80% 水位判据溢出 panic（评审 NB-1 的回归锁）。
+    ///
+    /// 判别力：把 `new()` 里的 `limit.min(usize::MAX / 4)` 去掉 ⇒ `self.limit * 4`
+    /// 在 debug 构建下直接 panic ⇒ 本用例红（而不是断言失败）。
+    #[test]
+    fn image_budget_survives_absurd_env_limit() {
+        // 用户可通过 ABB_AGENT_IMAGE_BUDGET_BYTES 设到这个值（usize 解析合法）。
+        let absurd = usize::MAX / 4 + 1;
+        let budget = ImageBudget::new(absurd);
+        assert!(
+            budget.limit <= usize::MAX / 4,
+            "limit 必须被夹到 usize::MAX/4，否则 80% 判据里的 limit*4 会溢出"
+        );
+
+        // 真正跑一次 apply：走到 80% 水位分支不该 panic。
+        let mut content = vec![image_block(&"E".repeat(64))];
+        budget.apply(&mut content);
+        assert!(
+            image_data_of(&content[0]).is_some(),
+            "夹取后小图仍应正常保留"
         );
     }
 
