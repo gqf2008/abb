@@ -1,0 +1,23 @@
+# 钉住工具链：让「clippy 门禁是否绿」成为**可复现**的事实，而不是取决于本机上次
+# `rustup update` 是哪天。
+#
+# 为什么必须有（卡 abb-clippy-gate-red-on-main-20261022）：
+# 1. clippy 的 lint 集合与默认级别随版本变化。仓库原先没有本文件，CI 里 8 处都是
+#    `dtolnay/rust-toolchain@stable`（浮动）⇒ 同一个 commit 在不同机器/不同月份可能
+#    一绿一红，而「门禁」的全部意义就是**可复现**。
+# 2. 2026-10-11 卡 `abb-macos-clippy-gate-20261011` 把 clippy 修到 exit 0；之后
+#    10-14～10-17 的若干提交（syschat v11 批、macOS 窗口改造）又攒出 25 条基线红，
+#    而每次自述都是「零新增」——因为基线一红，「不比 base 更红」就成了事实上的标准。
+#    「零新增」是相对量，会允许红色无限累积；只有绝对量（exit 0）才是门禁。
+#
+# 版本选择依据：本机实测 1.99.0 下清完 25 条后 exit 0。版本必须 **≥ 1.85**
+# （`crates/abb-chart` 的 rust-version；charton 0.8 是 edition 2024），且 ≥ 1.78
+# （`crates/abb-agent` 的 MSRV 声明）——1.99.0 同时满足。
+#
+# 升级工具链时请**同时**做三件事：① 改本文件；② 改 .github/workflows/*.yml 里
+# `dtolnay/rust-toolchain@stable` 为同版本；③ 在本机重跑
+# `cargo clippy --all-targets -- -D warnings` 并确保仍 exit 0（新版本会加新 lint，
+# 升版本等于自愿接受新增的清理工作——这正是要让它在一次提交里显式发生的原因）。
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

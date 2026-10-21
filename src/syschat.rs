@@ -2224,7 +2224,11 @@ pub fn split_composer_h(band_h: f32, convo_h: f32) -> f32 {
 /// 内容区高 → 比例（落盘口径）。`band_h <= 0` / 非有限输入 ⇒ [`SPLIT_RATIO_DEFAULT`]
 /// （绝不把 `NaN`/`inf` 写进 `split.json`）。
 pub fn split_ratio(band_h: f32, convo_h: f32) -> f32 {
-    if !(band_h > 0.0) || !convo_h.is_finite() {
+    // **不能写成 `band_h <= 0.0`**：`!(x > 0.0)` 对 NaN 为 true（NaN 与任何数比较都 false），
+    // 而 `NaN <= 0.0` 为 false ⇒ 直接换会让 NaN 漏进后面的计算，写出非法 `split.json`。
+    // 这里显式列出 NaN 分支，把「非正 / NaN / convo 非有限」三种情况保持成与改造前逐字等价；
+    // `+inf` 仍按原语义**放行**（原式 `!(inf > 0.0)` 为 false）——别顺手把它也拦掉。
+    if band_h.is_nan() || band_h <= 0.0 || !convo_h.is_finite() {
         return SPLIT_RATIO_DEFAULT;
     }
     (convo_h / band_h).clamp(0.0, 1.0)
@@ -5078,7 +5082,12 @@ mod tests {
     /// 判别力：若把 `nearest_corner` 改成按「角顶点」比距离，窗口极窄等退化输入下会翻角 ⇒ 本用例红。
     #[test]
     fn snap_is_idempotent() {
-        let cases: &[((i32, i32, i32, i32), (i32, i32), (i32, i32, i32, i32))] = &[
+        // 三个元组拼在一起超出了 clippy 的复杂度阈值（`type_complexity`）。这里用**本函数内**
+        // 的别名收口：生产签名 `snap_bubble_to_window(window: (i32,i32,i32,i32), …)` 本次不动
+        // （那是独立的可读性问题，不该夹在「清 clippy 基线」的提交里顺手改公共 API）。
+        type RectI = (i32, i32, i32, i32);
+        type PointI = (i32, i32);
+        let cases: &[(RectI, PointI, RectI)] = &[
             ((400, 200, 520, 560), (930, 724), WORK),
             ((400, 200, 520, 560), (354, 200), WORK),
             ((0, 0, 520, 560), (-20, -20), WORK),
@@ -5127,7 +5136,7 @@ mod tests {
         // 分支 2：气泡贴左缘 ⇒ 窗口翻到气泡右侧。
         let bubble2 = (0, 120);
         let (wx2, wy2) = anchor_window_pos(bubble2, BS, ws, WORK);
-        assert_eq!(wx2, 0 + BS.0 + BUBBLE_GAP, "前提：确实翻了右侧");
+        assert_eq!(wx2, BS.0 + BUBBLE_GAP, "前提：确实翻了右侧");
         let (_, back2) = snap_bubble_to_window((wx2, wy2, ws.0, ws.1), bubble2, BS, WORK);
         assert_eq!(back2, bubble2, "开窗位不被吸附改动（窗口在右）");
         assert_eq!(
@@ -5452,8 +5461,11 @@ mod tests {
         assert_eq!(pick("min-width:"), SYSCHAT_MIN_W);
         assert_eq!(pick("min-height:"), SYSCHAT_MIN_H);
         // 最小尺寸必须严格小于默认尺寸，否则窗口会退化成「固定尺寸」（拖不动）。
-        assert!(SYSCHAT_MIN_W < SYSCHAT_PREFERRED_WIDTH);
-        assert!(SYSCHAT_MIN_H < SYSCHAT_DEFAULT_H);
+        // 用**编译期**断言而不是 `assert!`：两个操作数都是 `const`，运行期断言恒为真
+        // ⇒ clippy `assertions_on_constants` 会判它没意义；而这条不变式本身是真约束，
+        // 要在**它被破坏的那一刻**（改常量的人）报出来，不是等有人跑这条测试。
+        const _: () = assert!(SYSCHAT_MIN_W < SYSCHAT_PREFERRED_WIDTH);
+        const _: () = assert!(SYSCHAT_MIN_H < SYSCHAT_DEFAULT_H);
     }
 
     /// **设置窗**的最小尺寸常量必须等于 `ui/app.slint` 的 `SettingsWindow` 两行（跨文件不变量）。

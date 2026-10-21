@@ -1522,7 +1522,7 @@ fn titlebar_strip_does_not_steal_window_button_clicks() {
         );
     }
     // ② 正面控制：点 ①新建会话必须真的触发（否则「没被吃」只是因为条本身没命中面）。
-    let strip_x = ui.get_titlebar_strip_x().round() as f32;
+    let strip_x = ui.get_titlebar_strip_x().round();
     assert!(strip_x > 0.0, "控件条没摆上（strip_x={strip_x}）");
     press_release(&win, strip_x + crate::syschat::TB_NEW_W / 2.0, 19.0);
     assert_eq!(
@@ -1565,6 +1565,7 @@ fn move_to(win: &Rc<MinimalSoftwareWindow>, x: f32, y: f32) {
 /// 判别力实测（2026-10-14，本用例在两种配置下各跑一次）：
 /// - 生产配置（`native-move: true`）：D → `[]`（点击被拦下）、F → `["max"]`；
 /// - 变异 `native-move: false`：D → `["drag","drag","max"]` **报红**（点击没被拦下）。
+///
 /// 反向也成立：把 `PixelWindowResize` 热区挪到标题栏上（或让控件条盖住空白区），
 /// 对照 F 会先红（按压根本没进标题栏）。
 #[test]
@@ -3052,7 +3053,7 @@ fn dump_v11_split_and_pops_for_review() {
     let f4 = settle_w(&win, W520, H);
     write_png(&f4, &dir.join("v11-pop-more.png"));
     // 只切输入区那一带（放大看分割条/抓手/输入框贴底）。
-    let band = crop(&f2, 0, (H - 420) as u32, W520, 420);
+    let band = crop(&f2, 0, H - 420, W520, 420);
     write_png(&band, &dir.join("v11-split-zone.png"));
     println!(
         "v11 出图完成：v11-split-default.png / v11-split-dragged.png / v11-pop-emoji.png / \n         v11-pop-more.png / v11-split-zone.png（convo_h={} ratio={}）",
