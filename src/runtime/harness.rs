@@ -2001,30 +2001,29 @@ fn handle_prompt_result(l: &mut Loop, handle: &RuntimeHandle, mut result: Prompt
                     channel_id = %batch.channel_id,
                     "dead-lettering batch — request body exceeds upstream limit (413)"
                 );
-                let invalidated = result.agent.state.invalidate_channel(&batch.channel_id);
-                l.registry.forget_channel(agent_index, batch.channel_id);
                 // 评审 NB-2：上面只清了**这份 checked-out agent**（它不在池里，helper 管不到），
                 // 但其余**空闲槽位**也可能持有该频道会话（`invalidate_channel_sessions` 的
                 // 文档明写它不碰 in-flight 的那一个）——两边都做才盖全，否则别的空闲槽位
                 // 仍可能拿旧上下文接下一批。
+                // 三个副作用（失效本 agent 会话 / 遗忘登记表 / 失效空闲槽位 / 发提示）
+                // 拆成两步：先做副作用、把**结果**交给纯函数算文案，再由可测的
+                // `apply_body_too_large_dead_letter` 处理提示。之所以不把三个副作用
+                // 全用闭包注入，是因为它们都要 `&mut l` / `&mut result.agent`，同时捕获
+                // 会撞借用检查（E0500）。
+                //
+                // 可测性安排（评审 BLOCKING-1）：副作用本身看调用点一眼可验（每行一次
+                // 无分支调用），而**协同逻辑**（谁先谁后、提示报的命中数、文案怎么选）
+                // 收在纯函数里，由 `body_too_large_dead_letter_tests` 钉死。
+                let invalidated = result.agent.state.invalidate_channel(&batch.channel_id);
+                l.registry.forget_channel(agent_index, batch.channel_id);
                 let invalidated_idle = l.pool.invalidate_channel_sessions(batch.channel_id);
-                crate::log!(
-                    "[harness] 死信（请求体超上游上限 413）：channel={} 已失效该频道执行层会话={}（另有空闲槽位 {} 个）→ 下一条消息重建上下文",
-                    batch.channel_id,
+                let text = apply_body_too_large_dead_letter(
+                    &batch.channel_id,
+                    agent_index,
                     invalidated,
-                    invalidated_idle
+                    invalidated_idle,
                 );
-                // 评审 NB-1：文案不得无条件宣称「已重置」——若两处都没命中（该频道在该
-                // agent 上本就无会话），事实是「没得重置」，说「已重置」是骗人。
-                let hint = body_too_large_hint(invalidated, invalidated_idle);
-                notify_channel(
-                    l,
-                    handle,
-                    &batch,
-                    format!(
-                        "⚠️ 处理失败：本会话的请求体已超过上游上限（多为图片在上下文里累积）。{hint}"
-                    ),
-                );
+                notify_channel(l, handle, &batch, text);
             } else if let Some(dead) = l.queue.requeue(batch) {
                 let reason =
                     dead_letter_reason(&result.outcome, result.agent.acp.stderr_tail().as_deref());
@@ -2346,6 +2345,36 @@ fn body_too_large_hint(invalidated: bool, invalidated_idle: usize) -> &'static s
         // 两处都没命中 ⇒ 压根没东西可重置，不能骗用户说“已重置”。
         "请重发这条消息；若仍失败，请减少一次发送的图片数量。"
     }
+}
+
+/// 413 死信的**协同逻辑**：记录命中情况、选择文案、返回要发的提示。
+///
+/// 为什么要抽这一步（评审 BLOCKING-1）：`body_too_large_hint` 抽成纯函数后，它
+/// **自己的**行为可测了，但两个副作用（失效会话 / 遗忘登记）仍没测试路径能触到 ——
+/// 实测把整个分支改成 `else if false` 后 4 条单测全绿，即「本卡承重行为零覆盖」。
+///
+/// 职责切分（刻意的）：
+/// - **副作用**（`invalidate_channel` / `forget_channel` / `invalidate_channel_sessions`）
+///   留在调用点，每行一次无分支调用，审阅可验；
+/// - **协同逻辑**（先失效后报告、命中数怎么进日志与文案）收在这里，由单测钉死。
+///
+/// 返回要发的文本（而不是直接发）：把 `notify_channel` 留给调用方，
+/// 这样本函数无 I/O、无全局状态，测试只需一个断言。
+fn apply_body_too_large_dead_letter(
+    channel_id: &Uuid,
+    agent_index: usize,
+    invalidated: bool,
+    invalidated_idle: usize,
+) -> String {
+    crate::log!(
+        "[harness] 死信（请求体超上游上限 413）：channel={} agent={} 已失效该频道执行层会话={}（另有空闲槽位 {} 个）→ 下一条消息重建上下文",
+        channel_id,
+        agent_index,
+        invalidated,
+        invalidated_idle
+    );
+    let hint = body_too_large_hint(invalidated, invalidated_idle);
+    format!("⚠️ 处理失败：本会话的请求体已超过上游上限（多为图片在上下文里累积）。{hint}")
 }
 
 /// P2.3：受限会话被 `pool::create_session_and_apply_model` 的档位硬闸拒绝
@@ -4009,12 +4038,194 @@ mod body_too_large_tests {
         assert!(none.contains("重发"), "仍要给可行动出路：{none}");
     }
 
+    /// 413 死信的**协同逻辑**：命中情况必须如实进提示，且四种组合都走到「发提示」
+    /// 这一步（评审 BLOCKING-1 的核心诉求：承重行为不能零覆盖）。
+    ///
+    /// 判别力：把 `apply_body_too_large_dead_letter` 的返回改成恒空串，或把命中数
+    /// 丢掉（恒传 false/0），本条红。
+    #[test]
+    fn dead_letter_reports_real_hits_and_always_notifies() {
+        let ch = Uuid::new_v4();
+        // 四种命中组合都必须产出非空提示（即「一定要通知用户」，不能静默）。
+        for (invalidated, idle) in [(true, 0usize), (false, 1), (true, 2), (false, 0)] {
+            let text = apply_body_too_large_dead_letter(&ch, 0, invalidated, idle);
+            assert!(!text.trim().is_empty(), "必须给用户一个提示");
+            assert!(text.contains("上游上限"), "提示要说清是请求体超限：{text}");
+            // 文案由 body_too_large_hint 决定，此处核对协同是否把它接对了。
+            let expected = body_too_large_hint(invalidated, idle);
+            assert!(
+                text.contains(expected),
+                "提示必须采用 hint 的选择（invalidated={invalidated}, idle={idle}）：{text}"
+            );
+        }
+    }
+
+    /// 真的失效过 ⇒ 提示说「已重置」；完全没失效 ⇒ **不许**说「已重置」。
+    ///
+    /// 这条是评审 NB-1 的端到端回归：此前文案与 `invalidated` 脱钩。
+    #[test]
+    fn dead_letter_reset_claim_matches_actual_effect() {
+        let ch = Uuid::new_v4();
+        let did = apply_body_too_large_dead_letter(&ch, 3, true, 0);
+        assert!(did.contains("已为你重置"), "确实失效了就该说已重置：{did}");
+
+        let idle_only = apply_body_too_large_dead_letter(&ch, 3, false, 2);
+        assert!(
+            idle_only.contains("已为你重置"),
+            "空闲槽位命中同样算重置过：{idle_only}"
+        );
+
+        let none = apply_body_too_large_dead_letter(&ch, 3, false, 0);
+        assert!(
+            !none.contains("已为你重置"),
+            "什么都没失效却宣称已重置就是骗用户：{none}"
+        );
+        assert!(none.contains("重发"), "仍必须给可行动出路：{none}");
+    }
+
     /// 非 `AgentError` 变体一律不归这条管（保持与其它分类判据同形）。
     #[test]
     fn non_agent_errors_never_match() {
         assert!(!is_body_too_large(&AcpError::SpawnRefused(
             "熔断中".to_string()
         )));
+    }
+}
+
+#[cfg(test)]
+mod body_too_large_dead_letter_e2e {
+    //! 413 死信分支的**端到端**覆盖（评审 BLOCKING-1 的正面回应）。
+    //!
+    //! 为什么必须是端到端：`body_too_large_hint` / `apply_body_too_large_dead_letter`
+    //! 抽成纯函数后，它们**自己**可测了，但那只证明「函数算得对」，不能证明
+    //! 「`handle_prompt_result` 的 413 分支真的会调它们」。实测（评审与我都复现过）：
+    //! 把整条分支改成 `else if false && matches!(…)`，纯函数单测**照样全绿**。
+    //!
+    //! 所以这里跑真回合：mock agent 回 413 → 走完 `handle_prompt_result`
+    //! → 断言①用户收到提示（证明 notify_channel 被执行）②下次消息重建会话
+    //! （证明 invalidate_channel 被执行）。分支一旦被禁用，两条断言都会红。
+
+    use super::*;
+
+    fn mock_cfg(env: Vec<(String, String)>, rec: &std::path::Path) -> AgentConfig {
+        let python3 = crate::deps::find_in_path("python3")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python3".to_string());
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_acp_agent.py");
+        let mut extra_env = vec![
+            ("PATH".to_string(), crate::deps::composed_path()),
+            ("MOCK_RECORD_FILE".to_string(), rec.display().to_string()),
+        ];
+        extra_env.extend(env);
+        AgentConfig {
+            command: python3,
+            args: vec![script.display().to_string()],
+            extra_env,
+            backend: "mock".to_string(),
+            session_sandbox: None,
+        }
+    }
+
+    /// 413 → 死信分支必须真的执行：发提示 + 失效会话。
+    ///
+    /// 判别力：把 `handle_prompt_result` 里 413 那臂改成 `false &&` ⇒ ①无提示 ②
+    /// 第二次不重建会话 ⇒ 两条断言都红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dead_letter_branch_actually_runs() {
+        let rec = std::env::temp_dir().join(format!("mock-413-{}.jsonl", Uuid::new_v4()));
+        let stop = CancellationToken::new();
+        let handle = RuntimeHandle::new(
+            mock_cfg(
+                vec![(
+                    "MOCK_ERROR_MESSAGE".to_string(),
+                    "回合失败：http error 413: Failed to buffer the request body: length limit exceeded"
+                        .to_string(),
+                )],
+                &rec,
+            ),
+            stop.clone(),
+            std::env::current_dir()
+                .unwrap_or_default()
+                .display()
+                .to_string(),
+            false,
+        );
+        let mut turn_rx = handle.take_turn_rx().expect("turn rx");
+        let run = tokio::spawn(run_loop(handle.clone()));
+
+        let cid = Uuid::new_v4();
+        handle.upsert_channel(
+            cid,
+            ChannelMeta {
+                bot_key: "e2e413".to_string(),
+                chat_id: "oc_e2e413".to_string(),
+                chat_type: "p2p".to_string(),
+                thread_id: None,
+                name: "e2e413".to_string(),
+                anchor_mid: None,
+                adhoc: true,
+                workspace: None,
+            },
+        );
+
+        assert!(handle.push_message(
+            cid,
+            InboundMsg {
+                id_hex: "e2e-1".to_string(),
+                author_role: "user".to_string(),
+                text: "交作业".to_string(),
+                ts_secs: 0,
+                prompt_tag: "test".to_string(),
+                bridge_generation: "gen-a".to_string(),
+            },
+        ));
+
+        // ① 用户必须收到提示（notify_channel 被执行）。
+        let msg = tokio::time::timeout(Duration::from_secs(60), turn_rx.recv())
+            .await
+            .expect("413 必须有回执，不能静默")
+            .expect("turn 通道不应关闭");
+        assert_eq!(msg.channel_id, cid);
+        assert!(
+            msg.text.contains("上游上限"),
+            "回执要说清是请求体超限：{}",
+            msg.text
+        );
+
+        // ② 会话必须被失效：再推一条消息，mock agent 应收到**第二次** session/new
+        //    （失效后 pool 只能重建）。分支被禁用时这里是 1。
+        assert!(handle.push_message(
+            cid,
+            InboundMsg {
+                id_hex: "e2e-2".to_string(),
+                author_role: "user".to_string(),
+                text: "再试一次".to_string(),
+                ts_secs: 0,
+                prompt_tag: "test".to_string(),
+                bridge_generation: "gen-a".to_string(),
+            },
+        ));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let count_new = || {
+            std::fs::read_to_string(&rec)
+                .unwrap_or_default()
+                .matches("\"event\": \"session_new\"")
+                .count()
+        };
+        while Instant::now() < deadline && count_new() < 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            count_new() >= 2,
+            "413 死信后必须失效执行层会话（否则下一条消息仍复用旧上下文）；\
+             实测 session/new 次数 = {}",
+            count_new()
+        );
+
+        stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+        let _ = std::fs::remove_file(&rec);
     }
 }
 

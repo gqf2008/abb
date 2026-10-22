@@ -186,6 +186,14 @@ while True:
                   "error": {"code": -32000,
                             "message": "API Error: 401 authentication failed"}})
             continue
+        # 卡 abb-413-body-limit：任意错误文本注入（如 413 请求体超限），
+        # 用于驱动 handle_prompt_result 的不可重试分类与死信处置。
+        _err_msg = os.environ.get("MOCK_ERROR_MESSAGE")
+        if _err_msg:
+            send({"jsonrpc": "2.0", "id": rid,
+                  "error": {"code": int(os.environ.get("MOCK_ERROR_CODE", "-32002")),
+                            "message": _err_msg}})
+            continue
         respond = os.environ.get("MOCK_RESPOND_JSON")
         if respond is not None:
             # P3.4 teambuilder 全链路：不 echo，以该 env 值作为助手文本原样
