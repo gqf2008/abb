@@ -4083,6 +4083,55 @@ mod body_too_large_tests {
         assert!(none.contains("重发"), "仍必须给可行动出路：{none}");
     }
 
+    /// 413 判据与相邻的不可重试分类**互不误伤**：同一个错误文本只能命中一类。
+    ///
+    /// 为什么要测：这条臂插在 `is_spawn_refused` 之后、通用 `requeue` 之前，
+    /// 若顺序被挪到 `requeue` 后面，功能会静默失效（413 又变回重试 10 次）——
+    /// 而纯判定函数的测试对此毫无感知。这里钉住各分类的**互斥性**。
+    #[test]
+    fn body_too_large_does_not_overlap_other_non_retryables() {
+        // (message, expected_owner) —— 每条只该命中它自己那一类。
+        let cases: [(&str, &str); 4] = [
+            (
+                "回合失败：http error 413: Failed to buffer the request body: length limit exceeded",
+                "body_too_large",
+            ),
+            ("API Error: 401 authentication failed", "auth"),
+            ("llm model not found: gpt-x", "model_not_found"),
+            // 会话过期**不该**被任何不可重试分类命中（应继续重排）——
+            // 既有回归 `non_model_resource_not_found_is_requeued` 保护这一点。
+            ("Resource not found: session no longer exists", "none"),
+        ];
+        for (message, expected) in cases {
+            let err = AcpError::AgentError {
+                code: -32002,
+                message: message.to_string(),
+            };
+            let hits = [
+                ("body_too_large", is_body_too_large(&err)),
+                ("auth", is_auth_error(&err)),
+                ("model_not_found", is_model_not_found(&err)),
+            ];
+            let matched: Vec<&str> = hits
+                .iter()
+                .filter(|(_, h)| *h)
+                .map(|(name, _)| *name)
+                .collect();
+            if expected == "none" {
+                assert!(
+                    matched.is_empty(),
+                    "可重试错误不得被不可重试分类吃掉，实际命中 {matched:?}：{message}"
+                );
+            } else {
+                assert_eq!(
+                    matched,
+                    vec![expected],
+                    "每个错误只应命中它自己那一类，实际 {matched:?}：{message}"
+                );
+            }
+        }
+    }
+
     /// 非 `AgentError` 变体一律不归这条管（保持与其它分类判据同形）。
     #[test]
     fn non_agent_errors_never_match() {
