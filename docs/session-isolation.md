@@ -110,3 +110,43 @@ key = chat_id（非话题）或 chat_id:thread_id（飞书话题）
 - 并发/打断：`src/bridge.rs`（`chat_lock` / `cancel_flags` / `handle`）
 - 各平台入站：`src/bridge.rs`（`on_payload` / `on_weixin` / `on_dingtalk`）、`src/dingtalk.rs`
 - 发送：`src/feishu.rs`（`send_text` / `reply_text`）、`src/messenger.rs`（`send_thread_reply`、WeixinMessenger context_token）
+
+## 8. 执行层并发与池化（2026-10-22 补，含一处易误读勘误）
+
+> 起因：ki（pi-rust）对接评估中，外部协作者据 `pool.rs` 的 `channel_id → session_id`
+> 映射误读为「一个句柄 = 一个 agent 子进程、渠道在进程内多路复用」，进而错误推出
+> 「多渠道对单会话执行层（`ki acp serve`）会撞其单进程单会话限制」。本节如实记载
+> 执行层并发模型，全部判据可在现文复核。
+
+### 8.1 渠道内：单回合
+
+同一渠道（chat_id / chat_id:thread_id）同时**只有一个在途回合**（`runtime/queue.rs`
+每渠道队列 + 每渠道在途跟踪）。在途期间的新消息不并发执行：入队，经 steer 合并
+（执行层声明 `_meta.steering.supported` 时原生插入；否则 cancel+merge 重提示）。
+配套预算：单批 ≤50 条、渠道积压 ≤500 条（超限丢最老）、在途死线 = max_turn+100s、
+重试 10 次（5s 倍增，300s 封顶）。
+
+### 8.2 渠道间：不设并发上限（owner 2026-10-04 裁定）
+
+`runtime/harness.rs::wanted_slots`：`pending.max(1)` —— **队列里有几个待跑会话就扩到
+几个 agent**，回合经 `join_set` 并行执行。资源边界不靠限并发，靠：
+
+1. **闲置回收**：额外槽位空闲 300s（`IDLE_REAP_AFTER`）回收，60s 巡检；0 号槽位是
+   热实例，永不回收（免冷启动）。稳态 agent 进程数 = 正在跑的会话数。
+2. **spawn 守卫**（v2.23.89）：同 key ≥500ms 启动间隔 + 连续失败熔断——「不限并发」
+   不等于「瞬间起一堆」。
+
+裁定理由（原注）：限制并发会把「会话互不影响」打折（第 9 个会话得排别人后面）；
+**回收闲置进程才是真正的资源边界**。
+
+### 8.3 勘误：`channel_id → session_id` 不是「一个进程多渠道复用」
+
+`runtime/pool.rs` 的 `channel_id → session_id` 映射是**单个 agent 进程内部**「本进程
+当前服务哪个渠道会话」的记账，不是跨渠道共享进程。池子是**会话级隔离的多槽位**
+（`agents: Vec<Option<OwnedAgent>>`，每个槽位一个独立子进程 + 独立 AcpClient）；
+跨渠道并发 = **多个 agent 子进程并行**。
+
+推论：外部**单进程单活动会话**的执行层（如 `ki acp serve`，pi-rust `acp/mod.rs` 的
+session/new 第二次拒绝）与本池子**天然契合**——每个并跑渠道各起一个执行层进程，
+会话按各自 cwd 隔离，不存在「第二渠道被拒」的路径；不需要执行层为此支持进程内
+多会话。
