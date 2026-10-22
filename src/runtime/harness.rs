@@ -4132,6 +4132,10 @@ mod body_too_large_dead_letter_e2e {
     /// 判别力：把 `handle_prompt_result` 里 413 那臂改成 `false &&` ⇒ ①无提示 ②
     /// 第二次不重建会话 ⇒ 两条断言都红。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
+    )]
     async fn dead_letter_branch_actually_runs() {
         let rec = std::env::temp_dir().join(format!("mock-413-{}.jsonl", Uuid::new_v4()));
         let stop = CancellationToken::new();
