@@ -4085,9 +4085,15 @@ mod body_too_large_tests {
 
     /// 413 判据与相邻的不可重试分类**互不误伤**：同一个错误文本只能命中一类。
     ///
-    /// 为什么要测：这条臂插在 `is_spawn_refused` 之后、通用 `requeue` 之前，
-    /// 若顺序被挪到 `requeue` 后面，功能会静默失效（413 又变回重试 10 次）——
-    /// 而纯判定函数的测试对此毫无感知。这里钉住各分类的**互斥性**。
+    /// **职责边界（评审 abb-coordinator 在 R6 复核里纠正过）**：本条是**纯判定函数**
+    /// 测试，它只能挡「一类错误被两类认领」；它**挡不住**「413 臂被挪到 `requeue`
+    /// 之后」这类位置错误——那需要 [`dead_letter_branch_actually_runs`]（走真
+    /// `run_loop`，臂被挪走则用户收不到回执 ⇒ 它红）。别把本条当成 e2e 的替代。
+    ///
+    /// 三条用例的分工：
+    /// - 本条：**判据重叠**（跨类误命）；
+    /// - `dead_letter_branch_actually_runs`：**分支是否执行 / 位置是否对**；
+    /// - 纯函数用例：文案选择与文案如实性。
     #[test]
     fn body_too_large_does_not_overlap_other_non_retryables() {
         // (message, expected_owner) —— 每条只该命中它自己那一类。
