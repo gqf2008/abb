@@ -3418,7 +3418,7 @@ fn prepare_turn(
     // fail-fast：缺执行层时不要挂满整轮预算（见 agent_command_available 文档）。
     if !agent_command_available(&agent_cfg.command) {
         return Err(format!(
-            "执行层不可用：找不到 `{}`。请确认已安装随包 abb-agent（发行包自带），或在本机 PATH 上提供 pi-acp。",
+            "执行层不可用：找不到 `{}`。请确认已安装随包 abb-agent（发行包自带），或在本机 PATH 上安装 ki（回落执行层 `ki acp serve`）。",
             agent_cfg.command
         ));
     }

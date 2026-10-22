@@ -3280,6 +3280,102 @@ mod tests {
         client.shutdown().await;
     }
 
+    /// 探针：真 spawn `ki acp serve`（pi-rust 的宿主级 ACP server，ki-acp-serve.md
+    /// 批次 3 接线的验收轮）。spawn 形状与 `service.rs` 回落链解析结果一致：
+    /// `<ki> acp serve`（子命令作 args）。全链：initialize（v2 握手，ki 应答 1）→
+    /// session/new → prompt 工具轮（真实 LLM，文件真落盘）→ 取消轮（sleep 工具挂住，
+    /// idle 超时后 `cancel_with_cleanup` 打断，stopReason=cancelled）→ 同会话续轮。
+    /// 手动跑（需 ki 侧已配 provider，两轮真实 LLM 回合）：
+    /// `KI_ACP_E2E_BIN=/path/to/ki cargo test probe_real_ki_acp_serve -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "探针：真 spawn `ki acp serve`（需 KI_ACP_E2E_BIN 指向 ki，且 ki 侧已配 provider）"]
+    async fn probe_real_ki_acp_serve_lifecycle() {
+        let Some(ki) = std::env::var_os("KI_ACP_E2E_BIN").map(std::path::PathBuf::from) else {
+            eprintln!("skip: KI_ACP_E2E_BIN 未设（本探针手动跑）");
+            return;
+        };
+        // 工作目录用一次性 tempdir：ki 的会话按 cwd 落 `<cwd>/.ki/sessions/`。
+        let ws = std::env::temp_dir().join(format!("abb-ki-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).expect("create workspace");
+        let cwd = ws.display().to_string();
+
+        let mut client = AcpClient::spawn(
+            &ki.display().to_string(),
+            &["acp".to_string(), "serve".to_string()],
+            &[],
+        )
+        .await
+        .expect("spawn ki acp serve");
+
+        // v2 握手（§7 对表）：ABB 请求 protocolVersion 2，ki（官方 crate，v1 线）应答
+        // 1；ABB 不读应答版本，协商无冲突。ki 不声明 steering ⇒ 能力探测=false。
+        let init = client.initialize().await.expect("initialize");
+        assert_eq!(init["protocolVersion"].as_u64(), Some(1), "ki 应答 v1");
+        assert_ne!(
+            init.pointer("/_meta/steering/supported"),
+            Some(&serde_json::json!(true)),
+            "ki 不声明 steering，能力探测必须如实为 false"
+        );
+
+        let session = client
+            .session_new(&cwd, vec![], None, None)
+            .await
+            .expect("session/new");
+        assert!(!session.is_empty());
+
+        // 工具轮：真实 LLM 回合，模型经工具把文件写进 session cwd。
+        let stop = client
+            .session_prompt_with_idle_timeout(
+                &session,
+                "用 bash 工具执行: printf 'hello-ki-e2e' > ki_e2e_out.txt 。执行完回复 done。",
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(180),
+            )
+            .await
+            .expect("工具轮 prompt");
+        assert_eq!(stop, StopReason::EndTurn, "工具轮应正常结束");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("ki_e2e_out.txt")).unwrap_or_default(),
+            "hello-ki-e2e",
+            "工具必须真的在 session cwd 里落了文件"
+        );
+
+        // 取消轮：`sleep 30` 的工具轮在 3s idle 超时时仍挂在工具执行上（无正文分片），
+        // cancel_with_cleanup 打断它 —— 对应 ki 侧批次 1 钉死的「取消贯穿在途回合」。
+        let r = client
+            .session_prompt_with_idle_timeout(
+                &session,
+                "用 bash 工具执行: sleep 30 。执行完回复 done。",
+                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(120),
+            )
+            .await;
+        assert!(
+            matches!(r, Err(AcpError::IdleTimeout(_))),
+            "expected IdleTimeout, got {r:?}"
+        );
+        let stop = client
+            .cancel_with_cleanup(&session, std::time::Duration::from_secs(10))
+            .await
+            .expect("cancel");
+        assert_eq!(stop, StopReason::Cancelled, "取消轮应以 cancelled 收束");
+
+        // 同会话续轮：cancel 后会话仍可用（ki 侧会话状态未被取消污染）。
+        let stop = client
+            .session_prompt_with_idle_timeout(
+                &session,
+                "只回复两个字: 继续",
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(180),
+            )
+            .await
+            .expect("cancel 后续轮");
+        assert_eq!(stop, StopReason::EndTurn, "cancel 后同会话续轮应正常结束");
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
     #[tokio::test]
     async fn idle_timeout_fires_on_silent_process() {
         let mut client = spawn_script(vec![SleepMs(10_000)]).await;

@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// 解析 ACP 执行层命令（纯函数便于单测）。
 /// 决议链（刀 4b 后）：
 /// ① 主程序同目录随包 `abb-agent`（单一执行层，两种角色都走它）；
-/// ② 都没有 → None（调用方回落 PATH `pi-acp` 兑底）。
+/// ② 都没有 → None（调用方回落 PATH `ki acp serve` 兑底，ki-acp-serve.md 批次 3）。
 ///
 /// 随包执行层的文件名（同一个二进制名在两平台一致，Windows 追加 `.exe` 由调用方处理）。
 const BUNDLED_AGENT: &str = "abb-agent";
@@ -30,11 +30,46 @@ fn bundled_agent_in_dir(bundled: &[&str], exe_dir: Option<&std::path::Path>) -> 
     None
 }
 
+/// 一条可 spawn 的执行层命令：程序 + 参数。
+///
+/// 随包 `abb-agent` 是裸二进制（args 恒空）；回落目标 `ki acp serve` 必须带子命令
+/// 参数。此前回落 `pi-acp` 是 rpi-package 的 ACP↔RPC 桥（前身实现），已被
+/// `ki acp serve` 取代（pi-rust `docs/design/ki-acp-serve.md` 批次 3，2026-10-22）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentCmd {
+    program: String,
+    args: Vec<String>,
+}
+
+impl AgentCmd {
+    /// 裸二进制（无参数）——随包 abb-agent 的形状。
+    fn bare(program: impl Into<String>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentCmd {
+    /// 日志/测试展示形状（`/path/ki acp serve`）；非 shell 转义，不用于 spawn。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.args.is_empty() {
+            f.write_str(&self.program)
+        } else {
+            write!(f, "{} {}", self.program, self.args.join(" "))
+        }
+    }
+}
+
 /// 给定（owner 命令、授权者命令）与该 bot 的 owner 档位，选出 normal 会话实际用哪条。
 ///
 /// 统一迁移刀 4b：旧执行层已删除，两种角色只有一条执行层（abb-agent），两条命令
 /// 解析结果相同。保留函数签名是为了让三条建会话路径的接线测试仍然能钉住「走哪个槽」。
-fn pick_command_by_sandbox<'a>(role_cmds: (&'a str, &'a str), _needs_sandbox: bool) -> &'a str {
+fn pick_command_by_sandbox<'a>(
+    role_cmds: (&'a AgentCmd, &'a AgentCmd),
+    _needs_sandbox: bool,
+) -> &'a AgentCmd {
     let (owner_cmd, _granted_cmd) = role_cmds;
     owner_cmd
 }
@@ -47,9 +82,10 @@ fn bundled_names_for_role(owner: bool) -> &'static [&'static str] {
     &[BUNDLED_AGENT]
 }
 
-/// 按**角色**解析出两条命令（normal / granted）。随包缺失时各自回落 PATH `pi-acp`
-/// （开发/自签构建）。刀 4b 后两种角色都解析到同一执行层（abb-agent）。
-fn resolve_acp_commands() -> (String, String) {
+/// 按**角色**解析出两条命令（normal / granted）。随包缺失时各自回落 PATH
+/// `ki acp serve`（ki 的宿主级 ACP server；pi-rust ki-acp-serve.md 批次 3 接线）。
+/// 刀 4b 后两种角色都解析到同一执行层（abb-agent）。
+fn resolve_acp_commands() -> (AgentCmd, AgentCmd) {
     // **必须经 `bundled_names_for_role`**：映射若被内联回数组，那个函数就 dead（root clippy
     // 会以 dead_code 报红），而「角色 → 名字」这条锁也就落空了（评审 M6 实测过这种缝）。
     let normal =
@@ -59,20 +95,26 @@ fn resolve_acp_commands() -> (String, String) {
     (normal, granted)
 }
 
-/// 无随包时解析 `pi-acp` 的最终命令。Windows 上 npm 生成的是 `.cmd` shim，
-/// CreateProcess 裸名只试 `.exe`；`find_in_path` 命中后必须传全路径（#246④）。
+/// 无随包时的回落命令：PATH 命中 `ki` ⇒ spawn `<ki> acp serve`（子命令作 args；
+/// 全路径必传，#246④ 同款口径）；连 `ki` 都没有 ⇒ 保留裸名 `ki`，spawn 失败
+/// 如实可见（#246④）。
 fn resolve_acp_command_with(
     agent_cmd: Option<&str>,
-    find_pi_acp: impl FnOnce() -> Option<std::path::PathBuf>,
-) -> String {
+    find_ki: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> AgentCmd {
     agent_cmd
-        .map(str::to_string)
-        .or_else(|| find_pi_acp().map(|p| p.display().to_string()))
-        .unwrap_or_else(|| "pi-acp".to_string())
+        .map(AgentCmd::bare)
+        .or_else(|| {
+            find_ki().map(|p| AgentCmd {
+                program: p.display().to_string(),
+                args: vec!["acp".to_string(), "serve".to_string()],
+            })
+        })
+        .unwrap_or_else(|| AgentCmd::bare("ki"))
 }
 
-fn resolve_acp_command(agent_cmd: Option<&str>) -> String {
-    resolve_acp_command_with(agent_cmd, || crate::deps::find_in_path("pi-acp"))
+fn resolve_acp_command(agent_cmd: Option<&str>) -> AgentCmd {
+    resolve_acp_command_with(agent_cmd, || crate::deps::find_in_path("ki"))
 }
 
 /// 本 bot 的 ACP 供应商 env（旧 service 级 `env_for` 的 per-bot 化，P2.1）。
@@ -225,11 +267,11 @@ fn granted_sandbox_profile(
 fn build_bot_acp_handles(
     bot: &crate::config::BotConfig,
     cfg: &Config,
-    commands: (&str, &str),
+    commands: (&AgentCmd, &AgentCmd),
     stop: tokio_util::sync::CancellationToken,
 ) -> crate::bridge::BotAcpHandles {
-    // 开发/自签构建无随包 → PATH pi-acp 全路径兜底（Windows .cmd shim 不能裸名 spawn；
-    // 都没装则保留裸名，spawn 失败 → AgentDown，如实可见，见 #246④）。
+    // 开发/自签构建无随包 → PATH `ki acp serve` 全路径兜底（裸名表达不了子命令参数；
+    // 都没装则保留裸名 `ki`，spawn 失败 → AgentDown，如实可见，见 #246④）。
     //
     // 两条命令**按角色**分，但刀 4b 后都解析到同一执行层 abb-agent（两种角色已统一）。
     let (command, granted_command) = commands;
@@ -248,14 +290,14 @@ fn build_bot_acp_handles(
     // 刀 4b：abb-agent 已声明 `_meta.abbSandbox` 三档并实现受限执行，owner 受限档也走它。
     let normal_command = pick_command_by_sandbox((command, granted_command), normal_meta.is_some());
 
-    let mk = |command: &str,
+    let mk = |command: &AgentCmd,
               extra_env: Vec<(String, String)>,
               session_sandbox: Option<crate::runtime::acp::SessionSandboxMeta>,
               mcp_from_channel: bool| {
         crate::runtime::harness::RuntimeHandle::new(
             crate::runtime::harness::AgentConfig {
-                command: command.to_string(),
-                args: Vec::new(),
+                command: command.program.clone(),
+                args: command.args.clone(),
                 extra_env: vec![("PATH".to_string(), crate::deps::composed_path())]
                     .into_iter()
                     .chain(extra_env)
@@ -322,16 +364,12 @@ pub(crate) fn oneshot_agent_config(
 fn oneshot_agent_config_inner(
     bot: &crate::config::BotConfig,
     cfg: &Config,
-    role_cmds: (String, String),
+    role_cmds: (AgentCmd, AgentCmd),
     sandbox: Option<crate::runtime::acp::SessionSandboxMeta>,
 ) -> crate::runtime::harness::AgentConfig {
     // 统一迁移刀 4a：需要档位的会话（owner 的 read-only/workspace-write、granted）也走
     // abb-agent（已声明档位），且套 Jev 门禁——所以带档位时注入 JEV_* env。
-    let command = pick_command_by_sandbox(
-        (role_cmds.0.as_str(), role_cmds.1.as_str()),
-        sandbox.is_some(),
-    )
-    .to_string();
+    let picked = pick_command_by_sandbox((&role_cmds.0, &role_cmds.1), sandbox.is_some());
     let env = env_for_bot(bot, cfg);
     // Jev 门禁 env **只在带档位（受限）时注入**：sandbox=None（owner 全权限维护任务，
     // 如 session_gc/角色生成）不套 Jev 门禁、不需要 key，多注一个凭证只扩大暴露面（评审 D1）。
@@ -345,8 +383,8 @@ fn oneshot_agent_config_inner(
         extra_env.extend(jev_env(cfg));
     }
     crate::runtime::harness::AgentConfig {
-        command,
-        args: Vec::new(),
+        command: picked.program.clone(),
+        args: picked.args.clone(),
         extra_env,
         backend: "buzz".to_string(),
         session_sandbox: sandbox,
@@ -411,7 +449,7 @@ pub(crate) fn oneshot_agent_config_for_role(
 fn oneshot_agent_config_for_role_inner(
     bot: &crate::config::BotConfig,
     cfg: &Config,
-    role_cmds: (String, String),
+    role_cmds: (AgentCmd, AgentCmd),
     restricted: bool,
 ) -> crate::runtime::harness::AgentConfig {
     let sandbox = if restricted {
@@ -481,8 +519,8 @@ pub async fn run() {
     let cfg = Arc::new(cfg);
 
     // ACP 执行层命令**按角色**两条：owner 优先随包 `abb-agent`，授权者（受限）会话仍走
-    // 执行层（授权链路的承担者不变）。每进程解析一次；两条都可能回落 PATH `pi-acp`
-    // （开发/自签构建无随包）。
+    // 执行层（授权链路的承担者不变）。每进程解析一次；两条都可能回落 PATH
+    // `ki acp serve`（开发/自签构建无随包）。
     let (normal_cmd, granted_cmd) = resolve_acp_commands();
 
     // #200 Phase 3 + 单后端化 P2.1：执行层随包（abb-agent 单一执行层）——每 bot
@@ -491,7 +529,7 @@ pub async fn run() {
     // 装配零等待（不 spawn 进程、不碰盘）——handle 同步可得，无启动竞态；agent
     // 懒启动 + 崩溃退避重拉（harness 内闭环），启动失败只影响本 bot 的 ACP 频道。
     // 命令按**角色**解析（两条，刀 4b 后都解析到 abb-agent），每进程一次；两条都可能
-    // 回落 PATH `pi-acp`（开发/自签构建无随包；Windows .cmd shim 见 #246④）。
+    // 回落 PATH `ki acp serve`（开发/自签构建无随包）。
 
     // 接入飞书 bot → 后台自动装 lark-cli + lark-* 技能（幂等/best-effort，绝不阻塞 bot 启动）。
     // #69 审计：短命任务（装完即收尾），登记进治理（panic/指标可见）；装不上只 log 警告。
@@ -747,7 +785,7 @@ pub async fn run() {
             }
         }
         // ACP 执行层命令**按角色**两条（owner 优先随包 abb-agent；授权者会话仍走
-        // 旧执行层，授权承担者不变）。两者都可能回落 PATH pi-acp（开发/自签无随包）。
+        // 执行层，授权承担者不变）。两者都可能回落 PATH `ki acp serve`（开发/自签无随包）。
         // 句柄对按 bot 在 run_bot 内构造（P2.1）。
         let role_cmds = (normal_cmd.clone(), granted_cmd.clone());
         // #206：回合投递路由注册表（全部 bot 共享同一份）
@@ -888,7 +926,7 @@ async fn run_bot(
     msgr: std::sync::Arc<dyn crate::messenger::Messenger>,
     router: std::sync::Arc<crate::deliver::Router>,
     stop: tokio_util::sync::CancellationToken,
-    role_cmds: (String, String), // ACP 执行层命令 (normal, granted)
+    role_cmds: (AgentCmd, AgentCmd), // ACP 执行层命令 (normal, granted)
     bridge_registry: crate::bridge::BridgeRegistry, // #206：回合投递路由用
 ) {
     let key = bot.key();
@@ -1916,10 +1954,14 @@ mod tests {
             ..Default::default()
         };
         let cfg = Config::default();
+        let cmds = (
+            AgentCmd::bare("/bin/abb-agent"),
+            AgentCmd::bare("/bin/abb-agent"),
+        );
         let handles = build_bot_acp_handles(
             &bot,
             &cfg,
-            ("/bin/abb-agent", "/bin/abb-agent"),
+            (&cmds.0, &cmds.1),
             tokio_util::sync::CancellationToken::new(),
         );
         assert!(
@@ -1941,7 +1983,10 @@ mod tests {
     /// 判别力：删掉 `mk` 里的 `.chain(abb_bin_env())` ⇒ 本用例红。
     #[test]
     fn chat_handles_extra_env_carries_abb_bin() {
-        let cmds = ("/bin/abb-agent", "/bin/abb-agent");
+        let cmds = (
+            AgentCmd::bare("/bin/abb-agent"),
+            AgentCmd::bare("/bin/abb-agent"),
+        );
         let stop = tokio_util::sync::CancellationToken::new();
         let cfg = Config::default();
         for mode in [
@@ -1953,7 +1998,7 @@ mod tests {
                 sandbox_mode: mode,
                 ..crate::config::BotConfig::default()
             };
-            let handles = build_bot_acp_handles(&bot, &cfg, cmds, stop.clone());
+            let handles = build_bot_acp_handles(&bot, &cfg, (&cmds.0, &cmds.1), stop.clone());
             for (label, handle) in [("normal", &handles.normal), ("granted", &handles.granted)] {
                 let env = handle.extra_env_for_test();
                 let abb_bin = env
@@ -1981,7 +2026,10 @@ mod tests {
     /// `extra_env.push(agent_bot_key_env(bot))` ⇒ 本用例红。
     #[test]
     fn both_spawn_paths_inject_agent_bridge_bot_key() {
-        let cmds = ("/bin/abb-agent", "/bin/abb-agent");
+        let cmds = (
+            AgentCmd::bare("/bin/abb-agent"),
+            AgentCmd::bare("/bin/abb-agent"),
+        );
         let stop = tokio_util::sync::CancellationToken::new();
         let cfg = Config::default();
         let bot = crate::config::BotConfig {
@@ -1992,7 +2040,7 @@ mod tests {
         let expect_key = bot.key();
 
         // 路径 1：聊天句柄（normal 与 granted 都算生产路径）
-        let handles = build_bot_acp_handles(&bot, &cfg, cmds, stop.clone());
+        let handles = build_bot_acp_handles(&bot, &cfg, (&cmds.0, &cmds.1), stop.clone());
         for (label, handle) in [("normal", &handles.normal), ("granted", &handles.granted)] {
             let env = handle.extra_env_for_test();
             let got = env
@@ -2022,7 +2070,10 @@ mod tests {
     #[test]
     fn chat_handles_route_sandboxed_sessions_to_the_old_layer() {
         // 刀 4a 后两个槽都解析到 abb-agent（bundled_names_for_role 对两种角色都优先 abb-agent）。
-        let cmds = ("/bin/abb-agent", "/bin/abb-agent");
+        let cmds = (
+            AgentCmd::bare("/bin/abb-agent"),
+            AgentCmd::bare("/bin/abb-agent"),
+        );
         let stop = tokio_util::sync::CancellationToken::new();
         let cfg = Config::default();
         let mk_bot = |mode: crate::config::SandboxMode| crate::config::BotConfig {
@@ -2036,7 +2087,8 @@ mod tests {
             crate::config::SandboxMode::ReadOnly,
             crate::config::SandboxMode::WorkspaceWrite,
         ] {
-            let handles = build_bot_acp_handles(&mk_bot(mode), &cfg, cmds, stop.clone());
+            let handles =
+                build_bot_acp_handles(&mk_bot(mode), &cfg, (&cmds.0, &cmds.1), stop.clone());
             assert_eq!(
                 handles.normal.agent_command(),
                 "/bin/abb-agent",
@@ -2053,7 +2105,8 @@ mod tests {
             crate::config::SandboxMode::Auto,
             crate::config::SandboxMode::FullAccess,
         ] {
-            let handles = build_bot_acp_handles(&mk_bot(mode), &cfg, cmds, stop.clone());
+            let handles =
+                build_bot_acp_handles(&mk_bot(mode), &cfg, (&cmds.0, &cmds.1), stop.clone());
             assert_eq!(
                 handles.normal.agent_command(),
                 "/bin/abb-agent",
@@ -2066,7 +2119,7 @@ mod tests {
         let handles = build_bot_acp_handles(
             &mk_bot(crate::config::SandboxMode::FullAccess),
             &cfg,
-            cmds,
+            (&cmds.0, &cmds.1),
             stop,
         );
         assert_eq!(handles.granted.agent_command(), "/bin/abb-agent");
@@ -2083,10 +2136,16 @@ mod tests {
     /// （公共包装不丢档位）。
     #[test]
     fn sessions_needing_a_sandbox_always_use_the_old_layer() {
-        let cmds = ("/bin/abb-agent", "/bin/legacy-agent");
-        assert_eq!(pick_command_by_sandbox(cmds, false), "/bin/abb-agent");
+        let cmds = (
+            AgentCmd::bare("/bin/abb-agent"),
+            AgentCmd::bare("/bin/legacy-agent"),
+        );
         assert_eq!(
-            pick_command_by_sandbox(cmds, true),
+            pick_command_by_sandbox((&cmds.0, &cmds.1), false).program,
+            "/bin/abb-agent"
+        );
+        assert_eq!(
+            pick_command_by_sandbox((&cmds.0, &cmds.1), true).program,
             "/bin/abb-agent",
             "受限档会话现在也走 abb-agent（已声明 abbSandbox 三档）"
         );
@@ -2103,8 +2162,8 @@ mod tests {
         };
         let cfg = Config::default();
         let cmds = (
-            "/bin/abb-agent".to_string(),
-            "/bin/legacy-agent".to_string(),
+            AgentCmd::bare("/bin/abb-agent"),
+            AgentCmd::bare("/bin/legacy-agent"),
         );
 
         // owner 配了 read-only ⇒ 档位存在，也走 abb-agent（已支持档位）。
@@ -2113,6 +2172,10 @@ mod tests {
         assert_eq!(
             c.command, "/bin/abb-agent",
             "带档位的 oneshot 也走 abb-agent"
+        );
+        assert!(
+            c.args.is_empty(),
+            "裸二进制槽（abb-agent）不带参数，args 恒空"
         );
 
         // owner 无档位 ⇒ 用新执行层。
@@ -2128,6 +2191,30 @@ mod tests {
         let c = oneshot_agent_config_for_role_inner(&bot, &cfg, cmds, true);
         assert!(c.session_sandbox.is_some());
         assert_eq!(c.command, "/bin/abb-agent", "granted 任务也走 abb-agent");
+    }
+
+    /// ki 回落的 args 必须透传到 `AgentConfig.args`：`ki acp serve` 的子命令在参数里，
+    /// spawn 侧 `AcpClient::spawn(command, args, …)` 原样带上——丢了它，ki 会进交互
+    /// TUI 而不是 ACP server（读 stdin 协议帧立刻失败）。
+    #[test]
+    fn ki_fallback_args_flow_into_agent_config() {
+        use crate::config::BotConfig;
+        let bot = BotConfig {
+            name: "ki-args".into(),
+            ..BotConfig::default()
+        };
+        let cfg = Config::default();
+        let ki = AgentCmd {
+            program: "/usr/local/bin/ki".to_string(),
+            args: vec!["acp".to_string(), "serve".to_string()],
+        };
+        let c = oneshot_agent_config_inner(&bot, &cfg, (ki.clone(), ki), None);
+        assert_eq!(c.command, "/usr/local/bin/ki");
+        assert_eq!(
+            c.args,
+            vec!["acp".to_string(), "serve".to_string()],
+            "`ki acp serve` 的子命令必须作为 args 透传到 spawn"
+        );
     }
 
     /// M6 的锁：角色 → 随包候选名（刀 4b 后两种角色都只认 abb-agent）。
@@ -2147,8 +2234,9 @@ mod tests {
 
     /// M5 的锁：**公共薄包装** `oneshot_agent_config` 不许丢档位、也不许用错命令槽。
     ///
-    /// 诚实说明判据强度：`command` 这一半在本机（无随包目录）两条槽都回落 `pi-acp`，
-    /// 所以它只能证明「包装确实走了 `pick_command_by_sandbox`」；真正区分两条槽的是
+    /// 诚实说明判据强度：`command` 这一半在本机（无随包目录）两条槽都回落
+    /// `ki acp serve`，所以它只能证明「包装确实走了 `pick_command_by_sandbox`」；
+    /// 真正区分两条槽的是
     /// `chat_handles_route_sandboxed_sessions_to_the_old_layer` 与
     /// `oneshot_paths_follow_the_sandbox_invariant`（注入式内层）。**档位那半是非空断言、不空转**。
     #[test]
@@ -2167,8 +2255,8 @@ mod tests {
         let (owner_cmd, old_cmd) = resolve_acp_commands();
         assert_eq!(
             c.command,
-            pick_command_by_sandbox((&owner_cmd, &old_cmd), true),
-            "带档位的 oneshot 走 owner 槽（abb-agent）"
+            pick_command_by_sandbox((&owner_cmd, &old_cmd), true).program,
+            "带档位的 oneshot 走 owner 槽"
         );
         // `$ABB_BIN` 必须在这条生产路径的 env 里（卡 abb-mcp-orchestrator-p0-20261012）：
         // 提示词与白名单都按它工作，此前**从未注入** ⇒ agent 的 shell/MCP 子进程里展开为空。
@@ -2224,7 +2312,7 @@ mod tests {
         let (owner_cmd, granted_cmd) = resolve_acp_commands();
         assert_eq!(
             c.command,
-            pick_command_by_sandbox((&owner_cmd, &granted_cmd), false),
+            pick_command_by_sandbox((&owner_cmd, &granted_cmd), false).program,
             "系统级对话不得走带档位的命令槽"
         );
         assert!(!c.command.is_empty(), "命令槽必被解析");
@@ -2297,20 +2385,20 @@ mod tests {
     }
 
     #[test]
-    fn acp_fallback_prefers_full_pi_acp_path() {
-        let full = std::path::PathBuf::from(r"C:\Users\me\AppData\Roaming\npm\pi-acp.cmd");
+    fn acp_fallback_prefers_full_ki_path() {
+        let full = std::path::PathBuf::from("/usr/local/bin/ki");
         let mut looked_up = false;
         assert_eq!(
             resolve_acp_command_with(Some("abb-agent"), || {
                 looked_up = true;
                 Some(full.clone())
             }),
-            "abb-agent",
-            "随包 abb-agent 优先于 pi-acp 兑底"
+            AgentCmd::bare("abb-agent"),
+            "随包 abb-agent 优先于 ki 兑底"
         );
         assert!(
             !looked_up,
-            "已有 abb-agent 时不得探测 pi-acp（Windows 会走同步注册表）"
+            "已有 abb-agent 时不得探测 ki（Windows 会走同步注册表）"
         );
 
         let mut looked_up = false;
@@ -2319,10 +2407,13 @@ mod tests {
                 looked_up = true;
                 Some(full.clone())
             }),
-            full.display().to_string(),
-            "Windows .cmd shim 必须传 PATH 命中的全路径，不能裸名 spawn"
+            AgentCmd {
+                program: full.display().to_string(),
+                args: vec!["acp".to_string(), "serve".to_string()],
+            },
+            "回落必须传 PATH 命中的全路径，且带 acp serve 子命令参数"
         );
-        assert!(looked_up, "无旧执行层可执行时必须探测 pi-acp");
+        assert!(looked_up, "无随包可执行时必须探测 ki");
 
         let mut looked_up = false;
         assert_eq!(
@@ -2330,9 +2421,10 @@ mod tests {
                 looked_up = true;
                 None
             }),
-            "pi-acp"
+            AgentCmd::bare("ki"),
+            "ki 缺失时保留裸名，spawn 失败如实可见（#246④）"
         );
-        assert!(looked_up, "pi-acp 缺失时也要完成一次探测");
+        assert!(looked_up, "ki 缺失时也要完成一次探测");
     }
 
     /// 回归（P2.1 结构消灭的串台）：旧 service 级共享句柄集的 env_for 取**第一个
