@@ -2016,11 +2016,7 @@ fn handle_prompt_result(l: &mut Loop, handle: &RuntimeHandle, mut result: Prompt
                 );
                 // 评审 NB-1：文案不得无条件宣称「已重置」——若两处都没命中（该频道在该
                 // agent 上本就无会话），事实是「没得重置」，说「已重置」是骗人。
-                let hint = if invalidated || invalidated_idle > 0 {
-                    "已为你重置本会话上下文，请重发这条消息。"
-                } else {
-                    "请重发这条消息；若仍失败，请减少一次发送的图片数量。"
-                };
+                let hint = body_too_large_hint(invalidated, invalidated_idle);
                 notify_channel(
                     l,
                     handle,
@@ -2332,6 +2328,24 @@ fn is_body_too_large(error: &AcpError) -> bool {
         return false;
     };
     MARKERS.iter().any(|marker| message.contains(marker))
+}
+
+/// 413 死信时给用户的那句「接下来怎么办」。
+///
+/// 为何单独抽出来（评审 abb-reviewer-141 在邻卡抓到的同类盲区）：原先这句是内联的
+/// `if invalidated || invalidated_idle > 0 {…}`，而**测试只盖了判据 `is_body_too_large`、
+/// 没盖判定之后的动作**——实测把整个 413 分支注释掉，三条单测仍然全绿。
+/// 抽成纯函数后，“失效了 ⇒ 说已重置；没失效 ⇒ 不得声称已重置”这个语义才能被钉住。
+///
+/// `invalidated` = 这份 checked-out agent 上该频道有无活会话；
+/// `invalidated_idle` = 其余空闲槽位命中多少个。两者任一命中即“真的重置过”。
+fn body_too_large_hint(invalidated: bool, invalidated_idle: usize) -> &'static str {
+    if invalidated || invalidated_idle > 0 {
+        "已为你重置本会话上下文，请重发这条消息。"
+    } else {
+        // 两处都没命中 ⇒ 压根没东西可重置，不能骗用户说“已重置”。
+        "请重发这条消息；若仍失败，请减少一次发送的图片数量。"
+    }
 }
 
 /// P2.3：受限会话被 `pool::create_session_and_apply_model` 的档位硬闸拒绝
@@ -3975,6 +3989,24 @@ mod body_too_large_tests {
                 "不应判为请求体超限：{message}"
             );
         }
+    }
+
+    /// 文案必须**如实**：真的失效过才说「已重置」（评审 NB-1 的回归）。
+    ///
+    /// 判别力：把 `body_too_large_hint` 改成恒返回「已为你重置…」⇒ 第二条断言红。
+    #[test]
+    fn hint_only_claims_reset_when_something_was_invalidated() {
+        // 就地失效命中
+        assert!(body_too_large_hint(true, 0).contains("已为你重置"));
+        // 只有空闲槽位命中
+        assert!(body_too_large_hint(false, 1).contains("已为你重置"));
+        // 两处都没命中 ⇒ 不得声称已重置
+        let none = body_too_large_hint(false, 0);
+        assert!(
+            !none.contains("已为你重置"),
+            "没失效过却说已重置就是骗用户：{none}"
+        );
+        assert!(none.contains("重发"), "仍要给可行动出路：{none}");
     }
 
     /// 非 `AgentError` 变体一律不归这条管（保持与其它分类判据同形）。
