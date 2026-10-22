@@ -53,6 +53,24 @@ entire runtime directory; empty means default); per-bot workspaces under
 - **Board/CI declarations**: `.walgit/board.toml` and `.walgit/ci.toml` are part of
   the tested tree. Move cards only by appending a signed `status` entry; never edit
   the board to represent a state change.
+- **MCP lane (自动协作，本机 ki 会话)**: ki 的 `mcpServers` 读 `<cwd>/.ki/settings.json`
+  （本机配置，含绝对路径与私钥路径，已 gitignore）。本项目启一个 `walgit` stdio server：
+  `walgit mcp --repo <检出> --allow-write --key <本 worktree 的 principal seed>`，
+  **控制台只订 `walgit://collab/board/<owner>/<repo>` 一条**，`signals.wake=auto` + `minIntervalSeconds`
+  限流。每条通知只带 URI，读到的 `_meta.version` 就是游标：**变了才处理，自己写下的那条按 head
+  entry 的 `actor` 过滤掉**；重启后先读一次（订阅是进程内轮询、best-effort，不能把重启读成
+  「什么都没发生」）。写走 `collab_entry` / `collab_claim` 两个工具（`actor` 必须是 `--key`
+  绑定的 principal），重活（构建、测试、push）仍在工具调用之外跑，收尾只写一条 entry。
+  **看板内容不要走 `read_resource`**：本项目 board 约 580 KB，而 ki 的读工具硬截断 20 KiB
+  （拿到的是断掉的 JSON 残片）；唤醒后用 CLI 取全文 —— `walgit collab board` / `collab board --json`。
+  同理 `walgit://refs/<owner>/<repo>` **不要订**：实测该仓库 4514 条 ref（`inbox` 3625、
+  `ci-artifacts` 516、tag 166、`refs/heads` 1），摘要按字典序预算 464 条**全部**是
+  `refs/collab/ci-artifacts/*`，分支/inbox 一条不回；而它的 `_meta.version` 是全量 ref 的流式
+  hash，等于每次 CI 产物落地都唤醒一次、却拿不到可读信息。worker 要盯自己的卡就订
+  `walgit://collab/thread/<owner>/<repo>/<thread-id>`（version = head oid，payload 小）。
+- **MCP 不改角色拓扑**：看板唤醒的是**控制台/orchestrator**，`--allow-write` 的 key 是
+  `abb-coordinator`；实现仍派给各 worktree 自己的 `abb-worker-N`（各自 `collab join` 生成 key），
+  验收仍是与作者不同的 `abb-reviewer-N`。一卡一 owner，改同一文件的卡串行。
 - **Build intermediates go to `/Volumes/DataExt/tmp`** (user policy, 2026-09-17): the
   228 GiB boot volume must not hold build output. `export TMPDIR=/Volumes/DataExt/tmp`
   for anything that makes temp trees, and put `CARGO_TARGET_DIR` on the data volume too.
