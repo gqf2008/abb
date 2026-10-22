@@ -446,7 +446,16 @@ async fn run_claimed(
     let workspace = task_workspace(bot_key, &task);
     match task.payload.kind {
         PayloadKind::Agent => {
-            let agent_cfg = agent_cfg_for_task(bot, cfg, &task, bot_key);
+            // 存量 granted 任务 fail-closed 拒跑（授权者机制已移除——没有受限执行层
+            // 保护它，绝不提权按 owner 全权限执行）。任务留在库里，owner 自行删除。
+            if task.created_by.role == crate::config::SenderRole::Granted {
+                crate::log!(
+                    "[task:{}] 存量 granted 任务拒跑（fail-closed，授权者机制已移除）",
+                    &task.id[..task.id.len().min(8)]
+                );
+                return;
+            }
+            let agent_cfg = agent_cfg_for_task(bot, cfg);
             run_attempt(bot_key, task, agent_cfg, workspace, router, states, stop).await;
         }
         PayloadKind::Proc if task.trigger.kind == TriggerKind::Keepalive => {
@@ -971,20 +980,13 @@ fn claim(prev: &TaskRuntime, started: u64) -> TaskRuntime {
 /// **选执行剖面并装配 agent 配置**——这是「这条任务用什么权限跑」的唯一定点。
 ///
 /// 安全审查 B1：剖面必须按**创建者角色**选，不能一律用 owner 的内部任务配置。
-/// `$ABB_BIN task add` 对 granted 会话是放行的（与 `job add` 同一条信任链），
-/// 选错就等于 granted 会话里的 agent 能借任务拿全权限。
-/// 判据与 `run_job` 完全一致：`config::restrict_granted(role, bot_key)`。
+/// 授权者机制移除后任务剖面与角色解耦（owner 配置档）；存量 granted 任务由
+/// 派发臂 fail-closed 拒跑。
 fn agent_cfg_for_task(
     bot: &crate::config::BotConfig,
     cfg: &crate::config::Config,
-    task: &Task,
-    bot_key: &str,
 ) -> crate::runtime::harness::AgentConfig {
-    // 用 **worker 自己的 bot_key**（不是定义文件里的 `task.bot_key`）判剖面：定义文件
-    // 可被手改，拿它当判据的话，改成一台 `restrict_granted_agent = false` 的 bot
-    // 就能选到更松的档。`TaskStore::add` 另有一道「归属必须与所在目录一致」的校验。
-    let restricted = crate::config::restrict_granted(task.created_by.role, bot_key);
-    crate::service::oneshot_agent_config_for_role(bot, cfg, restricted)
+    crate::service::oneshot_agent_config(bot, cfg)
 }
 
 /// 任务的工作目录：定义里显式给了就用它，否则回落该 bot 的工作区。
@@ -1812,42 +1814,30 @@ mod tests {
 
     /// 安全审查 B1 的回归锁：granted 建的任务必须拿 granted 剖面（workspace-write +
     /// restricted shell + NO_HINTS），owner 的才跟 bot 配置档走。
-    /// 这条锁的是**装配处的接线**——只测 `oneshot_agent_config_for_role` 本身
-    /// 无法证明 `run_one` 真的把 `created_by.role` 传下去了。
+    /// 授权者机制移除后的 fail-closed 替代（原 B1 回归锁）：存量 granted 任务在
+    /// `PayloadKind::Agent` 派发臂**早退拒跑**（见 run_task_attempt），永不落到
+    /// 装配处；装配对一切任务都给 owner 剖面——按档位（bot 配置）收紧，与角色无关。
     #[test]
-    fn granted_task_gets_restricted_profile() {
+    fn task_agent_config_ignores_legacy_role() {
         let bot = crate::config::BotConfig {
             name: "taskrole-wire".into(),
             kind: "feishu".into(),
             ..Default::default()
         };
         let cfg = crate::config::Config::default();
-        // 未知 bot_key → restrict_granted 对 Granted 取安全默认 true（不依赖本机 config 内容）
-        let bot_key = "no-such-bot-for-taskrole-test";
 
-        let mut g = now_task(bot_key, "tk_g", "c");
-        g.created_by.role = crate::config::SenderRole::Granted;
-        let gc = agent_cfg_for_task(&bot, &cfg, &g, bot_key);
-        let sb = gc
-            .session_sandbox
-            .expect("granted 任务必须有档位载荷（None = FullAccess，等于提权）");
-        assert_eq!(sb.sandbox.as_deref(), Some("workspace-write"));
-        assert_eq!(sb.shell.as_deref(), Some("restricted"));
+        let mut g = now_task("taskrole-wire", "tk_g", "c");
+        g.created_by.role = crate::config::SenderRole::Granted; // 存量数据形态
+        let gc = agent_cfg_for_task(&bot, &cfg);
         assert!(
-            gc.extra_env
-                .iter()
-                .any(|(k, v)| k == "ABB_AGENT_NO_HINTS" && v == "1"),
-            "granted 任务要带进程级 hints 收口"
+            gc.session_sandbox.is_none(),
+            "装配不再按角色给剖面（granted 拒跑发生在派发臂，轮不到这里提权）"
         );
 
         let mut o = g.clone();
         o.created_by.role = crate::config::SenderRole::Owner;
-        let oc = agent_cfg_for_task(&bot, &cfg, &o, bot_key);
-        assert!(
-            oc.session_sandbox.is_none(),
-            "owner 任务不该被额外收紧（默认档位 FullAccess → None）"
-        );
-        assert!(!oc.extra_env.iter().any(|(k, _)| k == "ABB_AGENT_NO_HINTS"));
+        let oc = agent_cfg_for_task(&bot, &cfg);
+        assert!(oc.session_sandbox.is_none());
     }
 
     /// P1b：任务完成投递的来源——自环（目标==创建者会话）记 `InSession`（保持旧行为），

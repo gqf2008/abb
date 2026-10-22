@@ -53,40 +53,6 @@ impl Bridge {
         }
     }
 
-    /// 发送者展示名解析（#74 历史/提醒展示用，8-20 用户反馈：显示名字不是 id）：
-    /// 本地授权者名单优先（授权时已反查过名字），未授权用户 API 反查（best-effort）。
-    /// 空 = 未查到（GUI 回落 id）。
-    pub(super) async fn resolve_sender_name(&self, sender_id: &str) -> String {
-        // 本地名单名字先克隆（释放 &self 借用——跨 await 持有引用会让 future 非 Send）
-        let local = {
-            let infos = if self.bot.is_dingtalk() {
-                &self.bot.ding_granted_infos
-            } else {
-                &self.bot.granted_infos
-            };
-            infos
-                .iter()
-                .find(|i| i.open_id == sender_id)
-                .map(|i| i.name.clone())
-                .filter(|n| !n.is_empty())
-        };
-        if let Some(n) = local {
-            return n;
-        }
-        self.msgr
-            .user_display_name(sender_id)
-            .await
-            .unwrap_or_default()
-    }
-
-    /// 热读 config 推导（准入, 发送者角色, mention map, #91 mention_default）——
-    /// on_payload / on_dingtalk 共用同一份 load+find+快照回落，避免两个入口各写一份
-    /// 导致准入与角色推导漂移（同一发送者在不同通道被推导成不同角色 = 授权者拿到
-    /// owner 权限或反之）。
-    /// 第三个返回值 = 该 bot 的 mention_modes（config 路径成功时 Some，含空 map——
-    /// 空 map 同样是权威判定；config 无该 bot / 读失败时 None，由调用方回落快照）。
-    /// 第四个返回值 = #91 bot 级提及默认（true=免 @；config 路径失败回落 false=需要 @，
-    /// 与旧行为一致）。门槛与准入共用这一次 load：未 @ 的顶层群消息不必再整份读一次 config.json。
     pub(super) fn access_and_role(
         &self,
         sender_id: &str,
@@ -100,20 +66,20 @@ impl Bridge {
             Ok(c) => match c.bots.into_iter().find(|b| b.key() == self.bot.key()) {
                 Some(b) => (
                     b.access_allows(sender_id),
-                    b.sender_role(sender_id),
+                    crate::config::SenderRole::Owner,
                     Some(b.mention_modes),
                     b.mention_default,
                 ),
                 None => (
                     self.access_snapshot_allows(sender_id),
-                    self.bot.sender_role(sender_id),
+                    crate::config::SenderRole::Owner,
                     None,
                     false,
                 ),
             },
             Err(_) => (
                 self.access_snapshot_allows(sender_id),
-                self.bot.sender_role(sender_id),
+                crate::config::SenderRole::Owner,
                 None,
                 false,
             ),
@@ -148,9 +114,9 @@ impl Bridge {
         }
     }
 
-    /// 尝试把一条消息当作授权码处理（owner 生成后给到对方）。仅 p2p 接受（飞书 p2p / 钉钉单聊，
-    /// 群里发码太公开防抢注）；文本精确匹配 pending 码 → 消费并把发送者加入对应白名单
-    /// （管理员码→owner / 普通码→授权者，按 bot kind 落位到 open_id 或 staffId 字段）、回发结果。
+    /// 尝试把一条消息当作管理员授权码处理（owner 生成后给到对方）。仅 p2p 接受（飞书 p2p /
+    /// 钉钉单聊，群里发码太公开防抢注）；文本精确匹配 pending 码 → 消费并把发送者加入
+    /// owner 白名单（按 bot kind 落位到 open_id 或 staffId 字段）、回发结果。
     /// 返回 true = 授权码消息已消费/回复，调用方应 return（不再进 agent）。
     pub(super) async fn try_consume_owner_code(
         &self,
@@ -173,7 +139,7 @@ impl Bridge {
             .unwrap_or_default();
         let r = crate::config::Config::consume_owner_code(&self.bot.key(), text, sender_id, &name);
         let reply = match r {
-            R::Granted => Some("✅ 授权成功，你现在可以在这个 bot 里对话了。"),
+            R::Admitted => Some("✅ 授权成功，你现在可以在这个 bot 里对话了。"),
             R::Expired => Some("❌ 授权码已过期，请联系管理员重新生成。"),
             R::NotFound => None, // 不是授权码 → 按未授权消息忽略
         };

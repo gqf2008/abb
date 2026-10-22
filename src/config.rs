@@ -14,7 +14,7 @@ use std::fs;
 use std::path::PathBuf;
 
 /// 内部执行档位（普通 UI 不再暴露；保留旧 config 兼容与高级 JSON 能力）：
-/// - Auto（legacy alias）：owner 会话全权限直跑；granted 仍由角色闸强制受限
+/// - Auto（legacy alias）：与会话档位一并按 owner 配置执行（历史别名，等价 FullAccess）
 /// - FullAccess（默认）：owner 会话**全权限直跑**（私人助理与用户同权限）
 /// - ReadOnly：claude 白名单只剩读/查工具；codex `--sandbox read-only`（全盘只读）
 /// - WorkspaceWrite：claude 工作区可写白名单；codex `--sandbox workspace-write` + bridge_dir 可写根
@@ -85,17 +85,9 @@ pub struct BotConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub key_suffix: String,
     /// 飞书：**owner（管理员）** 白名单（逗号/分号/空白分隔多个 open_id）。负责管理 bot、
-    /// 生成授权码。与「授权者」（granted_ids，授权码添加）分开。微信 bot 忽略。
+    /// 生成授权码（管理员码）。微信 bot 忽略。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner_open_id: String,
-    /// 飞书：**授权者**白名单（逗号/分号/空白分隔多个 open_id）——通过授权码获得的普通
-    /// 使用权限，与 owner（管理员）分开。授权码消费时自动加入。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub granted_ids: String,
-    /// 飞书：对话权限开关。false=仅授权用户（owner+授权者）可对话（默认）；true=任何人都可以
-    /// 对话（公开，owner/授权者/授权码均不限制）。公开模式下授权码无意义（生成按钮禁用）。
-    #[serde(default, skip_serializing_if = "not_open")]
-    pub open_access: bool,
     /// 微信：登录拿到的 bot_token（飞书忽略）。等同凭证，0600。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub wx_token: String,
@@ -117,18 +109,9 @@ pub struct BotConfig {
     /// 钉钉：owner（管理员）白名单（逗号分隔 staffId）。与飞书 owner_open_id 对应。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ding_owner_ids: String,
-    /// 钉钉：授权者白名单（逗号分隔 staffId）——授权码添加的普通用户。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub ding_granted_ids: String,
-    /// 钉钉：对话权限开关（false=仅授权用户可对话，true=任何人）。
-    #[serde(default, skip_serializing_if = "not_open")]
-    pub ding_open_access: bool,
     /// 钉钉：owner 展示名（staffId + 名字）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ding_owner_infos: Vec<OwnerInfo>,
-    /// 钉钉：授权者展示名（staffId + 名字）。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ding_granted_infos: Vec<OwnerInfo>,
     /// 钉钉：机器人编码（RobotCode）。企业内部应用机器人通常 = AppKey，个别后台单独展示时填它。
     /// 空 = 发送时用 app_id 兜底（对绝大多数企业内部应用机器人成立）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -145,14 +128,6 @@ pub struct BotConfig {
     /// 供 GUI 列表展示（授权时经飞书联系人 API 反查，查不到用 open_id 兜底）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owner_infos: Vec<OwnerInfo>,
-    /// 授权者展示信息（open_id + 名字）——授权码添加的普通授权用户。owner_infos 只管 owner。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub granted_infos: Vec<OwnerInfo>,
-    /// 授权者（granted_ids 成员）agent 会话是否隔离受限（安全默认 true）：
-    /// true=授权者驱动 agent 时走受限模式（仅工作区内读写 + $ABB_BIN 白名单，不能联网）；
-    /// false=授权者与 owner 同权限（现状全权限）。owner 会话不受此字段影响，恒全权限。
-    #[serde(default = "default_true", skip_serializing_if = "restrict_on")]
-    pub restrict_granted_agent: bool,
     /// 每日工作目录整理开关（默认关）：service 每日对该 bot 工作区做 tidy——孤儿后端
     /// 会话文件（24h 护栏 + live 集双保险）、临时/垃圾文件、超期历史 jsonl 截断、
     /// 根目录文档归档（archive/YYYY-MM/）+ git 留痕。破坏性/磁盘操作，故默认关，
@@ -233,17 +208,10 @@ impl Default for BotConfig {
             ding_user_id: String::new(),
             ding_robot_code: String::new(),
             ding_owner_ids: String::new(),
-            ding_granted_ids: String::new(),
-            ding_open_access: false,
             ding_owner_infos: Vec::new(),
-            ding_granted_infos: Vec::new(),
             provider: String::new(),
             pending_codes: Vec::new(),
             owner_infos: Vec::new(),
-            granted_ids: String::new(),
-            granted_infos: Vec::new(),
-            open_access: false,
-            restrict_granted_agent: true,
             tidy_enabled: false,
             mention_modes: std::collections::HashMap::new(),
             mention_default: false,
@@ -295,10 +263,6 @@ pub(crate) fn default_kind() -> String {
 }
 
 /// skip_serializing_if：false（默认私有）不落盘，旧 config 兼容。
-fn not_open(b: &bool) -> bool {
-    !*b
-}
-
 /// Auto（legacy）与 FullAccess 对 owner 都是不额外收窄，按默认省略；限制档才落盘。
 fn is_unrestricted_sandbox(m: &SandboxMode) -> bool {
     matches!(m, SandboxMode::Auto | SandboxMode::FullAccess)
@@ -307,11 +271,6 @@ fn is_unrestricted_sandbox(m: &SandboxMode) -> bool {
 /// #91：mention_default 默认 false（需要 @），false 不落盘（旧 config 兼容）。
 fn mention_default_off(b: &bool) -> bool {
     !*b
-}
-
-/// skip_serializing_if：restrict_granted_agent 为 true（安全默认）不落盘，旧 config 兼容。
-fn restrict_on(b: &bool) -> bool {
-    *b
 }
 
 /// skip_serializing_if：tidy_enabled 为 false（默认关）不落盘，旧 config 兼容。
@@ -324,7 +283,8 @@ fn tidy_off(b: &bool) -> bool {
 const OWNER_CODE_TTL_SECS: u64 = 30 * 60;
 
 /// 一个待消费的授权码。code 随机 4 位大写字母数字；expires_at = unix 秒。
-/// role 决定消费后落哪个白名单："owner"（管理员码）→ owner_open_id；"granted"（普通码）→ 授权者。
+/// role 历史上区分管理员码/普通码；granted（普通码）已随授权者机制移除，
+/// 现在只生成/消费 "owner"。存量 granted 码消费时按无效忽略（不提权）。
 /// 4 位足够：字符集 28（去易混淆的 0/O/1/I）≈ 61 万组合，且一次性 + 30 分钟过期 + 仅 p2p
 /// 接受——即使被猜中也只开一次口子，不构成长期访问面。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -332,7 +292,7 @@ const OWNER_CODE_TTL_SECS: u64 = 30 * 60;
 pub struct OwnerCode {
     pub code: String,
     pub expires_at: u64,
-    /// "owner" | "granted"（默认 granted）
+    /// "owner"（granted 为历史持久数据，消费时按无效忽略）
     pub role: String,
 }
 
@@ -344,24 +304,11 @@ pub struct OwnerInfo {
     pub name: String,
 }
 
-/// 在 BotConfig 上移除**授权者**（纯逻辑）：从 granted 白名单字符串删 open_id + 清对应展示名。
-/// GUI 同步工作副本与 Config::remove_granted 共用，避免两处各拆一遍。按 bot kind 落位。
-pub fn remove_granted_from_bot(bot: &mut BotConfig, open_id: &str) {
-    let (_, _, granted_ids, granted_infos) = bot.whitelists_mut();
-    let keep: Vec<&str> = granted_ids
-        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != open_id)
-        .collect();
-    *granted_ids = keep.join(",");
-    granted_infos.retain(|i| i.open_id != open_id);
-}
-
 /// 消费授权码的结果（bridge 据此回发用户可见文案）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerCodeResult {
     /// 授权成功：sender 已加入 owner 白名单。
-    Granted,
+    Admitted,
     /// 码匹配但已过期（30 分钟）。
     Expired,
     /// 不匹配任何待消费码（当作普通消息，桥静默忽略）。
@@ -401,8 +348,8 @@ fn whitelist_add(list: &mut String, infos: &mut Vec<OwnerInfo>, open_id: &str, n
 
 /// 在 BotConfig 上消费授权码（纯逻辑，不落盘）：
 /// 匹配（不区分大小写）pending 里的码 → 删除该码（一次性）；未过期 → 按码的 role 把 sender
-/// 加入对应白名单（owner 码→owner_open_id+owner_infos；普通码→granted_ids+granted_infos）并记录
-/// 展示名（name 空则用 open_id 兜底）返回 Granted；过期 → Expired；无匹配 → NotFound。
+/// 加入 owner 白名单（owner_open_id+owner_infos）并记录展示名（name 空则用 open_id 兜底）
+/// 返回 Admitted；过期 → Expired；无匹配（含历史 granted 码，不消费）→ NotFound。
 /// 顺带清理过期残留码。
 fn consume_owner_code_on_bot(
     bot: &mut BotConfig,
@@ -417,22 +364,19 @@ fn consume_owner_code_on_bot(
     }
     let mut found: Option<(bool, String)> = None; // (未过期, role)
     bot.pending_codes.retain(|c| {
-        if c.code.eq_ignore_ascii_case(code) {
+        if c.code.eq_ignore_ascii_case(code) && c.role == "owner" {
             found = Some((c.expires_at > now, c.role.clone()));
             false // 消费（删除），一次性
         } else {
-            c.expires_at > now // 顺带清理过期残留
+            // 历史 granted 码：不消费也不生效（保留到 TTL 过期清理），防误提权
+            c.expires_at > now
         }
     });
     match found {
-        Some((true, role)) => {
-            let (owner_ids, owner_infos, granted_ids, granted_infos) = bot.whitelists_mut();
-            if role == "owner" {
-                whitelist_add(owner_ids, owner_infos, sender, name);
-            } else {
-                whitelist_add(granted_ids, granted_infos, sender, name);
-            }
-            OwnerCodeResult::Granted
+        Some((true, _role)) => {
+            let (owner_ids, owner_infos) = bot.owner_whitelists_mut();
+            whitelist_add(owner_ids, owner_infos, sender, name);
+            OwnerCodeResult::Admitted
         }
         Some((false, _)) => OwnerCodeResult::Expired,
         None => OwnerCodeResult::NotFound,
@@ -624,9 +568,8 @@ impl BotConfig {
         }
     }
 
-    /// 统一访问判定（不矛盾的单一入口）：只放行 owner ∪ 授权者白名单成员
-    /// （#118：公开开关已从判定链移除，open_access / ding_open_access 字段仅保留兼容旧 config，
-    /// 不再被读取——未经授权一律拦截，fail-closed）。
+    /// 统一访问判定（不矛盾的单一入口）：只放行 owner（管理员）白名单成员。
+    /// （授权者白名单与公开开关已随 granted 机制移除——未经授权一律拦截，fail-closed。）
     /// 飞书用 open_id 字段、钉钉用 staffId 字段（各自独立，互不干扰）。
     /// 微信不走这套（wx_user_id 是登录身份，on_weixin 独立过滤）。
     /// 桥每次消息从 config 读最新值调用（授权后立即生效，不依赖启动快照）。
@@ -634,66 +577,21 @@ impl BotConfig {
         if self.is_wechat() {
             return true; // 微信由 on_weixin 的 wx_user_id 判据管，不在这里限制
         }
-        if self.is_dingtalk() {
-            let in_owner = !self.ding_owner_ids.is_empty()
-                && is_owner_allowed(&self.ding_owner_ids, sender_id);
-            let in_granted = !self.ding_granted_ids.is_empty()
-                && is_owner_allowed(&self.ding_granted_ids, sender_id);
-            return in_owner || in_granted;
-        }
-        let in_owner =
-            !self.owner_open_id.is_empty() && is_owner_allowed(&self.owner_open_id, sender_id);
-        let in_granted =
-            !self.granted_ids.is_empty() && is_owner_allowed(&self.granted_ids, sender_id);
-        in_owner || in_granted
-    }
-
-    /// 会话发送者角色推导（与 access_allows 同构，准入闸顺路区分 owner 与授权者）：
-    /// 命中 owner 白名单 → Owner（agent 全权限）；否则一律 Granted（agent 受限）。
-    /// 注意：空 owner 白名单 → 一律
-    /// Granted（安全默认，不猜 Owner；is_owner_allowed 对空串返回 true 只管准入不管角色，
-    /// 若需 owner 全权限请先把自己加进白名单）。微信恒 Owner
-    /// （wx_user_id 是唯一 owner 判据，on_weixin 已先过滤，无授权者概念）。
-    pub fn sender_role(&self, sender_id: &str) -> SenderRole {
-        if self.is_wechat() {
-            return SenderRole::Owner;
-        }
         let owner_ids = if self.is_dingtalk() {
             &self.ding_owner_ids
         } else {
             &self.owner_open_id
         };
-        if !owner_ids.is_empty() && is_owner_allowed(owner_ids, sender_id) {
-            SenderRole::Owner
-        } else {
-            SenderRole::Granted
-        }
+        !owner_ids.is_empty() && is_owner_allowed(owner_ids, sender_id)
     }
 
-    /// 按 kind 取（owner 白名单, owner 展示名, 授权者白名单, 授权者展示名）的可变引用，
-    /// 授权码消费/取消授权按 bot 类型落位（飞书 open_id / 钉钉 staffId）。
-    fn whitelists_mut(
-        &mut self,
-    ) -> (
-        &mut String,
-        &mut Vec<OwnerInfo>,
-        &mut String,
-        &mut Vec<OwnerInfo>,
-    ) {
+    /// 按 kind 取（owner 白名单, owner 展示名）的可变引用，
+    /// 授权码消费按 bot 类型落位（飞书 open_id / 钉钉 staffId）。
+    fn owner_whitelists_mut(&mut self) -> (&mut String, &mut Vec<OwnerInfo>) {
         if self.is_dingtalk() {
-            (
-                &mut self.ding_owner_ids,
-                &mut self.ding_owner_infos,
-                &mut self.ding_granted_ids,
-                &mut self.ding_granted_infos,
-            )
+            (&mut self.ding_owner_ids, &mut self.ding_owner_infos)
         } else {
-            (
-                &mut self.owner_open_id,
-                &mut self.owner_infos,
-                &mut self.granted_ids,
-                &mut self.granted_infos,
-            )
+            (&mut self.owner_open_id, &mut self.owner_infos)
         }
     }
 
@@ -814,6 +712,8 @@ pub fn first_owner_id(owner: &str) -> Option<String> {
 /// 会话发送者角色：owner（管理员，agent 全权限）/ granted（授权者，agent 受限）。
 /// PendingItem/Job 的 role 字段落盘为小写字符串；Default=Owner 兼容旧数据（无角色
 /// 时代的任务/待恢复消息按全权限处理，与现状一致）。
+/// `Granted` 仅服务**历史持久数据**的反序列化（运行时不再产生——授权者机制已移除，
+/// 存量 granted 任务/定时任务在执行侧按 fail-closed 拒跑，不提权）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SenderRole {
@@ -845,29 +745,6 @@ impl SenderRole {
             SenderRole::Granted => "granted",
         }
     }
-}
-
-/// 受限会话 prompt 前置说明（bridge 聊天路径 virtualbot.rs 与 run_job 定时任务同源；
-/// 必须最外层——安全约束不得被任何指令文件/历史内容盖过）。尾部带两个换行（与下文分隔）。
-pub const RESTRICT_PREAMBLE: &str = "\
-[受限模式] 你是受限会话：只能读/写本工作区（当前 bot 目录）内的文件；\
-你的记忆文件是 GRANTED.md（跨轮次保存信息用它，可读写）；\
-可用命令仅限 $ABB_BIN（定时任务/投递）与只读 git（status/diff 摘要等，不可读历史）；\
-不可联网、不可访问工作区外任何路径；越界操作会被系统拦截并记录。\n\n";
-
-/// 受限模式判定（agent::run 的 spawn 分支 / bridge prompt 注入 / run_job 定时任务
-/// 三处共用，防语义漂移）：role==Granted 且该 bot 的「授权者 agent 隔离」开关未放宽；
-/// 配置读不到按安全默认 true。每次热读（授权/关开关即时生效）。
-///
-/// 单后端化 P2.2 起，granted 会话不再被拒答——路由到独立 granted ACP 实例
-///（强制 workspace-write 域闸 + argv 白名单 shell + `$ABB_BIN`，进程级
-/// NO_HINTS）。「受限兑现」从「拒答」变成「受限实例执行」，本判定仍是选择该实例
-/// 的唯一角色闸门（与 prompt 受限说明/agent 受限判定同源）。
-pub fn restrict_granted(role: SenderRole, bot_key: &str) -> bool {
-    role == SenderRole::Granted
-        && Config::bot_for_bot_key(bot_key)
-            .map(|b| b.restrict_granted_agent)
-            .unwrap_or(true)
 }
 
 /// Jev 决策模型配置（统一迁移刀 4a）：授权者/受限会话的工具调用门禁。
@@ -1957,30 +1834,21 @@ impl Config {
         })
     }
 
-    /// 按 bot_key 读 BotConfig（load + find，provider_for_bot_key 同款热读）。
-    /// agent.rs 每次受限判定调用，判定安全开关（restrict_granted_agent）跟随最新配置。
-    pub fn bot_for_bot_key(bot_key: &str) -> Option<BotConfig> {
-        Config::load()
-            .ok()
-            .and_then(|c| c.bots.into_iter().find(|b| b.key() == bot_key))
-    }
-
     // ── 授权码（GUI 生成 / bridge 消费 / GUI 展示）──
 
-    /// 生成新授权码并落盘：role 指定码类型（"owner"=管理员码→owner 白名单；"granted"=普通码→
-    /// 授权者）。只作废**同 role** 的旧码（管理员码与普通码可同时存在）。返回 (码, 过期秒)。
-    /// GUI「生成管理员授权码 / 生成授权码」按钮调用。
-    pub fn generate_owner_code(bot_key: &str, role: &str) -> Option<(String, u64)> {
+    /// 生成新管理员授权码并落盘（消费后加入 owner 白名单）。作废旧管理员码。返回 (码, 过期秒)。
+    /// GUI「生成管理员授权码」按钮调用。
+    pub fn generate_owner_code(bot_key: &str) -> Option<(String, u64)> {
         let _g = CONFIG_WRITE_LOCK.lock().unwrap();
         let mut c = Config::load().ok()?;
         let bot = c.bots.iter_mut().find(|b| b.key() == bot_key)?;
         let code = new_owner_code();
         let expires_at = crate::chrono_lite::unix_secs() + OWNER_CODE_TTL_SECS;
-        bot.pending_codes.retain(|c| c.role != role); // 同 role 旧码作废，另一 role 保留
+        bot.pending_codes.retain(|c| c.role != "owner"); // 旧管理员码作废
         bot.pending_codes.push(OwnerCode {
             code: code.clone(),
             expires_at,
-            role: role.to_string(),
+            role: "owner".to_string(),
         });
         if c.save().is_err() {
             return None;
@@ -1989,7 +1857,7 @@ impl Config {
     }
 
     /// 消费授权码（bridge 收到疑似授权码的私聊消息时调用）：
-    /// Granted → sender 已加入该 bot owner 白名单（含展示名）并落盘；Expired/NotFound → 只反馈不落盘。
+    /// Admitted → sender 已加入该 bot owner 白名单（含展示名）并落盘；Expired/NotFound → 只反馈不落盘。
     /// 找不到 bot / 落盘失败 → NotFound（不误授权，也静默不打扰）。
     pub fn consume_owner_code(
         bot_key: &str,
@@ -2007,30 +1875,10 @@ impl Config {
         };
         let r = consume_owner_code_on_bot(bot, code, sender, name, crate::chrono_lite::unix_secs());
         // 落盘失败 = 授权未生效，按未消费处理（不误授权）
-        if r == OwnerCodeResult::Granted && c.save().is_err() {
+        if r == OwnerCodeResult::Admitted && c.save().is_err() {
             return OwnerCodeResult::NotFound;
         }
         r
-    }
-
-    /// 取消授权（GUI「取消授权」按钮）：从**授权者**白名单移除 open_id，并清掉对应展示名记录。
-    /// owner（管理员）不走这——GUI owner 输入框直接编辑。
-    pub fn remove_granted(bot_key: &str, open_id: &str) -> bool {
-        let _g = CONFIG_WRITE_LOCK.lock().unwrap();
-        let mut c = match Config::load() {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        let Some(bot) = c.bots.iter_mut().find(|b| b.key() == bot_key) else {
-            return false;
-        };
-        let before_ids = bot.granted_ids.clone();
-        let before_infos = bot.granted_infos.len();
-        remove_granted_from_bot(bot, open_id);
-        if bot.granted_ids == before_ids && bot.granted_infos.len() == before_infos {
-            return false; // 该用户本来就不在授权者列表（幂等）
-        }
-        c.save().is_ok()
     }
 
     /// 查询某 bot 当前未过期的授权码（GUI 展示「码 + 剩余分钟」）。返回 (role, 码, 过期秒)；
@@ -2359,36 +2207,26 @@ mod tests {
         assert!(!is_owner_allowed("ou_x, ou_y", "ou_z"));
     }
 
-    // ── 发送者角色（owner=全权限 / granted=受限）──
+    // ── 准入（owner-only，授权者机制已移除）──
 
     #[test]
-    fn sender_role_owner_vs_granted() {
-        // 飞书：owner 白名单命中 → Owner；授权者 → Granted；公开模式陌生人 → Granted
+    fn access_allows_owner_only() {
+        // 飞书：owner 白名单命中放行；其他一律拒（fail-closed）
         let bot = BotConfig {
             kind: "feishu".into(),
             owner_open_id: "ou_boss, ou_admin".into(),
-            granted_ids: "ou_friend".into(),
             ..Default::default()
         };
-        assert_eq!(bot.sender_role("ou_boss"), SenderRole::Owner);
-        assert_eq!(bot.sender_role("ou_admin"), SenderRole::Owner);
-        assert_eq!(bot.sender_role("ou_friend"), SenderRole::Granted);
-        assert_eq!(bot.sender_role("ou_stranger"), SenderRole::Granted);
-        // 公开模式：owner 命中 → Owner，陌生人 → Granted（受限）
-        let open = BotConfig {
-            kind: "feishu".into(),
-            owner_open_id: "ou_boss".into(),
-            open_access: true,
-            ..Default::default()
-        };
-        assert_eq!(open.sender_role("ou_boss"), SenderRole::Owner);
-        assert_eq!(open.sender_role("ou_stranger"), SenderRole::Granted);
-        // 空 owner 白名单：白名单里没有任何人 → 一律 Granted（安全默认，不猜 Owner）
+        assert!(bot.access_allows("ou_boss"));
+        assert!(bot.access_allows("ou_admin"));
+        assert!(!bot.access_allows("ou_friend"));
+        assert!(!bot.access_allows("ou_stranger"));
+        // 空 owner 白名单：不放行任何人（fail-closed）
         let no_owner = BotConfig {
             kind: "feishu".into(),
             ..Default::default()
         };
-        assert_eq!(no_owner.sender_role("ou_anyone"), SenderRole::Granted);
+        assert!(!no_owner.access_allows("ou_anyone"));
     }
 
     #[test]
@@ -2404,42 +2242,19 @@ mod tests {
     }
 
     #[test]
-    fn sender_role_dingtalk_uses_staff_ids() {
+    fn access_allows_dingtalk_uses_staff_ids() {
         let bot = BotConfig {
             kind: "dingtalk".into(),
             ding_owner_ids: "staff1, staff2".into(),
-            ding_granted_ids: "staff3".into(),
             ..Default::default()
         };
-        assert_eq!(bot.sender_role("staff1"), SenderRole::Owner);
-        assert_eq!(bot.sender_role("staff2"), SenderRole::Owner);
-        assert_eq!(bot.sender_role("staff3"), SenderRole::Granted);
-        assert_eq!(bot.sender_role("staff4"), SenderRole::Granted);
-        // 公开模式陌生人 → Granted
-        let open = BotConfig {
-            kind: "dingtalk".into(),
-            ding_owner_ids: "staff1".into(),
-            ding_open_access: true,
-            ..Default::default()
-        };
-        assert_eq!(open.sender_role("staff1"), SenderRole::Owner);
-        assert_eq!(open.sender_role("staff9"), SenderRole::Granted);
+        assert!(bot.access_allows("staff1"));
+        assert!(bot.access_allows("staff2"));
+        assert!(!bot.access_allows("staff3"));
     }
 
     #[test]
-    fn sender_role_wechat_always_owner() {
-        // 微信只有 owner（wx_user_id 判据，on_weixin 先过滤），无授权者概念
-        let bot = BotConfig {
-            kind: "wechat".into(),
-            wx_user_id: "wx_owner".into(),
-            ..Default::default()
-        };
-        assert_eq!(bot.sender_role("wx_owner"), SenderRole::Owner);
-        assert_eq!(bot.sender_role("wx_anyone"), SenderRole::Owner);
-    }
-
-    #[test]
-    fn sender_role_parse_and_serde() {
+    fn sender_role_parse_and_serde_legacy_contract() {
         assert_eq!(SenderRole::parse("granted"), SenderRole::Granted);
         assert_eq!(SenderRole::parse("GRANTED"), SenderRole::Granted);
         assert_eq!(SenderRole::parse("owner"), SenderRole::Owner);
@@ -2457,37 +2272,16 @@ mod tests {
     }
 
     #[test]
-    fn restrict_granted_agent_serde_compat() {
-        // 手动 Default 与旧 config 反序列化都落到安全默认 true
-        assert!(BotConfig::default().restrict_granted_agent);
-        let bot: BotConfig = serde_json::from_str(r#"{"name":"b1","kind":"feishu"}"#).unwrap();
-        assert!(bot.restrict_granted_agent);
-        // round-trip：默认 true 时字段不落盘（skip_serializing_if 保旧 config 兼容）
-        let s = serde_json::to_string(&bot).unwrap();
-        assert!(!s.contains("restrict_granted_agent"));
-        let back: BotConfig = serde_json::from_str(&s).unwrap();
-        assert!(back.restrict_granted_agent);
-        // 显式关闭（GUI 放宽）→ 落盘并往返保真
-        let off = BotConfig {
-            restrict_granted_agent: false,
-            ..Default::default()
-        };
-        let s2 = serde_json::to_string(&off).unwrap();
-        assert!(s2.contains("\"restrict_granted_agent\":false"));
-        let back2: BotConfig = serde_json::from_str(&s2).unwrap();
-        assert!(!back2.restrict_granted_agent);
-    }
-
-    #[test]
-    fn open_access_field_kept_but_not_read() {
-        // #118：字段保留兼容（反序列化不崩），但 access_allows 不再读它
-        let bot: BotConfig =
-            serde_json::from_str(r#"{"name":"b1","kind":"feishu","open_access":true}"#).unwrap();
-        assert!(bot.open_access, "字段保留");
-        assert!(
-            !bot.access_allows("ou_unknown"),
-            "fail-closed：公开字段不再放行"
-        );
+    fn legacy_granted_fields_are_ignored_on_load() {
+        // granted 机制移除后的兼容钉：旧落盘 config 里的
+        // restrict_granted_agent / granted_ids / open_access 字段不得让启动失败
+        // （BotConfig 无 deny_unknown_fields，多余字段按忽略处理）。
+        let bot: BotConfig = serde_json::from_str(
+            r#"{"name":"b1","kind":"feishu","granted_ids":"ou_a","open_access":true,"restrict_granted_agent":false}"#,
+        )
+        .expect("旧 config 含 granted 字段必须仍可解析");
+        assert_eq!(bot.name, "b1");
+        assert!(!bot.access_allows("ou_a"), "旧授权者不再放行（机制已移除）");
     }
 
     /// 废弃 wassette（2026-10-10）后的显式兼容断言：旧落盘 config 里的 `"wassette": false`
@@ -2546,7 +2340,7 @@ mod tests {
             pending_codes: vec![OwnerCode {
                 code: code.into(),
                 expires_at,
-                role: "granted".into(),
+                role: "owner".into(),
             }],
             ..Default::default()
         }
@@ -2556,23 +2350,18 @@ mod tests {
     fn owner_code_consume_adds_granted_not_owner() {
         let now = crate::chrono_lite::unix_secs();
         let mut bot = bot_with_code("K3M8XQ2P", now + 1800);
-        let r = consume_owner_code_on_bot(&mut bot, "K3M8XQ2P", "ou_friend", "张三", now);
-        assert_eq!(r, OwnerCodeResult::Granted);
-        // 授权码只产生「授权者」，owner（管理员）不动
-        assert!(is_owner_allowed(&bot.granted_ids, "ou_friend"));
-        assert!(
-            !is_owner_allowed(&bot.owner_open_id, "ou_friend"),
-            "owner 不该被授权码污染"
-        );
-        assert_eq!(bot.owner_open_id, "ou_boss", "owner 保持手填值");
+        let r = consume_owner_code_on_bot(&mut bot, "K3M8XQ2P", "ou_new_admin", "张三", now);
+        assert_eq!(r, OwnerCodeResult::Admitted);
+        // 管理员码 → 发送者加入 owner 白名单
+        assert!(is_owner_allowed(&bot.owner_open_id, "ou_new_admin"));
+        assert_eq!(bot.owner_open_id, "ou_boss,ou_new_admin");
         assert!(bot.pending_codes.is_empty(), "码一次性，消费后删除");
-        // 展示名随授权记录（GUI 授权者列表能显示「谁」）
-        assert_eq!(bot.granted_infos.len(), 1);
-        assert_eq!(bot.granted_infos[0].open_id, "ou_friend");
-        assert_eq!(bot.granted_infos[0].name, "张三");
-        // 私有模式下 access_allows 放行 owner 与授权者
+        // 展示名随授权记录（GUI 列表能显示「谁」）
+        assert_eq!(bot.owner_infos.len(), 1);
+        assert_eq!(bot.owner_infos[0].open_id, "ou_new_admin");
+        assert_eq!(bot.owner_infos[0].name, "张三");
         assert!(bot.access_allows("ou_boss"));
-        assert!(bot.access_allows("ou_friend"));
+        assert!(bot.access_allows("ou_new_admin"));
         assert!(!bot.access_allows("ou_stranger"));
     }
 
@@ -2582,73 +2371,62 @@ mod tests {
         let now = crate::chrono_lite::unix_secs();
         let mut bot = bot_with_code("NAME000", now + 1800);
         let r = consume_owner_code_on_bot(&mut bot, "NAME000", "ou_anon", "", now);
-        assert_eq!(r, OwnerCodeResult::Granted);
-        assert_eq!(bot.granted_infos[0].name, "ou_anon", "名字空时兜底 open_id");
+        assert_eq!(r, OwnerCodeResult::Admitted);
+        assert_eq!(bot.owner_infos[0].name, "ou_anon", "名字空时兜底 open_id");
     }
 
     #[test]
-    fn remove_granted_strips_whitelist_and_info() {
-        // 从多成员授权者白名单里精确移除一个：白名单字符串 + 展示名记录都清掉，其它成员保留
+    fn legacy_granted_code_is_ignored_not_consumed() {
+        // 存量 granted 码：消费尝试 → NotFound（不提权），码保留在 pending 里
+        // 等过期清理；管理员码不受影响
+        let now = crate::chrono_lite::unix_secs();
         let mut bot = BotConfig {
-            granted_ids: "ou_a, ou_b, ou_c".into(),
-            granted_infos: vec![
-                OwnerInfo {
-                    open_id: "ou_a".into(),
-                    name: "甲".into(),
+            pending_codes: vec![
+                OwnerCode {
+                    code: "ADMIN2".into(),
+                    expires_at: now + 1800,
+                    role: "owner".into(),
                 },
-                OwnerInfo {
-                    open_id: "ou_b".into(),
-                    name: "乙".into(),
-                },
-                OwnerInfo {
-                    open_id: "ou_c".into(),
-                    name: "丙".into(),
+                OwnerCode {
+                    code: "GRANT2".into(),
+                    expires_at: now + 1800,
+                    role: "granted".into(),
                 },
             ],
             ..Default::default()
         };
-        remove_granted_from_bot(&mut bot, "ou_b");
-        assert_eq!(bot.granted_ids, "ou_a,ou_c");
-        assert!(is_owner_allowed(&bot.granted_ids, "ou_a"));
-        assert!(!is_owner_allowed(&bot.granted_ids, "ou_b"));
-        assert_eq!(bot.granted_infos.len(), 2);
-        assert!(bot.granted_infos.iter().all(|i| i.open_id != "ou_b"));
-
-        // 移除最后一个 → 授权者清空（私有模式下只剩 owner 能对话；owner 也空则封闭）
-        remove_granted_from_bot(&mut bot, "ou_a");
-        remove_granted_from_bot(&mut bot, "ou_c");
-        assert!(bot.granted_ids.is_empty());
-        assert!(bot.granted_infos.is_empty());
-        assert!(!bot.access_allows("ou_a"), "授权者移除后不再放行");
-
-        // 移除不存在的成员 = 幂等无副作用
-        let mut bot2 = BotConfig {
-            granted_ids: "ou_x".into(),
-            granted_infos: vec![OwnerInfo {
-                open_id: "ou_x".into(),
-                name: "x".into(),
-            }],
-            ..Default::default()
-        };
-        remove_granted_from_bot(&mut bot2, "ou_none");
-        assert_eq!(bot2.granted_ids, "ou_x");
-        assert_eq!(bot2.granted_infos.len(), 1);
+        assert_eq!(
+            consume_owner_code_on_bot(&mut bot, "GRANT2", "ou_u", "小张", now),
+            OwnerCodeResult::NotFound,
+            "granted 码不再生效（机制已移除）"
+        );
+        assert!(bot.owner_open_id.is_empty());
+        assert_eq!(
+            bot.pending_codes.len(),
+            2,
+            "granted 码也不被删除（等 TTL 清理）"
+        );
+        // 管理员码照常
+        assert_eq!(
+            consume_owner_code_on_bot(&mut bot, "admin2", "ou_admin", "李总", now),
+            OwnerCodeResult::Admitted
+        );
+        assert!(is_owner_allowed(&bot.owner_open_id, "ou_admin"));
+        assert_eq!(bot.pending_codes.len(), 1, "granted 码仍在");
     }
 
     #[test]
-    fn open_access_no_longer_opens_door() {
-        // #118：公开开关从判定链移除（字段保留兼容，不再被读）——open_access=true 不再放行陌生人
-        let bot = BotConfig {
-            owner_open_id: "ou_boss".into(),
-            granted_ids: "ou_friend".into(),
-            open_access: true,
-            ..Default::default()
-        };
+    fn legacy_open_access_field_does_not_open_door() {
+        // granted 机制移除后的兼容钉：旧 config 的 open_access=true 不放行任何人
+        //（字段随机制删除，serde 忽略未知键；准入只剩 owner 白名单）
+        let bot: BotConfig = serde_json::from_str(
+            r#"{"name":"b1","kind":"feishu","owner_open_id":"ou_boss","open_access":true}"#,
+        )
+        .unwrap();
         assert!(bot.access_allows("ou_boss"));
-        assert!(bot.access_allows("ou_friend"));
         assert!(
             !bot.access_allows("ou_stranger"),
-            "公开开关失效：陌生人仍被拦截（fail-closed）"
+            "公开开关已死：陌生人被拦截（fail-closed）"
         );
     }
 
@@ -2659,7 +2437,7 @@ mod tests {
         // 小写输入也能匹配（用户手输大小写不一致很常见）
         assert_eq!(
             consume_owner_code_on_bot(&mut bot, "abcdefg2", "ou_a", "李四", now),
-            OwnerCodeResult::Granted
+            OwnerCodeResult::Admitted
         );
         // 二次消费同码 → NotFound（已删）
         assert_eq!(
@@ -2700,21 +2478,6 @@ mod tests {
     }
 
     #[test]
-    fn owner_code_first_grant_adds_granted_only() {
-        // owner 空 + 授权码 → 发送者成为「授权者」，owner（管理员）保持空（需 GUI 手填）
-        let now = crate::chrono_lite::unix_secs();
-        let mut bot = bot_with_code("FIRST01", now + 1800);
-        bot.owner_open_id.clear();
-        assert_eq!(
-            consume_owner_code_on_bot(&mut bot, "FIRST01", "ou_me", "", now),
-            OwnerCodeResult::Granted
-        );
-        assert!(bot.owner_open_id.is_empty(), "授权码不改 owner");
-        assert!(is_owner_allowed(&bot.granted_ids, "ou_me"));
-        assert!(bot.access_allows("ou_me"), "私有模式下授权者可对话");
-    }
-
-    #[test]
     fn owner_code_admin_role_adds_owner() {
         // 管理员码（role=owner）→ 发送者成为 owner（管理员），不进授权者列表
         let now = crate::chrono_lite::unix_secs();
@@ -2728,48 +2491,36 @@ mod tests {
         };
         assert_eq!(
             consume_owner_code_on_bot(&mut bot, "admin1", "ou_admin", "李总", now),
-            OwnerCodeResult::Granted
+            OwnerCodeResult::Admitted
         );
         assert!(is_owner_allowed(&bot.owner_open_id, "ou_admin"));
-        assert!(bot.granted_ids.is_empty(), "管理员码不进授权者");
         assert_eq!(bot.owner_infos[0].name, "李总");
         assert!(bot.access_allows("ou_admin"));
     }
 
     #[test]
-    fn owner_code_admin_and_granted_coexist() {
-        // 两类码可同时存在（生成时不互相作废）；消费各落各的位
+    fn legacy_granted_coexist_cleanup() {
+        // 过期残留清理对 granted 码同样生效（消费新码时顺带清掉过期项）
         let now = crate::chrono_lite::unix_secs();
         let mut bot = BotConfig {
             pending_codes: vec![
                 OwnerCode {
-                    code: "ADMIN2".into(),
+                    code: "NEWCODE1".into(),
                     expires_at: now + 1800,
                     role: "owner".into(),
                 },
                 OwnerCode {
-                    code: "GRANT2".into(),
-                    expires_at: now + 1800,
+                    code: "OLDSTALE".into(),
+                    expires_at: now - 10,
                     role: "granted".into(),
                 },
             ],
             ..Default::default()
         };
-        // 消费普通码：只落授权者；管理员码保留
         assert_eq!(
-            consume_owner_code_on_bot(&mut bot, "GRANT2", "ou_u", "小张", now),
-            OwnerCodeResult::Granted
+            consume_owner_code_on_bot(&mut bot, "NEWCODE1", "ou_f", "王五", now),
+            OwnerCodeResult::Admitted
         );
-        assert!(is_owner_allowed(&bot.granted_ids, "ou_u"));
-        assert!(bot.owner_open_id.is_empty());
-        assert_eq!(bot.pending_codes.len(), 1, "管理员码未被消费");
-        assert_eq!(bot.pending_codes[0].role, "owner");
-        // 再消费管理员码
-        assert_eq!(
-            consume_owner_code_on_bot(&mut bot, "admin2", "ou_admin", "李总", now),
-            OwnerCodeResult::Granted
-        );
-        assert!(is_owner_allowed(&bot.owner_open_id, "ou_admin"));
         assert!(bot.pending_codes.is_empty());
     }
 
@@ -2784,7 +2535,7 @@ mod tests {
         });
         assert_eq!(
             consume_owner_code_on_bot(&mut bot, "NEWCODE1", "ou_f", "王五", now),
-            OwnerCodeResult::Granted
+            OwnerCodeResult::Admitted
         );
         // 消费新码时顺带清掉过期残留，pending 不无限增长
         assert!(bot.pending_codes.is_empty());

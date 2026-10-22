@@ -43,16 +43,12 @@ impl BridgeRegistry {
     }
 }
 
-/// 单后端化（P2.1）：按 bot 构造的 ACP 句柄对——执行层随包（单一执行层 `abb-agent`，两种角色都走它；见 `service::resolve_acp_commands`），
-/// normal 与 granted（授权者受限会话）各一个**进程级**实例。
-/// granted 与 normal 差在 env（`ABB_AGENT_NO_HINTS=1`——fork 的 hints
-///（~/AGENTS.md、~/.agents/skills 扫盘）发生在 session/new **之前**，per-session
-/// `_meta` 管不到，只能进程级收口，计划决策 4）与 `session_sandbox`（granted
-/// 强制受限剖面）。域闸/argv 白名单经 `_meta` 随会话下发；dispatch/job 按角色
-/// 路由到对应实例（P2.2），granted 未路由时惰性待命（懒启动 = 零进程成本）。
+/// 单后端化（P2.1）：按 bot 构造的 ACP 句柄——单一执行层、单一实例
+///（授权者机制已移除，2026-10-22；见 `service::resolve_agent_command`）。
+/// 域闸/argv 白名单经 `session/new` `_meta.abbSandbox` 随会话下发（仅 owner
+/// 配置了受限档时携带）。懒启动 = 零进程成本。
 pub struct BotAcpHandles {
-    pub normal: Arc<crate::runtime::harness::RuntimeHandle>,
-    pub granted: Arc<crate::runtime::harness::RuntimeHandle>,
+    pub acp: Arc<crate::runtime::harness::RuntimeHandle>,
 }
 
 /// 一个正在跑的定时任务轮次（#309 PR-A2）。停止词靠它把取消送到**正确的**实例与频道：
@@ -1500,17 +1496,6 @@ mod tests {
         make_test_harness_full(record_file, registry, None, Vec::new())
     }
 
-    /// [`make_test_harness`] 的带档位变体：`session_sandbox` 随 `session/new`
-    /// `_meta` 下发（P2.2 端到端断言用；mock agent 已声明 `_meta.abbSandbox`，
-    /// 与真实 fork 能力位对齐）。
-    fn make_test_harness_with_sandbox(
-        record_file: std::path::PathBuf,
-        registry: &crate::bridge::BridgeRegistry,
-        session_sandbox: Option<crate::runtime::acp::SessionSandboxMeta>,
-    ) -> (Arc<crate::runtime::harness::RuntimeHandle>, BotAcpHandles) {
-        make_test_harness_full(record_file, registry, session_sandbox, Vec::new())
-    }
-
     /// 完整变体：额外 env（如 `MOCK_NO_ABB_SANDBOX=1` 模拟未声明能力位的旧
     /// fork——P2.3 硬闸回归锁）。
     fn make_test_harness_full(
@@ -1551,13 +1536,7 @@ mod tests {
             )
         };
         let rt = mk();
-        let handles = BotAcpHandles {
-            normal: rt.clone(),
-            // 默认 granted 复用同一 mock 实例（多数测试不区分实例）；需要区分
-            // normal/granted 的用例自行组装 BotAcpHandles（见
-            // restricted_session_refused_* 的两个硬闸测试）
-            granted: rt.clone(),
-        };
+        let handles = BotAcpHandles { acp: rt.clone() };
         // 诊断探针：3s 后快照 dead 状态（spawn 失败 = dead=true），写诊断文件供测试失败信息引用
         {
             let probe = rt.clone();
@@ -2383,14 +2362,19 @@ mod tests {
         );
         // 第二条是 granted 角色：重放时按原角色走受限分支（prompt 前置受限说明）
         assert!(prompts[1].contains("第二条"), "受限说明在前，原文在后");
-        assert!(prompts[1].starts_with("[受限模式]"));
+        // legacy Granted 夹具照常重放（不丢消息）；受限前导已随机制移除
+        assert!(
+            prompts[1].contains("第二条") && !prompts[1].contains("[受限模式]"),
+            "legacy granted 待重放不注入受限前导: {}",
+            prompts[1]
+        );
         assert_eq!(
             runner.roles(),
             [
                 crate::config::SenderRole::Owner,
                 crate::config::SenderRole::Granted
             ],
-            "重放必须携带原角色（granted 不得被提升为 owner）"
+            "legacy 角色原样透传（guard 的 env 防御链继续生效；不再注入受限 prompt 前导）"
         );
         assert!(
             msgr.sent().iter().any(|t| t.contains("正在恢复")),
@@ -2473,7 +2457,6 @@ mod tests {
             bot_name: "庆小丰".into(),
             bot_open_id: "ou_bot".into(),
             owner_open_id: "ou_boss".into(),
-            granted_ids: "ou_friend".into(),
             ..Default::default()
         };
         let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
@@ -2969,7 +2952,6 @@ mod tests {
             bot_name: "庆小丰".into(),
             bot_open_id: "ou_bot".into(),
             owner_open_id: "ou_owner".into(),
-            open_access: true, // #118：字段保留但不再被读（无公开开关）
             ..Default::default()
         };
         let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
@@ -3198,51 +3180,6 @@ mod tests {
         );
         cleanup_bridge(&bridge);
     }
-
-    #[tokio::test]
-    async fn on_payload_granted_gets_restricted_session() {
-        // 授权者（granted_ids 成员）消息：角色=Granted 传给 agent（受限分支），
-        // prompt 前置受限说明（CLAUDE.md 共享，只能靠 prompt 区分角色）
-        let runner = Arc::new(MockAgentRunner::immediate("done"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            kind: "feishu".into(),
-            bot_name: "庆小丰".into(),
-            bot_open_id: "ou_bot".into(),
-            owner_open_id: "ou_boss".into(),
-            granted_ids: "ou_friend".into(),
-            ..Default::default()
-        };
-        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
-
-        let payload = feishu_payload(
-            "om_g",
-            "oc_p2p",
-            "p2p",
-            "",
-            "",
-            "user",
-            "ou_friend",
-            &[],
-            "帮我分析附件",
-        );
-        bridge.on_payload(payload.as_bytes()).await;
-
-        let prompts = runner.prompts();
-        assert_eq!(prompts.len(), 1, "授权者应触发 agent");
-        assert!(
-            prompts[0].starts_with("[受限模式]"),
-            "granted 会话 prompt 应前置受限说明"
-        );
-        assert!(prompts[0].contains("帮我分析附件"));
-        assert_eq!(
-            runner.roles(),
-            [crate::config::SenderRole::Granted],
-            "授权者消息必须以 Granted 角色进入 agent 调用"
-        );
-        cleanup_bridge(&bridge);
-    }
-
     #[tokio::test]
     async fn on_payload_owner_gets_full_session() {
         // owner 消息：角色=Owner，prompt 不带受限说明（全权限会话不受影响）
@@ -3253,7 +3190,6 @@ mod tests {
             bot_name: "庆小丰".into(),
             bot_open_id: "ou_bot".into(),
             owner_open_id: "ou_boss".into(),
-            granted_ids: "ou_friend".into(),
             ..Default::default()
         };
         let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
@@ -3345,57 +3281,6 @@ mod tests {
         assert!(p.contains("执行任务"), "用户文本在块后");
         cleanup_bridge(&bridge);
     }
-
-    #[tokio::test]
-    async fn agents_md_block_sits_inside_restricted_preamble() {
-        // 受限说明必须最外层：granted 会话中 [受限模式] 在 [指令文件] 之前
-        //（AGENTS.md 里的任何话术不得盖过安全约束）
-        let runner = Arc::new(MockAgentRunner::immediate("done"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            kind: "feishu".into(),
-            bot_name: "庆小丰".into(),
-            bot_open_id: "ou_bot".into(),
-            owner_open_id: "ou_boss".into(),
-            granted_ids: "ou_friend".into(),
-            ..Default::default()
-        };
-        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
-        let bot_key = bridge.bot.key();
-        let root = bridge.agents_md_root.clone();
-        std::fs::create_dir_all(root.join("workspaces").join(&bot_key)).unwrap();
-        std::fs::write(
-            root.join("workspaces").join(&bot_key).join("AGENTS.md"),
-            "bot 规则",
-        )
-        .unwrap();
-
-        let payload = feishu_payload(
-            "om_b",
-            "oc_p2p",
-            "p2p",
-            "",
-            "",
-            "user",
-            "ou_friend",
-            &[],
-            "帮忙",
-        );
-        bridge.on_payload(payload.as_bytes()).await;
-
-        let prompts = runner.prompts();
-        let p = &prompts[0];
-        assert!(p.starts_with("[受限模式]"), "受限说明必须最外层: {p}");
-        let i_restrict = p.find("[受限模式]").unwrap();
-        let i_agents = p.find("[指令文件]").unwrap();
-        let i_text = p.find("帮忙").unwrap();
-        assert!(
-            i_restrict < i_agents && i_agents < i_text,
-            "顺序：受限说明 > [指令文件] > 用户文本"
-        );
-        cleanup_bridge(&bridge);
-    }
-
     #[tokio::test]
     async fn missing_agents_md_skips_block() {
         // 三级文件全缺 → 整个块不注入（现有断言 prompt 精确相等的测试不破坏）
@@ -3490,75 +3375,6 @@ mod tests {
         );
         cleanup_bridge(&bridge);
     }
-
-    #[tokio::test]
-    async fn granted_p2p_message_records_msgstore_and_unread() {
-        // #74：授权者私聊消息 → 落消息库（user 轮）+ 未读提醒；agent 回复发送成功后
-        // 再落 assistant 轮（同 mid，direction 区分，UNIQUE(mid,direction) 幂等）。
-        let runner = Arc::new(MockAgentRunner::immediate("done"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            kind: "feishu".into(),
-            bot_name: "庆小丰".into(),
-            bot_open_id: "ou_bot".into(),
-            owner_open_id: "ou_boss".into(),
-            granted_ids: "ou_friend".into(),
-            ..Default::default()
-        };
-        let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
-        let payload = feishu_payload(
-            "om_rec",
-            "oc_p2p",
-            "p2p",
-            "",
-            "",
-            "user",
-            "ou_friend",
-            &[],
-            "帮我写个周报",
-        );
-        bridge.on_payload(payload.as_bytes()).await;
-
-        let rows = bridge.msgstore.list_recent(10);
-        assert_eq!(rows.len(), 2, "granted 私聊应落 user + assistant 两条");
-        assert_eq!(rows[0].direction, "assistant", "最新是回复");
-        assert_eq!(rows[0].mid, "om_rec", "回复复用用户轮 mid");
-        assert_eq!(rows[0].sender_id, "ou_friend");
-        assert_eq!(rows[1].direction, "user");
-        assert_eq!(rows[1].text, "帮我写个周报");
-        assert_eq!(rows[1].sender_id, "ou_friend");
-
-        let unread = bridge.unread.snapshot().unwrap();
-        assert_eq!(unread.len(), 1, "未读提醒一条");
-        assert_eq!(unread[0].bot_key, bridge.bot.key());
-        assert_eq!(unread[0].sender, "ou_friend");
-        assert_eq!(unread[0].preview, "帮我写个周报");
-        // 提醒是纯本地 UI：messenger 只发出 agent 回复，绝不主动向任何 IM 发提醒消息
-        assert_eq!(msgr.sent().len(), 1, "外发只有 agent 回复一条");
-        assert_eq!(msgr.sent()[0], "done");
-        // 审查跟进：重放同 mid（崩溃恢复续跑 handle；seen 去重是进程内的，重启后
-        // 清空）→ 落库被 UNIQUE(mid,direction) 幂等挡住、未读不得重复提醒
-        // （弹窗/红点以「这条消息提醒过没」为准，不以收到几次为准）。
-        bridge.seen.lock().unwrap().clear(); // 模拟重启后的全新进程
-        bridge.on_payload(payload.as_bytes()).await;
-        assert_eq!(
-            bridge.msgstore.list_recent(10).len(),
-            2,
-            "重放不重复落库（user+assistant 仍各一行）"
-        );
-        assert_eq!(
-            bridge.unread.snapshot().unwrap().len(),
-            1,
-            "重放同 mid 只提醒一次"
-        );
-        assert_eq!(
-            msgr.sent().iter().filter(|t| *t == "done").count(),
-            2,
-            "W1 重放语义：agent 重跑并再发一条回复（at-least-once）"
-        );
-        cleanup_bridge(&bridge);
-    }
-
     #[tokio::test]
     async fn owner_p2p_message_skips_msgstore_and_unread() {
         // #74：owner 自己排除——owner 私聊不落历史库、不产生未读提醒
@@ -3569,7 +3385,6 @@ mod tests {
             bot_name: "庆小丰".into(),
             bot_open_id: "ou_bot".into(),
             owner_open_id: "ou_boss".into(),
-            granted_ids: "ou_friend".into(),
             ..Default::default()
         };
         let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
@@ -3607,7 +3422,6 @@ mod tests {
             bot_name: "庆小丰".into(),
             bot_open_id: "ou_bot".into(),
             owner_open_id: "ou_boss".into(),
-            granted_ids: "ou_friend".into(),
             ..Default::default()
         };
         let (bridge, msgr) = build_test_bridge_with_bot(runner.clone(), bot);
@@ -3656,80 +3470,6 @@ mod tests {
         );
         cleanup_bridge(&bridge);
     }
-
-    #[tokio::test]
-    async fn granted_group_message_skips_msgstore_and_unread() {
-        // #74：提醒/历史只覆盖私聊（p2p/dm）——群里授权者 @ 消息不落历史库、不提醒
-        let runner = Arc::new(MockAgentRunner::immediate("done"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            kind: "feishu".into(),
-            bot_name: "庆小丰".into(),
-            bot_open_id: "ou_bot".into(),
-            owner_open_id: "ou_boss".into(),
-            granted_ids: "ou_friend".into(),
-            ..Default::default()
-        };
-        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
-        let payload = feishu_payload(
-            "om_g_grp",
-            "oc_grp",
-            "group",
-            "",
-            "",
-            "user",
-            "ou_friend",
-            &[("庆小丰", "ou_bot")],
-            "大家早",
-        );
-        bridge.on_payload(payload.as_bytes()).await;
-        assert!(bridge.msgstore.list_recent(10).is_empty(), "群消息不得落库");
-        assert!(
-            bridge.unread.snapshot().unwrap_or_default().is_empty(),
-            "群消息不得产生未读"
-        );
-        cleanup_bridge(&bridge);
-    }
-
-    #[tokio::test]
-    async fn dingtalk_granted_dm_records_msgstore_and_unread() {
-        // #74：钉钉授权者单聊（chat_type=dm）同样落库 + 提醒（dm 分支覆盖）
-        let runner = Arc::new(MockAgentRunner::immediate("done"));
-        let bot = BotConfig {
-            name: format!("abb-test-{}", uuid::Uuid::new_v4()),
-            kind: "dingtalk".into(),
-            ding_owner_ids: "u_boss".into(),
-            ding_granted_ids: "u_friend".into(),
-            ..Default::default()
-        };
-        let (bridge, _msgr) = build_test_bridge_with_bot(runner.clone(), bot);
-        let msg = crate::dingtalk::DingtalkMessage {
-            mid: "dt1".into(),
-            sender_staff_id: "u_friend".into(),
-            conversation_id: "u_friend".into(), // 单聊：chat_id = sender
-            conversation_type: "1".into(),
-            conversation_title: String::new(),
-            text: "钉钉上找你".into(),
-            mentioned: false,
-            robot_code: "r".into(),
-            quoted_text: String::new(),
-            quoted_attachments: Vec::new(),
-            attachments: Vec::new(),
-        };
-        bridge.on_dingtalk(msg).await;
-
-        let rows = bridge.msgstore.list_recent(10);
-        assert_eq!(rows.len(), 2, "granted 钉钉单聊应落 user + assistant 两条");
-        assert_eq!(rows[0].direction, "assistant");
-        assert_eq!(rows[1].direction, "user");
-        assert_eq!(rows[1].text, "钉钉上找你");
-        assert_eq!(rows[1].sender_id, "u_friend");
-        let unread = bridge.unread.snapshot().unwrap();
-        assert_eq!(unread.len(), 1);
-        assert_eq!(unread[0].sender, "u_friend");
-        cleanup_bridge(&bridge);
-    }
-
     #[tokio::test]
     async fn on_payload_cancel_without_task_replies_and_no_agent() {
         // /cancel 无任务在跑 → 明确回复「当前没有正在运行的任务」，不透传给 agent
@@ -4760,7 +4500,6 @@ mod tests {
         );
         cleanup_bridge(&bridge);
     }
-
     /// 读取 mock agent 的 session/new 记录（`_meta` 载荷断言用）。
     fn read_session_metas(record_file: &std::path::Path) -> Vec<serde_json::Value> {
         let Ok(s) = std::fs::read_to_string(record_file) else {
@@ -4773,106 +4512,6 @@ mod tests {
             .collect()
     }
 
-    /// P2.2 端到端：granted 角色消息路由到 granted 实例（独立 mock 进程），
-    /// owner 消息走 normal 实例；档位载荷随 `session/new` `_meta` 下发且键名
-    /// camelCase（与 fork `SessionNewMeta` 契约一致），normal 侧（None）不带
-    /// `_meta`（今天字节级行为回归锁）。
-    #[tokio::test]
-    #[cfg_attr(
-        target_os = "windows",
-        ignore = "mock agent fixture 依赖 python3（Windows runner 未装）"
-    )]
-    async fn granted_role_routes_to_granted_instance_with_sandbox_meta() {
-        let runner = Arc::new(MockAgentRunner::immediate("done"));
-        let rec_normal =
-            std::env::temp_dir().join(format!("mock-n-{}.jsonl", uuid::Uuid::new_v4()));
-        let rec_granted =
-            std::env::temp_dir().join(format!("mock-g-{}.jsonl", uuid::Uuid::new_v4()));
-        let registry: crate::bridge::BridgeRegistry = Default::default();
-        let (normal, _h) = make_test_harness(rec_normal.clone(), &registry);
-        let (granted, _hg) = make_test_harness_with_sandbox(
-            rec_granted.clone(),
-            &registry,
-            Some(crate::runtime::acp::SessionSandboxMeta {
-                sandbox: Some("workspace-write".to_string()),
-                writable_roots: Some(vec!["/tmp/abb-granted-ws".to_string()]),
-                read_roots: None,
-                shell: Some("restricted".to_string()),
-                abb_bin: Some("/Applications/ABB.app/Contents/MacOS/agent-bridge".to_string()),
-            }),
-        );
-        let handles = BotAcpHandles {
-            normal: normal.clone(),
-            granted: granted.clone(),
-        };
-        let (bridge, _msgr) = build_test_bridge_full(
-            runner.clone(),
-            backend_bot("buzz"),
-            Some((normal.clone(), handles)),
-        );
-        registry.register(&bridge.bot.key(), &bridge);
-
-        // owner 消息 → normal 实例
-        let mut ev_owner = test_ev("m-owner", "oc_route_owner", "hi owner");
-        ev_owner.chat_type = "p2p".to_string();
-        bridge.handle(ev_owner).await;
-        // granted 消息 → granted 实例（受限会话）
-        let mut ev_granted = test_ev("m-granted", "oc_route_granted", "hi granted");
-        ev_granted.chat_type = "p2p".to_string();
-        ev_granted.role = crate::config::SenderRole::Granted;
-        bridge.handle(ev_granted).await;
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let (normal_metas, granted_metas) = loop {
-            let n = read_session_metas(&rec_normal);
-            let g = read_session_metas(&rec_granted);
-            if !n.is_empty() && !g.is_empty() {
-                break (n, g);
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "session/new 10s 未到达 mock agent（normal={n:?} granted={g:?}）"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        };
-
-        // normal：无档位 ⇒ 无 _meta 键（None = FullAccess 今天行为）
-        assert!(
-            normal_metas[0].is_null(),
-            "normal 实例不应带 _meta 档位: {:?}",
-            normal_metas[0]
-        );
-        // granted：受限剖面 + camelCase 键名
-        let gm = &granted_metas[0];
-        assert_eq!(gm["sandbox"], "workspace-write");
-        // 2026-10-12（卡 abb-channel-mcp-config-20261012）：域根不再照抄 handle 级
-        // 的 `writable_roots`，而是**跟随本次会话 cwd = 该渠道目录**——否则受限会话
-        // 连自己的 cwd 都写不了。
-        let granted_ws = crate::channel_dir::channel_dir(&bridge.bot.key(), "oc_route_granted");
-        let granted_ws = std::fs::canonicalize(&granted_ws).unwrap_or(granted_ws);
-        assert_eq!(
-            gm["writableRoots"],
-            serde_json::json!([granted_ws.display().to_string()])
-        );
-        // 写域跟着渠道目录，**原 bot 工作区降级为只读根**（附件可读；卡 abb-channel-mcp-followups-20261012）
-        assert_eq!(gm["readRoots"], serde_json::json!(["/tmp/abb-granted-ws"]));
-        assert_eq!(gm["shell"], "restricted");
-        assert_eq!(
-            gm["abbBin"],
-            "/Applications/ABB.app/Contents/MacOS/agent-bridge"
-        );
-        assert!(gm.get("writable_roots").is_none(), "键名必须 camelCase");
-        assert!(gm.get("abb_bin").is_none(), "键名必须 camelCase");
-        cleanup_bridge(&bridge);
-    }
-
-    /// P2.3 硬闸（Critical 风险回归锁）：随包 agent 未声明 `_meta.abbSandbox`
-    ///（模拟旧 fork）时，受限会话**拒绝创建**——绝不静默降级 FullAccess。
-    /// 断言：无 session/new 到达 agent（没有会话就没有执行），且用户收到
-    /// 可行动提示；错误不可重试（一次性死信，不反复重投）。
-    ///
-    /// normal/granted 用**两个不同**的 mock 进程（normal 能力正常）：若路由
-    /// 错把 granted 走成 normal，本测试会因「无拒答、反而建了会话」而红。
     #[tokio::test]
     #[cfg_attr(
         target_os = "windows",
@@ -4880,13 +4519,10 @@ mod tests {
     )]
     async fn restricted_session_refused_when_agent_lacks_capability() {
         let runner = Arc::new(MockAgentRunner::immediate("done"));
-        let rec_normal =
-            std::env::temp_dir().join(format!("mock-cap-n-{}.jsonl", uuid::Uuid::new_v4()));
         let rec_granted =
             std::env::temp_dir().join(format!("mock-cap-g-{}.jsonl", uuid::Uuid::new_v4()));
         let registry: crate::bridge::BridgeRegistry = Default::default();
-        let (normal, _h) = make_test_harness(rec_normal.clone(), &registry);
-        let (old_fork, _h2) = make_test_harness_full(
+        let (rt, _h) = make_test_harness_full(
             rec_granted.clone(),
             &registry,
             Some(crate::runtime::acp::SessionSandboxMeta {
@@ -4898,19 +4534,16 @@ mod tests {
             }),
             vec![("MOCK_NO_ABB_SANDBOX".to_string(), "1".to_string())],
         );
-        let handles = BotAcpHandles {
-            normal,
-            granted: old_fork.clone(),
-        };
+        let handles = BotAcpHandles { acp: rt.clone() };
         let (bridge, msgr) = build_test_bridge_full(
             runner.clone(),
             backend_bot("buzz"),
-            Some((old_fork.clone(), handles)),
+            Some((rt.clone(), handles)),
         );
         registry.register(&bridge.bot.key(), &bridge);
         let mut ev = test_ev("m1", "oc_old_fork", "hi");
         ev.chat_type = "p2p".to_string();
-        ev.role = crate::config::SenderRole::Granted;
+        // owner 事件 + 会话带档位：能力缺失照样拒（fail-closed 不分角色）
         bridge.handle(ev).await;
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4934,11 +4567,6 @@ mod tests {
             read_prompts(&rec_granted).is_empty(),
             "旧 fork 不得收到 prompt"
         );
-        // 拒绝是 granted 实例专属：normal 实例（能力正常）不该被误伤
-        assert!(
-            read_session_metas(&rec_normal).is_empty(),
-            "normal 实例不应收到 granted 消息"
-        );
         cleanup_bridge(&bridge);
     }
 
@@ -4952,11 +4580,8 @@ mod tests {
     )]
     async fn restricted_session_refused_when_mode_absent_from_vocabulary() {
         let runner = Arc::new(MockAgentRunner::immediate("done"));
-        let rec_normal =
-            std::env::temp_dir().join(format!("mock-vocab-n-{}.jsonl", uuid::Uuid::new_v4()));
         let rec = std::env::temp_dir().join(format!("mock-vocab-{}.jsonl", uuid::Uuid::new_v4()));
         let registry: crate::bridge::BridgeRegistry = Default::default();
-        let (normal, _hn) = make_test_harness(rec_normal.clone(), &registry);
         let (narrow, _h) = make_test_harness_full(
             rec.clone(),
             &registry,
@@ -4973,8 +4598,7 @@ mod tests {
             )],
         );
         let handles = BotAcpHandles {
-            normal: normal.clone(),
-            granted: narrow.clone(),
+            acp: narrow.clone(),
         };
         let (bridge, msgr) = build_test_bridge_full(
             runner.clone(),
@@ -4984,7 +4608,6 @@ mod tests {
         registry.register(&bridge.bot.key(), &bridge);
         let mut ev = test_ev("m1", "oc_narrow_vocab", "hi");
         ev.chat_type = "p2p".to_string();
-        ev.role = crate::config::SenderRole::Granted;
         bridge.handle(ev).await;
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -5002,10 +4625,6 @@ mod tests {
         assert!(
             read_session_metas(&rec).is_empty(),
             "词表不含请求档位时不得创建会话"
-        );
-        assert!(
-            read_session_metas(&rec_normal).is_empty(),
-            "normal 实例（能力正常）不应收到 granted 消息"
         );
         cleanup_bridge(&bridge);
     }

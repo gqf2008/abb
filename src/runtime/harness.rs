@@ -552,17 +552,6 @@ impl RuntimeHandle {
         }
     }
 
-    /// fork `_meta.abbSandbox` 能力位（P2.3）。桥侧预检只在 **Unsupported**
-    ///（agent 已起、initialize 未声明）时提前拒答；Unknown（懒启动未起）放行——
-    /// 真闸在 session 创建处（pool），否则首条 granted 消息必被误拒。
-    pub fn sandbox_support(&self) -> SandboxSupport {
-        match self.sandbox_supported.load(Ordering::Relaxed) {
-            1 => SandboxSupport::Supported,
-            2 => SandboxSupport::Unsupported,
-            _ => SandboxSupport::Unknown,
-        }
-    }
-
     /// steer 能力位（本卡）：给系统对话的发送判定用。`Unknown` = initialize 前。
     ///
     /// 与 [`sandbox_support`](Self::sandbox_support) 同款：**每次成功拉起后重判**，

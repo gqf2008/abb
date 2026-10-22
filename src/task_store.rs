@@ -458,7 +458,8 @@ impl Default for TaskDelivery {
     }
 }
 
-/// 创建者身份。`role` 决定执行时走哪个剖面（granted 建的任务不得借 owner 全权限跑）。
+/// 创建者身份。`role` 为历史持久数据（Granted 仅旧任务反序列化用；授权者机制已移除，
+/// 存量 granted 任务在派发臂 fail-closed 拒跑）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CreatedBy {
     #[serde(default)]

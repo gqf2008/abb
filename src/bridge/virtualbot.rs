@@ -7,19 +7,10 @@ use uuid::Uuid;
 impl Bridge {
     /// 按消息/事件角色选 ACP 实例（单后端化 P2.2）：granted 受限会话路由 granted
     /// 实例（强制受限剖面 + 进程级 NO_HINTS）；其余走 normal 实例（bot 配置档）。
-    /// 判据 `restrict_granted`（role==Granted && 开关热读）与 prompt 受限说明/agent
-    /// 受限判定同源，防语义漂移。None = 句柄对未装配（测试挡板/job 内部路径）。
-    fn acp_handle_for_role(
-        &self,
-        role: crate::config::SenderRole,
-    ) -> Option<std::sync::Arc<crate::runtime::harness::RuntimeHandle>> {
-        self.acp_handles.as_ref().map(|hs| {
-            if crate::config::restrict_granted(role, &self.bot.key()) {
-                hs.granted.clone()
-            } else {
-                hs.normal.clone()
-            }
-        })
+    /// 单执行实例（授权者机制已移除——只有 normal 一条链）。None = 句柄未装配
+    /// （测试挡板/job 内部路径）。
+    fn acp_handle(&self) -> Option<std::sync::Arc<crate::runtime::harness::RuntimeHandle>> {
+        self.acp_handles.as_ref().map(|hs| hs.acp.clone())
     }
 }
 
@@ -51,12 +42,6 @@ enum RuntimePrecheckFail {
     /// 未配置模型供应商（生效供应商解析为 None——执行层 agent 进程共用一组凭证，
     /// 与 CLI 后端硬闸同源语义；区别仅在 runtime 闸在预检而非 build_injection）
     NoProvider,
-    /// granted 受限会话的执行能力已判为不支持（P2.3 硬闸）：随包 fork 已起且
-    /// initialize 未声明 `_meta.abbSandbox` ⇒ 提前拒答——绝不允许「发不出档位就
-    /// 默认 FullAccess」的静默降级（新 ABB + 旧随包 fork 是唯一 Critical 风险）。
-    /// 未启动（Unknown）不在此拒——真闸在 session 创建处（pool），此处只做
-    /// 「已知不行」的早拒，避免首条 granted 消息因懒启动被误拒。
-    SandboxUnsupported,
 }
 
 impl Bridge {
@@ -76,11 +61,9 @@ impl Bridge {
     /// 「群聊·<chat_id 前缀>」——闸后登记话题频道时作话题频道名来源，不另查
     /// harness 频道表，防两份来源漂移。
     fn dispatch_precheck(&self, ev: &Ev) -> Result<String, RuntimePrecheckFail> {
-        // P2.2：按角色选实例——granted 会话路由 granted 实例（受限剖面）。
         let handle = self
-            .acp_handle_for_role(ev.role)
+            .acp_handle()
             .ok_or(RuntimePrecheckFail::RuntimeDisabled)?;
-        let granted = crate::config::restrict_granted(ev.role, &self.bot.key());
         // p2p（私聊）：免登记——频道由 dispatch 全闸通过后即时注册（upsert 幂等），
         // 频道名 = 对方展示名。私聊无「群登记」概念（用户私聊 bot 是合理路径）。
         if ev.chat_type == "p2p" || ev.chat_type == "dm" {
@@ -92,15 +75,6 @@ impl Bridge {
                     .as_ref(),
             ) {
                 return Err(RuntimePrecheckFail::NoProvider);
-            }
-            // P2.3 granted 能力硬闸（绝不静默降级 FullAccess）：仅在能力位已判为
-            // Unsupported（agent 已起、initialize 未声明）时提前拒答。Unknown
-            //（懒启动未起）放行——真闸在 session 创建处（pool，与本 agent 的
-            // initialize 结果同源，无竞态），否则首条 granted 消息必被误拒。
-            if granted
-                && handle.sandbox_support() == crate::runtime::harness::SandboxSupport::Unsupported
-            {
-                return Err(RuntimePrecheckFail::SandboxUnsupported);
             }
             let cfg = crate::config::Config::load().unwrap_or_default();
             let (peer, _) = crate::ui::resolve_display(&cfg, &self.bot.key(), &ev.sender_id);
@@ -124,12 +98,6 @@ impl Bridge {
         ) {
             return Err(RuntimePrecheckFail::NoProvider);
         }
-        // P2.3 granted 能力硬闸（同 p2p 分支：仅 Unsupported 提前拒答，Unknown 放行）
-        if granted
-            && handle.sandbox_support() == crate::runtime::harness::SandboxSupport::Unsupported
-        {
-            return Err(RuntimePrecheckFail::SandboxUnsupported);
-        }
         // 群根频道名：优先虚拟 Bot 登记快照的角色名（mtime 懒刷新，与注入判定
         // 同源）；未登记的群回退「群聊·<chat_id 前缀>」（自动登记语义，不拒答）。
         self.refresh_virtual_bots();
@@ -151,7 +119,7 @@ impl Bridge {
     /// 群不被覆盖——巡检登记的角色名优先）。adhoc 标记让巡检 diff 豁免清理
     ///（不在登记表是常态而非消失）。
     fn ensure_group_channel(&self, ev: &Ev, group_name: &str) {
-        let Some(handle) = self.acp_handle_for_role(ev.role) else {
+        let Some(handle) = self.acp_handle() else {
             return; // 预检已过则 handle 必在；防御性早退
         };
         let uuid = Uuid::parse_str(&crate::runtime::keys::channel_uuid(
@@ -185,7 +153,7 @@ impl Bridge {
     /// 消息注册，后续消息刷新 meta）。巡检对 adhoc 频道豁免清理，不会被登记表
     /// diff 误清。频道名 = 对方展示名（agent prompt 上下文）。
     fn ensure_p2p_channel(&self, ev: &Ev, peer_name: &str) {
-        let Some(handle) = self.acp_handle_for_role(ev.role) else {
+        let Some(handle) = self.acp_handle() else {
             return;
         };
         let uuid = Uuid::parse_str(&crate::runtime::keys::channel_uuid(
@@ -213,7 +181,7 @@ impl Bridge {
     /// 同频道）；每次 dispatch 都刷新锚点（= 本条用户消息 mid，话题回复
     /// send_thread_reply 的落点）。
     fn ensure_topic_channel(&self, ev: &Ev, group_name: &str) {
-        let Some(handle) = self.acp_handle_for_role(ev.role) else {
+        let Some(handle) = self.acp_handle() else {
             return; // 预检已过则 handle 必在；防御性早退
         };
         let uuid = Uuid::parse_str(&crate::runtime::keys::topic_channel_uuid(
@@ -618,17 +586,11 @@ impl Bridge {
                     // 带上**真实原因**（截断后进对话）：只说「未就绪」等于什么都没说 ——
                     // 用户既不知道是缺文件、取令牌失败、被 EDR 拦还是初始化失败，
                     // 也不知道该去看哪份日志（2026-09-29 owner 实报）。
-                    let detail = self
-                        .acp_handle_for_role(ev.role)
-                        .and_then(|h| h.last_start_error());
+                    let detail = self.acp_handle().and_then(|h| h.last_start_error());
                     Some(agent_down_reason(detail))
                 }
                 Err(RuntimePrecheckFail::NoProvider) => Some(
                     "未配置模型供应商或未填 API Key：请在 ABB 设置「模型供应商」页补全并保存"
-                        .to_string(),
-                ),
-                Err(RuntimePrecheckFail::SandboxUnsupported) => Some(
-                    "受限（授权者）会话需要 ABB 随包 agent 具备受限执行能力——请升级 ABB 后重试"
                         .to_string(),
                 ),
                 Ok(_) => None,
@@ -732,28 +694,6 @@ impl Bridge {
                 vb_desc.chars().count()
             );
         }
-        // 受限会话（授权者）：prompt 开头前置受限说明。CLAUDE.md 是 owner/授权者共享的
-        // 同一份指引，不能靠它区分——prompt 注入才是按角色区分的正确载体（硬闸在 guard hook）。
-        // 判定与 agent::run 的 restrict 一致（role==Granted && 开关热读）——owner 关掉
-        // 隔离开关后，granted 会话实际是全权限，prompt 不得再谎称受限（否则模型自我设限、
-        // 或把不存在的拦截声明当承诺）。读不到 config 按安全默认 true。
-        // （insert 挪到锁内历史注入之后——受限说明必须保持最外层。）
-        let restrict_prompt = crate::config::restrict_granted(ev.role, &self.bot.key());
-
-        // #74：是否落历史库 + 未读提醒（granted 私聊）。覆盖飞书 p2p / 钉钉单聊(dm)；
-        // owner 自己（role==Owner）排除；微信无授权者概念（on_weixin 恒 Owner）自然排除。
-        // 提醒是纯本地 UI（托盘红点 + 弹窗），绝不主动向任何 IM 发消息（授权边界规则）。
-        let record_granted = ev.role == crate::config::SenderRole::Granted
-            && (ev.chat_type == "p2p" || ev.chat_type == "dm");
-        // 发送者展示名：**锁外解析**（API 反查是 await——在代际锁/串行锁内 await 会让
-        // std MutexGuard 跨 await → future 非 Send，见审查）。本地名单优先，未授权 API。
-        // 未授权私聊的名字在 on_payload 未授权分支解析（不走 handle），这里只管 granted。
-        let granted_uname = if record_granted {
-            self.resolve_sender_name(&ev.sender_id).await
-        } else {
-            String::new()
-        };
-
         // per-chat 串行：同一 key（话题=chat:thread）的并发消息排队等前一条处理完（不丢弃）。
         // 先从 std Mutex 取出该 key 的锁 Arc（短持 std 锁），再 await 异步锁。
         let chat_lock = self.chat_lock(&key);
@@ -865,47 +805,11 @@ impl Bridge {
             if !agents_block.is_empty() {
                 prompt.insert_str(0, &agents_block);
             }
-            // 受限说明后插（insert_str(0) 后进者更靠前）→ 保持在最外层
-            if restrict_prompt {
-                prompt.insert_str(0, crate::config::RESTRICT_PREAMBLE);
-            }
             // 历史/消息库用同一份「用户轮文本」（显示与落库一致；只算一次——审查清理）
             let user_text = history_user_text(&text, &ev);
             // 当前用户轮落历史（锁内，与助手轮严格按真实顺序交替；重放由 (mid,user) 去重兜底）。
             // 锁内写与 /new 的 clear 互斥。
             hist.append_user(&ev.mid, "buzz", &user_text);
-            // #74：授权者（granted）私聊消息 → 落消息库 + 未读提醒（条件见 record_granted）。
-            // 与 hist 同处锁内写：插入快、失败只 log，不阻塞主链路。
-            // 落库与提醒联动（审查跟进）：insert 返回是否真正插入——重放（崩溃恢复
-            // 续跑 handle）同 mid 再插会被 UNIQUE(mid,direction) 挡住 → false → 不
-            // 重复提醒（弹窗/红点以「这条消息提醒过没」为准，不以收到几次为准）。
-            if record_granted {
-                // 展示名：锁外已解析（granted_uname；本地名单优先/API 反查）——
-                // 历史/提醒都显示名字（8-20 用户反馈，不显示 open_id）
-                let inserted = self.msgstore.insert(
-                    &self.bot.key(),
-                    &ev.chat_id,
-                    &ev.mid,
-                    "user",
-                    &ev.sender_id,
-                    &granted_uname,
-                    &user_text,
-                    ev.ts,
-                    &ev.chat_type,
-                    &ev.chat_name,
-                );
-                if inserted {
-                    // 未读提醒：只记发送者 id + 名字 + 摘要（40 字符预览）。
-                    // insert 返回真正插入才提醒——重放同 mid 被 UNIQUE 挡住 → 不重复
-                    self.unread.report(
-                        &self.bot.key(),
-                        &ev.sender_id,
-                        &granted_uname,
-                        &crate::agent::truncate(&user_text, 40),
-                        ev.ts,
-                    );
-                }
-            }
             (lock_ret, epoch, injected_rounds)
         };
 
@@ -928,7 +832,7 @@ impl Bridge {
         // ACP 单轨：句柄对已装配 → 按角色 push 进对应实例（P2.2：granted→受限实例，
         // 其余→normal 实例）异步回合后返回；未装配（测试挡板/job 内部）落到下方
         // spawn 同步路径。
-        if let Some(handle) = self.acp_handle_for_role(ev.role) {
+        if let Some(handle) = self.acp_handle() {
             crate::log!(
                 "[bridge] runtime 路径：push 进 harness chat={} len={}",
                 trunc(&ev.chat_id, 12),
@@ -1147,24 +1051,6 @@ impl Bridge {
                 }
                 match send_result {
                     Ok(()) => {
-                        // #74：bot 回复落历史库（与用户轮同条件：granted 私聊，见 record_granted）。
-                        // 回复 mid 复用用户轮 mid（history.rs 一消息一回复语义），由
-                        // UNIQUE(mid, direction) 幂等区分；时间用发送时刻。发的是纯回复
-                        // （不含注入提示 history_note——那是迁移期瞬态，不进历史）。
-                        if record_granted {
-                            self.msgstore.insert(
-                                &self.bot.key(),
-                                &ev.chat_id,
-                                &ev.mid,
-                                "assistant",
-                                &ev.sender_id,
-                                "", // assistant 行 GUI 显示 bot 名（direction 区分）
-                                &reply,
-                                crate::chrono_lite::unix_secs() as i64,
-                                &ev.chat_type,
-                                &ev.chat_name,
-                            );
-                        }
                         crate::log!(
                             "[bridge] 已回复 chat={} 长度={}",
                             trunc(&ev.chat_id, 10),
@@ -1276,7 +1162,7 @@ impl Bridge {
     /// 与 CLI 一致无角色门槛：任何能发言的 IM 用户都可叫停。!shutdown/!rotate
     /// 等 harness 无此面（cancel 是唯一暴露给聊天的控制信号）。
     async fn cancel_reply(&self, ev: &Ev) -> String {
-        let Some(handle) = self.acp_handle_for_role(ev.role) else {
+        let Some(handle) = self.acp_handle() else {
             return "⚠️ 叫停未送达：harness 未装配（检查服务状态/重启）。".to_string();
         };
         let channel_id = Uuid::parse_str(&if ev.thread_id.is_empty() {
