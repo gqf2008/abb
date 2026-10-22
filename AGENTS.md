@@ -54,11 +54,17 @@ entire runtime directory; empty means default); per-bot workspaces under
   the tested tree. Move cards only by appending a signed `status` entry; never edit
   the board to represent a state change.
 - **Build intermediates go to `/Volumes/DataExt/tmp`** (user policy, 2026-09-17): the
-  228 GiB boot volume must not hold build output. Use
-  `CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target` for local gates and
-  `export TMPDIR=/Volumes/DataExt/tmp` for anything that makes temp trees. Falling back
-  to the default `target/` or `$TMPDIR` fills the boot volume and manifests as an
-  `errno=28 (No space left on device)` link failure — not as a code failure.
+  228 GiB boot volume must not hold build output. `export TMPDIR=/Volumes/DataExt/tmp`
+  for anything that makes temp trees, and put `CARGO_TARGET_DIR` on the data volume too.
+  Falling back to the default `target/` or `$TMPDIR` fills the boot volume and manifests
+  as an `errno=28 (No space left on device)` link failure — not as a code failure.
+- **`CARGO_TARGET_DIR` must be per-worktree**, not the shared `abb-target`
+  (card `abb-target-dir-per-worktree-20261022`). `tools/gates.sh` now derives it as
+  `$base/abb-target-$(basename <worktree>)`; if you set it by hand, do the same. A shared
+  directory makes concurrent worktrees starve each other on cargo's file lock — observed:
+  a single `cargo build` stuck 25+ min, load 12.4, and `check_test_isolation.sh` timing
+  out repeatedly (the tests themselves take 15 s) while *looking like test failures*.
+  `ABB_TARGET_SHARED=1 tools/gates.sh` opts back into the shared dir for single-worktree use.
 - **CI**: merge gate = the local gate set below (fmt / clippy / build / `tools/check_test_isolation.sh`)
   + independent review — `merge_rule_eval` on this repo requires no CI run (`base is not protected`).
   This repo keeps **no resident local walgit CI runner**: do not start `tools/run_ci_runner.sh`. Historical
@@ -89,11 +95,11 @@ checkout — there `/Volumes` does not exist and intermediates were landing in `
 ```sh
 # macOS
 export TMPDIR=/Volumes/DataExt/tmp
-export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target
+export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target-$(basename "$PWD")   # 每 worktree 一个
 
 # Windows（Git Bash；E: 是数据卷）
 export TMPDIR=/e/tmp
-export CARGO_TARGET_DIR=/e/tmp/abb-target
+export CARGO_TARGET_DIR=/e/tmp/abb-target-$(basename "$PWD")   # 每 worktree 一个
 ```
 
 `tools/gates.sh` sets these two for the current platform and then runs the four gates below;
@@ -149,7 +155,7 @@ tools/check_test_isolation.sh
 - Walgit patch/PR entries: describe what and why, link the issue thread, and run
   `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo build --locked`, and `tools/check_test_isolation.sh` **with
-  `TMPDIR=/Volumes/DataExt/tmp CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target`
+  `TMPDIR=/Volumes/DataExt/tmp CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target-$(basename "$PWD")`
   exported** (see Build/Test above). The isolated test runner is the full-test gate;
   do not substitute a bare `cargo test` because it can write the real
   `~/.agent-bridge`. Include before/after screenshots for UI
