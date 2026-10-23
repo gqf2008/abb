@@ -115,6 +115,14 @@ windows = { version = "0.58", features = [
 
 
 
+# 本机 16 GB 统一内存实测：dev profile 默认 debuginfo=2 会让单个 rustc 峰值涨到 3.5 GB，
+# agent_bridge 的 bin + test 两个 target 并行编译合计 >7 GB，直接打爆内存并把系统拖进
+# swap 抖动（load 14、CPU 却只有 0.x%）。line-tables-only 仍保留行号断点与 backtrace
+# 符号，只是不再包含变量/类型的完整 debuginfo，rustc 峰值与产物体积都显著下降。
+# 需要完整变量级调试时临时覆盖：cargo test --config 'profile.dev.debug=2'
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = "z"
 lto = "fat"
