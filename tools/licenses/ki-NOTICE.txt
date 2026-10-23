@@ -1,0 +1,10 @@
+ki（kiqi）—— ABB 的随包执行层，以 abb-agent 之名分发（2026-10-23 起）
+
+仓库：https://github.com/gqf2008/pi-rust（pi 的 kiqi 分支；本地主开发远端为 walgit）
+版本：构建时钉定 pi-rust SHA（见 .github/workflows/release.yml 的 ref；当前 941b750）
+许可：MIT（全文见本目录 ki-LICENSE-MIT.txt；上游源自 pi，Copyright (c) 2025 Mario Zechner）
+
+用途：ABB 的 ACP 执行层。发布管线从 pi-rust 构建 `kiqi-cli` 并把产物**改名为
+abb-agent(.exe)** 随包分发（名字不变：解析链/签名/安装路径零改动；旧 abb-agent
+忽略 argv，新 ki 需 `acp serve` 子命令——随包命令统一带该参数，两代二进制兼容）。
+随包形态：独立可执行（非静态链接进 agent-bridge）。

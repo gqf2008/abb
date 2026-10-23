@@ -8,9 +8,10 @@ use crate::messenger;
 use std::sync::Arc;
 
 /// 解析 ACP 执行层命令（纯函数便于单测）。
-/// 决议链（刀 4b 后）：
-/// ① 主程序同目录随包 `abb-agent`（单一执行层，两种角色都走它）；
-/// ② 都没有 → None（调用方回落 PATH `ki acp serve` 兑底，ki-acp-serve.md 批次 3）。
+/// 决议链：
+/// ① 主程序同目录随包 `abb-agent`（单一执行层；2026-10-23 起产物 = ki）；
+/// ② 随包缺失 → 回落 PATH `ki`（ki-acp-serve.md 批次 3）。
+/// 两条路径都统一 spawn `<program> acp serve`（旧随包 abb-agent 忽略 argv，两代兼容）。
 ///
 /// 随包执行层的文件名（同一个二进制名在两平台一致，Windows 追加 `.exe` 由调用方处理）。
 const BUNDLED_AGENT: &str = "abb-agent";
@@ -32,9 +33,10 @@ fn bundled_agent_in_dir(bundled: &[&str], exe_dir: Option<&std::path::Path>) -> 
 
 /// 一条可 spawn 的执行层命令：程序 + 参数。
 ///
-/// 随包 `abb-agent` 是裸二进制（args 恒空）；回落目标 `ki acp serve` 必须带子命令
-/// 参数。此前回落 `pi-acp` 是 rpi-package 的 ACP↔RPC 桥（前身实现），已被
-/// `ki acp serve` 取代（pi-rust `docs/design/ki-acp-serve.md` 批次 3，2026-10-22）。
+/// 生产命令恒为 `<program> acp serve`：随包产物自 2026-10-23 起是 ki（需子命令），
+/// 而旧的裸 `abb-agent` 忽略 argv，所以同一形状对两代随包二进制都安全。此前回落
+/// `pi-acp` 是 rpi-package 的 ACP↔RPC 桥（前身实现），已被 `ki acp serve` 取代
+/// （pi-rust `docs/design/ki-acp-serve.md` 批次 3，2026-10-22）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentCmd {
     program: String,
@@ -42,7 +44,20 @@ struct AgentCmd {
 }
 
 impl AgentCmd {
-    /// 裸二进制（无参数）——随包 abb-agent 的形状。
+    /// 执行层命令的统一形状：`<program> acp serve`。
+    ///
+    /// 随包 `abb-agent` 自 2026-10-23 起就是 ki（打包层改名分发）：ki 需子命令参数；
+    /// **旧 abb-agent 忽略 argv**（crates/abb-agent/src/main.rs 无参数处理，直接跑
+    /// ACP server），故同一形状对两代随包二进制都安全。
+    fn acp_serve(program: impl Into<String>) -> Self {
+        Self {
+            program: program.into(),
+            args: vec!["acp".to_string(), "serve".to_string()],
+        }
+    }
+
+    /// 裸二进制（无参数）——仅测试夹具使用；生产命令一律 [`acp_serve`](Self::acp_serve)。
+    #[cfg(test)]
     fn bare(program: impl Into<String>) -> Self {
         Self {
             program: program.into(),
@@ -62,28 +77,23 @@ impl std::fmt::Display for AgentCmd {
     }
 }
 
-/// 解析执行层命令：主程序同目录随包 `abb-agent` 优先；随包缺失回落 PATH
-/// `ki acp serve`（ki 的宿主级 ACP server；pi-rust ki-acp-serve.md 批次 3 接线）。
+/// 解析执行层命令：主程序同目录随包 `abb-agent` 优先（产物即 ki，
+/// 见 release.yml 的打包步骤）；随包缺失回落 PATH `ki`。两者都以
+/// `<program> acp serve` 形状 spawn（旧随包 abb-agent 忽略 argv，兼容）。
 fn resolve_agent_command() -> AgentCmd {
     resolve_acp_command(bundled_agent_in_dir(&[BUNDLED_AGENT], None).as_deref())
 }
 
-/// 无随包时的回落命令：PATH 命中 `ki` ⇒ spawn `<ki> acp serve`（子命令作 args；
-/// 全路径必传，#246④ 同款口径）；连 `ki` 都没有 ⇒ 保留裸名 `ki`，spawn 失败
-/// 如实可见（#246④）。
+/// 无随包时的回落命令：PATH 命中 `ki` ⇒ spawn `<ki> acp serve`（全路径必传，
+/// #246④ 同款口径）；连 `ki` 都没有 ⇒ 保留裸名 `ki`，spawn 失败如实可见（#246④）。
 fn resolve_acp_command_with(
     agent_cmd: Option<&str>,
     find_ki: impl FnOnce() -> Option<std::path::PathBuf>,
 ) -> AgentCmd {
     agent_cmd
-        .map(AgentCmd::bare)
-        .or_else(|| {
-            find_ki().map(|p| AgentCmd {
-                program: p.display().to_string(),
-                args: vec!["acp".to_string(), "serve".to_string()],
-            })
-        })
-        .unwrap_or_else(|| AgentCmd::bare("ki"))
+        .map(AgentCmd::acp_serve)
+        .or_else(|| find_ki().map(|p| AgentCmd::acp_serve(p.display().to_string())))
+        .unwrap_or_else(|| AgentCmd::acp_serve("ki"))
 }
 
 fn resolve_acp_command(agent_cmd: Option<&str>) -> AgentCmd {
@@ -1942,7 +1952,10 @@ mod tests {
             .extra_env
             .iter()
             .any(|(k, v)| k == "JEV_API_KEY" && v == "jev-test"));
-        assert!(c.args.is_empty(), "裸二进制槽（abb-agent）不带参数");
+        assert!(
+            c.args.is_empty(),
+            "夹具给的是无参命令，args 必须原样透传为空"
+        );
 
         // owner 无档位 ⇒ 不带档位、无 JEV env。
         let full = BotConfig {
@@ -2138,8 +2151,8 @@ mod tests {
                 looked_up = true;
                 Some(full.clone())
             }),
-            AgentCmd::bare("abb-agent"),
-            "随包 abb-agent 优先于 ki 兑底"
+            AgentCmd::acp_serve("abb-agent"),
+            "随包 abb-agent 优先于 ki 兑底，且同带 acp serve 形状（ki 产物必需，旧二进制忽略 argv）"
         );
         assert!(
             !looked_up,
@@ -2166,7 +2179,7 @@ mod tests {
                 looked_up = true;
                 None
             }),
-            AgentCmd::bare("ki"),
+            AgentCmd::acp_serve("ki"),
             "ki 缺失时保留裸名，spawn 失败如实可见（#246④）"
         );
         assert!(looked_up, "ki 缺失时也要完成一次探测");

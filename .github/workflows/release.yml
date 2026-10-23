@@ -73,9 +73,21 @@ jobs:
       - name: Build release (aarch64)
         run: cargo build --release --target aarch64-apple-darwin
 
-      # abb-agent（统一迁移后单一执行层）：两种角色（owner / 授权者）都走它。
-      - name: Build abb-agent (aarch64)
-        run: cargo build --release --manifest-path crates/abb-agent/Cargo.toml --target aarch64-apple-darwin
+      # 随包执行层 abb-agent = ki（pi-rust 构建后改名分发，2026-10-23）。
+      # 名字不变是刻意的：解析链（BUNDLED_AGENT）与签名/安装路径全部零改动。
+      # 钉 SHA 保证可复现；升版时与 release notes 一起 bump。
+      # 旧实现 crates/abb-agent 保留在树内待退役（阶段 3，单独批次）。
+      - name: Checkout pi-rust (ki source)
+        uses: actions/checkout@v4
+        with:
+          repository: gqf2008/pi-rust
+          ref: 941b750
+          path: pi-rust-src
+
+      - name: Build ki as abb-agent (aarch64)
+        run: |
+          cd pi-rust-src
+          cargo build --release --locked -p kiqi-cli --target aarch64-apple-darwin
 
       # abb-chart（图形生成）：agent 用 `"$ABB_BIN" chart render …` 出图后 deliver 发回聊天。
       # 独立包/独立产物（charton 要 rustc≥1.85，且渲染 panic 不该砸托盘进程）。
@@ -93,7 +105,7 @@ jobs:
           # 2026-10-04 去提权：abb-helper（#129 锁屏特权助手）已随 v2.23.95 删除 ——
           # 这里不再拷贝它（旧写法是在这一步 cp 一个已不存在的产物，CI 直接失败）。
           # abb-agent（单一执行层，刀 4b 后 buzz-agent 已删）。
-          cp crates/abb-agent/target/aarch64-apple-darwin/release/abb-agent ABB.app/Contents/MacOS/
+          cp pi-rust-src/target/aarch64-apple-darwin/release/ki ABB.app/Contents/MacOS/abb-agent
           # abb-chart（图形生成，卡 abb-chart-cli-20261013）：与 abb-agent 同目录随包，
           # 由 `agent-bridge chart` 转发调用（同目录查找见 src/main.rs::bundled_chart_path_in）。
           cp crates/abb-chart/target/aarch64-apple-darwin/release/abb-chart ABB.app/Contents/MacOS/
@@ -232,9 +244,24 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      # abb-agent（单一执行层，刀 4b 后 buzz-agent 已删）。
-      - name: Build abb-agent
-        run: cargo build --release --manifest-path crates/abb-agent/Cargo.toml
+      # 随包执行层 abb-agent = ki（pi-rust 构建后改名分发，2026-10-23；与 macOS 同位钉 SHA）。
+      # 落点保持 crates/abb-agent/target/release/abb-agent.exe——ABB.iss 与 CRT 守卫按此取件。
+      - name: Checkout pi-rust (ki source)
+        uses: actions/checkout@v4
+        with:
+          repository: gqf2008/pi-rust
+          ref: 941b750
+          path: pi-rust-src
+
+      # #331：pi-rust 仓库不带 .cargo/config.toml（本地文件），Windows 分发必须显式
+      # static CRT，否则 VCRUNTIME140.dll 依赖会让干净机器起不来（与 abb 自身同款守卫）。
+      - name: Build ki as abb-agent (+crt-static, #331)
+        shell: bash
+        run: |
+          cd pi-rust-src
+          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --locked -p kiqi-cli
+          mkdir -p ../crates/abb-agent/target/release
+          cp target/release/ki.exe ../crates/abb-agent/target/release/abb-agent.exe
 
       # abb-chart（图形生成，卡 abb-chart-cli-20261013）：`agent-bridge chart` 转发调用它。
       - name: Build abb-chart

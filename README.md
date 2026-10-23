@@ -14,7 +14,7 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 ## 为什么选 ABB
 
 - **就在你聊天的地方干活**：不用在浏览器和聊天软件之间来回切。微信里 @ 一下，它立刻回复。
-- **开箱即用**：执行层随包自带（单一执行层 `abb-agent`，owner 与授权者会话同用），装完 ABB 就能聊，不需要再装任何命令行工具。
+- **开箱即用**：执行层随包自带（`abb-agent`，自 2026-10-23 起为 ki 的构建产物改名分发），装完 ABB 就能聊，不需要再装任何命令行工具。
 - **用的是你自己的模型**：接任意 Anthropic 原生 / OpenAI 兼容供应商（DeepSeek、通义、Kimi……），
   想用哪个用哪个。
 - **数据不出本机**：消息和模型都在你的电脑上流转，不经过第三方中转。
@@ -51,7 +51,7 @@ ABB 是一个住在你菜单栏（Windows 托盘）里的小助手：你把它�
 | 能力 | 说明 |
 |---|---|
 | 多通道接入 | 飞书（官方长连接）、微信（扫码登录）、钉钉（企业内部应用） |
-| 随包执行层 | 内置 `abb-agent`（**唯一**执行层：owner 与授权者会话同用，受限档由它自己实现并声明 `_meta.abbSandbox`），零安装；模型走 Anthropic 原生 / OpenAI 兼容供应商（设置里自助添加）。旧执行层及其 `config.buzz_agent_exe` 回滚开关已随 0685e66 删除 |
+| 随包执行层 | 内置 `abb-agent`（**产物 = ki**：pi-rust 构建后改名分发，名称/落点不变，MIT 见 `tools/licenses/ki-NOTICE.txt`），零安装；granted（授权者）机制已于 2026-10-23 移除，准入 owner-only；owner 自定义受限档经 `_meta.abbSandbox` 下发。模型走 Anthropic 原生 / OpenAI 兼容供应商（设置里自助添加） |
 | 图形生成 | 在聊天里说「把销售额画个图」即可出图：agent 用 `"$ABB_BIN" chart render --spec … --out chart.png` 渲染 PNG，再用 `deliver --to-current --file` 发回会话（**owner 与授权者会话都可用**）。`mark` 支持散点/折线/柱状/面积/直方图/密度/箱线/小提琴/误差棒/参考线/文字标注；数据可来自 CSV 或内联 JSON；中文标题与轴标签开箱即用（中文字体自动挑选）。由随包 `abb-chart`（charton 0.8，独立包与独立产物）实现，硬指标见 `crates/abb-chart/README.md` |
 | 模型供应商 | 设置 →「供应商」里可选并预置：`anthropic`（原生）、`openai-chat`（任意 OpenAI 兼容端点，含本地 Ollama / 自建网关）、`openai-responses`、`openrouter`（免填 `https://openrouter.ai/api/v1`）、`deepseek`（免填 `https://api.deepseek.com/v1`）；预置端点留空即用官方，填了以你填的为准（代理/网关） |
 | 内置开发工具 | 安装包随带固定版本 `rg` / `jq` / `uv` / `gh`，以及**常用 CLI 工具** `awk`（goawk）、`tail` / `sleep` / `head` / `diff` / `cmp` / `md5sum` / `sha1sum` / `sha256sum`（来自 uutils `coreutils` / `diffutils`），Windows 上另有 busybox-w32 提供的 `ps` / `watch` / `wget` / `sed` / `id` / `hexdump` 等（**GPL-2.0**，许可与源码见 `tools/licenses/`）macOS 侧是多调二进制 + 硬链接、Windows 侧取每工具 exe），仅注入 agent 子进程 PATH；`git` / `bun` / `sed` / `find` 仍使用系统或用户环境。；macOS 侧 `ps` 用宿主自带、`watch` / `wget` 不随包（原因与替代见 `tools/README.md`） |
