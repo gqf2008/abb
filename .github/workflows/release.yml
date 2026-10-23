@@ -77,11 +77,16 @@ jobs:
       # 名字不变是刻意的：解析链（BUNDLED_AGENT）与签名/安装路径全部零改动。
       # 钉 SHA 保证可复现；升版时与 release notes 一起 bump。
       # 旧实现 crates/abb-agent 保留在树内待退役（阶段 3，单独批次）。
+      #
+      # **ref 必须是完整 40 位 SHA**：actions/checkout 把 ref 当分支/标签名去 fetch
+      # （`+refs/heads/<ref>*`），短 SHA 两者都不是 ⇒ 两个 job 都红在 checkout
+      # （2026-10-23 首次真跑实测）。另外该 SHA 必须已推到 GitHub 镜像——只存在于
+      # walgit 的提交，CI 里根本不存在（同次实测）。
       - name: Checkout pi-rust (ki source)
         uses: actions/checkout@v4
         with:
           repository: gqf2008/pi-rust
-          ref: 941b750
+          ref: 941b750019c2fa59d3325899610eb0aa624e3d9e
           path: pi-rust-src
 
       - name: Build ki as abb-agent (aarch64)
@@ -246,11 +251,12 @@ jobs:
 
       # 随包执行层 abb-agent = ki（pi-rust 构建后改名分发，2026-10-23；与 macOS 同位钉 SHA）。
       # 落点保持 crates/abb-agent/target/release/abb-agent.exe——ABB.iss 与 CRT 守卫按此取件。
+      # 完整 40 位 SHA 与 GitHub 镜像前置条件见 macOS 侧同款步骤的注释。
       - name: Checkout pi-rust (ki source)
         uses: actions/checkout@v4
         with:
           repository: gqf2008/pi-rust
-          ref: 941b750
+          ref: 941b750019c2fa59d3325899610eb0aa624e3d9e
           path: pi-rust-src
 
       # #331：pi-rust 仓库不带 .cargo/config.toml（本地文件），Windows 分发必须显式

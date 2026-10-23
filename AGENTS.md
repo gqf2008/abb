@@ -76,6 +76,9 @@ entire runtime directory; empty means default); per-bot workspaces under
 - **Mirror discipline**: push normal heads/tags to `origin` only. The local
   walgit-to-GitHub mirror syncs `refs/heads/*` and `refs/tags/*`; GitHub Actions is
   used for mirror/release artifacts, not day-to-day collaboration.
+  **`release.yml` 跨仓库取 pi-rust 源码时，钉的 SHA 必须是完整 40 位**（`actions/checkout`
+  把 `ref` 当分支/标签名 fetch，短 SHA 会直接红在 checkout），且**该 SHA 必须已推到 GitHub
+  镜像**——只存在于 walgit 的提交在 CI 里不存在（2026-10-23 首次真跑两个 job 同时踩到）。
 
 ## Build, Test, and Development Commands
 
