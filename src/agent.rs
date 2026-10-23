@@ -409,13 +409,18 @@ impl AgentRunner for SpawnRetiredRunner {
     }
 }
 
-/// runtime 后端（共享 ACP agent 进程）的供应商 env 装配。命名空间与 pi 的宿主映射
-/// 无关：执行层的 OPENAI_COMPAT_BASE_URL / ANTHROPIC_BASE_URL 直接可指任意
-/// 端点，供应商配置的 base_url 原样透传（openrouter/deepseek 留空时回落各自预置端点）。
-/// 支持 anthropic / openai-chat / openai-responses / openrouter / deepseek；
-/// 其余 kind → Err（用户可见）。
-/// provider 为 None → Ok(None)（纯继承宿主 env，旧行为——e2e 即靠宿主注入）。
-/// 单个回合允许的模型请求轮数上限（ABB 扩展）：注入 `ABB_AGENT_MAX_ROUNDS`。
+/// runtime 后端（共享 ACP agent 进程）的供应商 env 装配。
+///
+/// 2026-10-23 起随包执行层是 ki：它不收参数、也不读 `ANTHROPIC_*` /
+/// `OPENAI_COMPAT_*`（旧 abb-agent 的约定）。供应商改为落一份只含它的
+/// `models.json`，目录经 `KI_CODING_AGENT_DIR` 下发（见 [`crate::ki_config`]）。
+/// base_url 语义不变：配置的什么端点就打什么（openrouter/deepseek 留空时回落各自
+/// 预置端点）。支持 anthropic / openai-chat / openai-responses / openrouter /
+/// deepseek；其余 kind → Err（用户可见）。provider 为 None → Ok(None)
+/// （不装配供应商：agent 起得来，但首轮会拿不到模型——预检已引导配置）。
+///
+/// 单个回合允许的模型请求轮数上限（ABB 扩展）：`KI_MAX_TURNS_PER_RUN`（ki 读它）；
+/// `ABB_AGENT_MAX_ROUNDS` 同时下发，留给升级期回滚到的旧 abb-agent。
 ///
 /// 为什么要有：fork 默认 0 = 无上限；而「工具卡住 ⇒ agent 反复重问」是真实发生过的
 /// 事故（2026-10-04），那时唯一的边界只有外层任务预算（30 分钟），中途会烧掉大量
@@ -430,61 +435,25 @@ pub(crate) fn abb_provider_env(
         return Ok(None);
     };
     let mut env = HashMap::new();
-    // 回合护栏（ABB 扩展，2026-10-04）：fork 的 `max_rounds` 默认 0 = **无上限**，
-    // 于是「无限重问模型」在协议上没有任何边界（事故形态：hook 挂死 ⇒ 工具永不返回 ⇒
-    // agent 反复问模型 ⇒ 定时任务每轮跑满预算超时、机器堆一排僵死进程）。这里给一个
-    // 明确上界：单个回合作多 200 轮（一轮 = 一次模型请求），超过即由 fork 以
-    // `StopReason::MaxTurnRequests` 收尾，不再无限跑。
+    // 回合护栏（ABB 扩展，2026-10-04）：执行层默认无上限，于是「工具挂死 ⇒ agent 反复
+    // 重问模型」没有协议边界（事故形态：每轮跑满预算超时、机器堆一排僵死进程）。
+    // 这里给单个回合一个 200 轮上界（一轮 = 一次模型请求）：
+    // - `KI_MAX_TURNS_PER_RUN` 是 ki（2026-10-23 起的随包执行层）读的旋钮；
+    // - `ABB_AGENT_MAX_ROUNDS` 留给旧 abb-agent（升级期回滚用，ki 忽略它）。
+    env.insert(
+        "KI_MAX_TURNS_PER_RUN".into(),
+        ABB_AGENT_MAX_ROUNDS.to_string(),
+    );
     env.insert(
         "ABB_AGENT_MAX_ROUNDS".into(),
         ABB_AGENT_MAX_ROUNDS.to_string(),
     );
-    // 思考档位（owner 卡，2026-10-16）：空串 = 不下发（执行层默认 `Off`，行为与旧版一致）；
-    // 非空就透传，执行层翻成 rpi 的 `ThinkingLevel`。这是「思考过程太长」的直接旋钮。
-    if !p.thinking.trim().is_empty() {
-        env.insert(
-            "ABB_AGENT_THINKING_LEVEL".into(),
-            p.thinking.trim().to_ascii_lowercase(),
-        );
-    }
-    match p.kind.as_str() {
-        "anthropic" => {
-            env.insert("ABB_AGENT_PROVIDER".into(), "anthropic".into());
-            env.insert("ANTHROPIC_API_KEY".into(), p.api_key.clone());
-            if !p.base_url.is_empty() {
-                env.insert("ANTHROPIC_BASE_URL".into(), p.base_url.clone());
-            }
-            if !p.model.is_empty() {
-                env.insert("ANTHROPIC_MODEL".into(), p.model.clone());
-            }
-        }
-        "openai-chat" | "openai-responses" | "openrouter" | "deepseek" => {
-            env.insert("ABB_AGENT_PROVIDER".into(), "openai".into());
-            env.insert("OPENAI_COMPAT_API_KEY".into(), p.api_key.clone());
-            // 与 pi 不同：执行层的 base_url 就是请求端点，不是 provider 身份
-            // 判定——供应商配的什么 URL 就打什么（含自定义网关/本地端点）。
-            // openrouter/deepseek 是预置端点：用户没填 base_url 时补默认值，填了以填的为准。
-            let base_url = if p.base_url.is_empty() {
-                crate::config::provider_kind_default_base_url(&p.kind)
-            } else {
-                p.base_url.as_str()
-            };
-            if !base_url.is_empty() {
-                env.insert("OPENAI_COMPAT_BASE_URL".into(), base_url.to_string());
-            }
-            if !p.model.is_empty() {
-                env.insert("OPENAI_COMPAT_MODEL".into(), p.model.clone());
-            }
-            // 只有 openai-responses 走 responses 端点；其余（含两组预置）都是 chat
-            let api = if p.kind == "openai-responses" { "responses" } else { "chat" };
-            env.insert("OPENAI_COMPAT_API".into(), api.into());
-        }
-        other => {
-            return Err(format!(
-                "⚠️ 供应商「{}」类型 {other} 无法用于 runtime 后端（支持 anthropic / openai-chat / openai-responses / openrouter / deepseek）。",
-                p.name
-            ))
-        }
+    // 供应商凭据与模型：ki 不收参数、也不读 `ANTHROPIC_*` / `OPENAI_COMPAT_*`（旧
+    // abb-agent 的约定）。改为落一份只含该供应商的 `models.json`，并把子进程的 ki
+    // agent 目录指过去——为什么不直接注入 `ANTHROPIC_API_KEY` 等见 `crate::ki_config`。
+    // 思考档位没有 ki 侧的等价 env，`thinking` 目前不生效（见 patch 的 non-blocking 项）。
+    for (key, value) in crate::ki_config::provider_env(Some(p))? {
+        env.insert(key, value);
     }
     Ok(Some(env))
 }
@@ -945,85 +914,98 @@ mod tests {
         p
     }
 
-    #[test]
-    fn abb_provider_env_maps_anthropic() {
-        let p = prov_bu("myant", "anthropic", "https://gateway.example.com");
-        let env = abb_provider_env(Some(&p)).unwrap().unwrap();
-        assert_eq!(env["ABB_AGENT_PROVIDER"], "anthropic");
-        assert_eq!(env["ANTHROPIC_API_KEY"], "sk-secret");
-        // 执行层支持自定义 anthropic 网关：base_url 原样透传（区别于 pi 的固定端点）
-        assert_eq!(env["ANTHROPIC_BASE_URL"], "https://gateway.example.com");
-        assert_eq!(env["ANTHROPIC_MODEL"], "some-model");
-        assert!(!env.contains_key("OPENAI_COMPAT_API_KEY"));
+    /// 取装配出的 models.json 里那唯一一家 provider。
+    fn ki_entry(env: &HashMap<String, String>) -> serde_json::Value {
+        let text = &env[crate::ki_config::MODELS_JSON_ENV];
+        let doc: serde_json::Value = serde_json::from_str(text).unwrap();
+        doc["providers"]
+            .as_object()
+            .expect("providers 必须是对象")
+            .values()
+            .next()
+            .cloned()
+            .expect("必须恰好装配一家 provider")
     }
 
-    /// 思考档位：**空串不下发**（保持旧行为），非空透传且归一成小写。
     #[test]
-    fn abb_provider_env_passes_thinking_level_only_when_set() {
-        let base = crate::config::ProviderConfig {
-            kind: "deepseek".into(),
-            api_key: "k".into(),
-            model: "deepseek-flash".into(),
-            ..Default::default()
-        };
-        let env = super::abb_provider_env(Some(&base)).unwrap().unwrap();
+    fn abb_provider_env_hands_ki_a_models_json() {
+        let p = prov_bu("myant", "anthropic", "https://gateway.example.com");
+        let env = abb_provider_env(Some(&p)).unwrap().unwrap();
+        // 旧 abb-agent 的凭据 env 不再下发：实测它们会让 ki 内置的 anthropic/openai
+        // 身份先变成「已认证」，默认模型选择抢在自定义 provider 前面。
+        for gone in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_MODEL",
+            "OPENAI_COMPAT_API_KEY",
+            "OPENAI_COMPAT_BASE_URL",
+            "OPENAI_COMPAT_MODEL",
+            "OPENAI_COMPAT_API",
+        ] {
+            assert!(!env.contains_key(gone), "{gone} 不该再下发");
+        }
+        let dir = std::path::PathBuf::from(&env[crate::ki_config::AGENT_DIR_ENV]);
         assert!(
-            !env.contains_key("ABB_AGENT_THINKING_LEVEL"),
-            "没配思考档位就不该下发（执行层保持默认 Off）"
+            dir.components().any(|c| c.as_os_str() == "ki-agents"),
+            "ki agent 目录必须落在数据目录的 ki-agents/ 下：{dir:?}"
         );
-        let configured = crate::config::ProviderConfig {
-            thinking: "LOW".into(),
-            ..base
-        };
-        let env = super::abb_provider_env(Some(&configured)).unwrap().unwrap();
-        assert_eq!(
-            env.get("ABB_AGENT_THINKING_LEVEL").map(String::as_str),
-            Some("low"),
-            "配了就要透传（并归一成小写）"
-        );
+        let entry = ki_entry(&env);
+        assert_eq!(entry["api"], "anthropic-messages");
+        assert_eq!(entry["baseUrl"], "https://gateway.example.com");
+        assert_eq!(entry["apiKey"], "sk-secret");
+        assert_eq!(entry["models"][0]["id"], "some-model");
+    }
+
+    /// 回合护栏：200 轮上界对两代执行层都下发（ki 读 `KI_MAX_TURNS_PER_RUN`，
+    /// 旧 abb-agent 读 `ABB_AGENT_MAX_ROUNDS`——升级期回滚时仍成立）。
+    #[test]
+    fn abb_provider_env_sets_the_turn_ceiling_for_both_generations() {
+        let env = abb_provider_env(Some(&prov("x", "deepseek")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(env["KI_MAX_TURNS_PER_RUN"], "200");
+        assert_eq!(env["ABB_AGENT_MAX_ROUNDS"], "200");
     }
 
     #[test]
     fn abb_provider_env_maps_openai_chat_and_responses() {
         let p = prov_bu("ds", "openai-chat", "https://api.deepseek.com");
-        let env = abb_provider_env(Some(&p)).unwrap().unwrap();
-        assert_eq!(env["ABB_AGENT_PROVIDER"], "openai");
-        assert_eq!(env["OPENAI_COMPAT_API_KEY"], "sk-secret");
-        assert_eq!(env["OPENAI_COMPAT_BASE_URL"], "https://api.deepseek.com");
-        assert_eq!(env["OPENAI_COMPAT_MODEL"], "some-model");
-        assert_eq!(env["OPENAI_COMPAT_API"], "chat");
+        let entry = ki_entry(&abb_provider_env(Some(&p)).unwrap().unwrap());
+        assert_eq!(entry["api"], "openai-completions");
+        assert_eq!(entry["baseUrl"], "https://api.deepseek.com");
+        assert_eq!(entry["models"][0]["id"], "some-model");
+        assert_eq!(entry["apiKey"], "sk-secret");
+
         let p2 = prov_bu("rs", "openai-responses", "https://api.openai.com/v1");
-        let env2 = abb_provider_env(Some(&p2)).unwrap().unwrap();
-        assert_eq!(env2["OPENAI_COMPAT_API"], "responses");
+        let entry = ki_entry(&abb_provider_env(Some(&p2)).unwrap().unwrap());
+        assert_eq!(entry["api"], "openai-responses");
     }
 
     /// #300：openrouter / deepseek 是 OpenAI 兼容**预置端点**——base_url 留空时补官方
-    /// 端点，填了以用户填的为准；协议路线都走 chat（不是 responses）。
+    /// 端点，填了以用户填的为准；协议路线都走 openai-completions（不是 responses）。
     #[test]
     fn abb_provider_env_maps_openrouter_and_deepseek_presets() {
         let or = prov_bu("or", "openrouter", "");
-        let env = abb_provider_env(Some(&or)).unwrap().unwrap();
-        assert_eq!(env["ABB_AGENT_PROVIDER"], "openai");
+        let entry = ki_entry(&abb_provider_env(Some(&or)).unwrap().unwrap());
         assert_eq!(
-            env["OPENAI_COMPAT_BASE_URL"], "https://openrouter.ai/api/v1",
+            entry["baseUrl"], "https://openrouter.ai/api/v1",
             "openrouter 留空 base_url 必须补预置端点"
         );
-        assert_eq!(env["OPENAI_COMPAT_API"], "chat");
+        assert_eq!(entry["api"], "openai-completions");
 
         let ds = prov_bu("ds", "deepseek", "");
-        let env2 = abb_provider_env(Some(&ds)).unwrap().unwrap();
+        let entry = ki_entry(&abb_provider_env(Some(&ds)).unwrap().unwrap());
         assert_eq!(
-            env2["OPENAI_COMPAT_BASE_URL"], "https://api.deepseek.com/v1",
+            entry["baseUrl"], "https://api.deepseek.com/v1",
             "deepseek 留空 base_url 必须补预置端点"
         );
-        assert_eq!(env2["OPENAI_COMPAT_API"], "chat");
 
         // 显式 base_url 覆盖预置（自建网关 / 代理场景）——两种预置都要能覆盖
         for kind in ["openrouter", "deepseek"] {
             let custom = prov_bu("custom", kind, "https://proxy.example.com/v1");
-            let env3 = abb_provider_env(Some(&custom)).unwrap().unwrap();
+            let entry = ki_entry(&abb_provider_env(Some(&custom)).unwrap().unwrap());
             assert_eq!(
-                env3["OPENAI_COMPAT_BASE_URL"], "https://proxy.example.com/v1",
+                entry["baseUrl"], "https://proxy.example.com/v1",
                 "{kind} 用户填了 base_url 就不能被预置覆盖"
             );
         }

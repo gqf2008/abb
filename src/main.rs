@@ -31,6 +31,7 @@ mod history;
 mod htmlmd;
 mod inlineflow;
 mod install;
+mod ki_config;
 mod lark_user;
 mod larkskills;
 mod mathrender;

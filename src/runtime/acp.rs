@@ -3376,6 +3376,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+    /// 探针：**ABB 供应商配置 → ki** 的接线验收（2026-10-23 评审阻断项的回归）。
+    ///
+    /// 与 [`probe_real_ki_acp_serve_lifecycle`] 的区别：那个探针让 ki 用自己
+    /// `~/.ki/agent` 里的配置（本机已配好，能通过但**证明不了 ABB 的供应商进了 ki**）；
+    /// 这个探针只给 ki 一份由 `ki_config::for_provider` 生成的 models.json，并把
+    /// `KI_CODING_AGENT_DIR` 指过去——与 ABB 生产路径同构（spawn 侧另经
+    /// `ki_config::materialize` 落盘，单测覆盖）。ki 若仍走内置身份或无 key，这一轮必红。
+    ///
+    /// 手动跑（真实 LLM 一轮）：
+    /// `KI_ACP_E2E_BIN=/path/to/ki KI_E2E_KIND=deepseek KI_E2E_MODEL=deepseek-flash \
+    ///  KI_E2E_API_KEY=sk-… cargo test probe_ki_provider_bridge -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "探针：真 spawn ki，验证 ABB 供应商经 models.json 进到 ki（需 KI_ACP_E2E_BIN 与 KI_E2E_* 供应商变量）"]
+    async fn probe_ki_provider_bridge_answers_a_turn() {
+        let (Some(ki), Ok(kind), Ok(model), Ok(api_key)) = (
+            std::env::var_os("KI_ACP_E2E_BIN").map(std::path::PathBuf::from),
+            std::env::var("KI_E2E_KIND"),
+            std::env::var("KI_E2E_MODEL"),
+            std::env::var("KI_E2E_API_KEY"),
+        ) else {
+            eprintln!("skip: KI_ACP_E2E_BIN / KI_E2E_KIND / KI_E2E_MODEL / KI_E2E_API_KEY 未设齐");
+            return;
+        };
+        let provider = crate::config::ProviderConfig {
+            name: "e2e-abb".into(),
+            kind,
+            base_url: std::env::var("KI_E2E_BASE_URL").unwrap_or_default(),
+            api_key,
+            model,
+            thinking: String::new(),
+            context_window: 0,
+        };
+
+        let root = std::env::temp_dir().join(format!("abb-ki-bridge-e2e-{}", std::process::id()));
+        let prepared =
+            crate::ki_config::for_provider(&provider, &root).expect("render models.json");
+        let env = crate::ki_config::materialize(&[
+            (
+                crate::ki_config::AGENT_DIR_ENV.to_string(),
+                prepared.dir.display().to_string(),
+            ),
+            (
+                crate::ki_config::MODELS_JSON_ENV.to_string(),
+                prepared.models_json.clone(),
+            ),
+        ])
+        .expect("materialize models.json");
+        assert!(
+            !env.iter()
+                .any(|(k, _)| k == crate::ki_config::MODELS_JSON_ENV),
+            "载荷变量不许传到子进程"
+        );
+
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).expect("create workspace");
+        let mut client = AcpClient::spawn(
+            &ki.display().to_string(),
+            &["acp".to_string(), "serve".to_string()],
+            &env,
+        )
+        .await
+        .expect("spawn ki acp serve with ABB models.json");
+
+        client.initialize().await.expect("initialize");
+        let session = client
+            .session_new(&ws.display().to_string(), vec![], None, None)
+            .await
+            .expect("session/new");
+        let stop = client
+            .session_prompt_with_idle_timeout(
+                &session,
+                "只回复两个字: 收到",
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(180),
+            )
+            .await
+            .expect("ABB 供应商配置下的回合");
+        assert_eq!(stop, StopReason::EndTurn, "回合应正常结束");
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn idle_timeout_fires_on_silent_process() {
         let mut client = spawn_script(vec![SleepMs(10_000)]).await;

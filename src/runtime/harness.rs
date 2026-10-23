@@ -1474,7 +1474,18 @@ fn schedule_agent_start(
 /// 后台启动尝试本体：spawn + initialize（60s 超时，与上游一致），成功后构造
 /// OwnedAgent（全新会话状态——新进程的旧 session id 全部失效）。
 async fn spawn_and_init_agent(cfg: &AgentConfig, index: usize) -> SpawnOutcome {
-    let mut acp = match AcpClient::spawn(&cfg.command, &cfg.args, &cfg.extra_env).await {
+    // 随包 ki 的供应商配置必须先落盘（`KI_CODING_AGENT_DIR/models.json`）再 spawn：
+    // 拿着空配置起来的 agent 只会在首轮报一个远端的 "No API key"，不如在这里响亮失败。
+    let extra_env = match crate::ki_config::materialize(&cfg.extra_env) {
+        Ok(env) => env,
+        Err(e) => {
+            return SpawnOutcome::Err {
+                index,
+                detail: format!("failed to prepare ki config: {e}"),
+            }
+        }
+    };
+    let mut acp = match AcpClient::spawn(&cfg.command, &cfg.args, &extra_env).await {
         Ok(acp) => acp,
         Err(e) => {
             return SpawnOutcome::Err {

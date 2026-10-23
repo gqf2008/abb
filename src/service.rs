@@ -101,8 +101,9 @@ fn resolve_acp_command(agent_cmd: Option<&str>) -> AgentCmd {
 }
 
 /// 本 bot 的 ACP 供应商 env（旧 service 级 `env_for` 的 per-bot 化，P2.1）。
-/// 执行层语义：`ABB_AGENT_PROVIDER` + anthropic/openai-chat/openai-responses/openrouter/deepseek 全系
-/// 兼容 env（abb_provider_env 同一映射，GUI 热改供应商随服务重启生效）。
+/// 执行层语义（2026-10-23 起）：供应商落成一份只含它的 ki `models.json`，目录经
+/// `KI_CODING_AGENT_DIR` 交给子进程（见 `crate::ki_config`）；ki 不读旧的
+/// `ANTHROPIC_*` / `OPENAI_COMPAT_*` env。GUI 热改供应商随服务重启生效。
 /// 装配级硬闸保留：供应商存在但 API Key 空 → 空 env（agent 侧
 /// 只会报内部错误，预检已按 NoProvider 拒答引导补填）。
 ///（P4.1：原先的 `uses_buzz_agent` 两臂（历史形参，取名即「是否走 buzz 承载」）都走已删的
@@ -2031,6 +2032,21 @@ mod tests {
         );
     }
 
+    /// 取装配出的 ki models.json 里那唯一一家 provider。
+    fn ki_models_entry(env: &std::collections::HashMap<String, String>) -> serde_json::Value {
+        let text = env
+            .get(crate::ki_config::MODELS_JSON_ENV)
+            .expect("装配期必须带 models.json 载荷");
+        let doc: serde_json::Value = serde_json::from_str(text).unwrap();
+        doc["providers"]
+            .as_object()
+            .expect("providers 必须是对象")
+            .values()
+            .next()
+            .cloned()
+            .expect("必须恰好装配一家 provider")
+    }
+
     /// 系统级对话装配（全局锚点气泡）：
     /// 全局默认供应商 + **无沙箱（整机全权限）**，且不依赖任何 bot 配置。
     #[test]
@@ -2056,15 +2072,18 @@ mod tests {
             "系统级对话 = 整机全权限，不得带沙箱档位"
         );
         let env: std::collections::HashMap<_, _> = c.extra_env.iter().cloned().collect();
+        // 供应商经 ki 的 models.json 下发（见 `crate::ki_config`）：装配期只给目录 + 载荷。
+        assert!(
+            env.get(crate::ki_config::AGENT_DIR_ENV)
+                .is_some_and(|dir| dir.contains("ki-agents")),
+            "必须把子进程的 ki agent 目录指向 ABB 管理的 ki-agents/：{env:?}"
+        );
+        let payload = ki_models_entry(&env);
         assert_eq!(
-            env.get("OPENAI_COMPAT_API_KEY").map(String::as_str),
-            Some("sk-sys"),
+            payload["apiKey"], "sk-sys",
             "系统级对话必须用全局默认供应商（不依赖任何 bot）"
         );
-        assert_eq!(
-            env.get("OPENAI_COMPAT_BASE_URL").map(String::as_str),
-            Some("https://sys.example.com/v1")
-        );
+        assert_eq!(payload["baseUrl"], "https://sys.example.com/v1");
         // 命令槽：当前 `pick_command_by_sandbox` **忽略第二个入参**（恒返回 owner 槽，见其注释），
         // 故本断言实际只锁「c.command == owner 槽」，对「是否传了 false」**不具区分度**；
         // 非空断言单独保留，防两边同时解析成空。等该函数恢复按档位选槽后本断言才真正承重。
@@ -2107,19 +2126,17 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            env_of("prov-b")
-                .get("OPENAI_COMPAT_API_KEY")
-                .map(String::as_str),
-            Some("sk-b"),
+            ki_models_entry(&env_of("prov-b"))["apiKey"],
+            "sk-b",
             "显式 provider 必须命中（会话级模型选择）"
         );
         assert_eq!(
-            env_of("").get("OPENAI_COMPAT_API_KEY").map(String::as_str),
-            Some("sk-a"),
+            ki_models_entry(&env_of(""))["apiKey"],
+            "sk-a",
             "空串 = 回落全局默认"
         );
         assert!(
-            !env_of("ghost").contains_key("OPENAI_COMPAT_API_KEY"),
+            !env_of("ghost").contains_key(crate::ki_config::MODELS_JSON_ENV),
             "名字不在 providers 里 ⇒ 不注入半截 env（按未配置处理）"
         );
     }
@@ -2214,7 +2231,8 @@ mod tests {
             kind: "openai-chat".into(),
             base_url: format!("https://{name}.example.com"),
             api_key: key.into(),
-            model: String::new(),
+            // 随包 ki 必须拿到显式模型 id（见 `crate::ki_config`），这里跟真实配置一样填上。
+            model: format!("{name}-model"),
             thinking: String::new(),
             context_window: 0,
         };
@@ -2232,17 +2250,11 @@ mod tests {
             env_for_bot(&cfg.bots[0], &cfg).into_iter().collect();
         let env_b: std::collections::HashMap<_, _> =
             env_for_bot(&cfg.bots[1], &cfg).into_iter().collect();
+        assert_eq!(ki_models_entry(&env_a)["apiKey"], "sk-a");
+        assert_eq!(ki_models_entry(&env_b)["apiKey"], "sk-b");
         assert_eq!(
-            env_a.get("OPENAI_COMPAT_API_KEY").map(String::as_str),
-            Some("sk-a")
-        );
-        assert_eq!(
-            env_b.get("OPENAI_COMPAT_API_KEY").map(String::as_str),
-            Some("sk-b")
-        );
-        assert_eq!(
-            env_b.get("OPENAI_COMPAT_BASE_URL").map(String::as_str),
-            Some("https://prov-b.example.com"),
+            ki_models_entry(&env_b)["baseUrl"],
+            "https://prov-b.example.com",
             "bot-b 不得串用 bot-a（第一个 enabled bot）的供应商"
         );
         // 空 API Key 硬闸：env 置空（预检按 NoProvider 拒答引导），不注入半截 env
