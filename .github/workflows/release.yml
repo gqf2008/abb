@@ -86,7 +86,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: gqf2008/pi-rust
-          ref: 941b750019c2fa59d3325899610eb0aa624e3d9e
+          ref: c6b1184694ad79296f96a491bb527f9b61d3e3a2
           path: pi-rust-src
 
       - name: Build ki as abb-agent (aarch64)
@@ -256,7 +256,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: gqf2008/pi-rust
-          ref: 941b750019c2fa59d3325899610eb0aa624e3d9e
+          ref: c6b1184694ad79296f96a491bb527f9b61d3e3a2
           path: pi-rust-src
 
       # #331：pi-rust 仓库不带 .cargo/config.toml（本地文件），Windows 分发必须显式
