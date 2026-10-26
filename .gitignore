@@ -59,3 +59,4 @@ __pycache__/
 /tools/walgit-watch/watch.stop
 /tools/walgit-watch/launcher.pid
 /tools/walgit-watch/wake-prompt.md
+/.ki
