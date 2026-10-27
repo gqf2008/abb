@@ -35,7 +35,10 @@
 #     哨兵存在」时才认为输出可信；缺哨兵（例如 python3 被替换成静默空输出）⇒ 2。
 #   · 解析失败 / 非字符串 parent 记为一条 parse / type 异常并继续，不抛异常、不静默跳过。
 #   · 异常行边查边出（先落临时文件），中途失败不会连带吞掉已检出的行。
-#   · 扫描条目数必须与 `git for-each-ref refs/collab/inbox` 的引用数相等，不等 ⇒ 2。
+#   · 扫描条目数必须与已取到的 refs/collab/inbox 引用条数相等：对账直接用 $refs 计行
+#     （不再重跑 git for-each-ref），且比较前校验条数是数字；取不到/非数字 ⇒ 2。
+#   · stdout 写出前做可编码化：JSON 的 lone surrogate（如 "\ud800"）不能让整轮扫描抛
+#     UnicodeEncodeError 而中止；单条畸形值只产出一条异常（以 backslash 转义写出）。
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -93,11 +96,20 @@ scan() {
     | python3 -c '
 import json, re, subprocess, sys
 
+# stdout 必须能写出任意 parent 值：JSON 允许 lone surrogate（"\ud800"），直接 print
+# 会抛 UnicodeEncodeError 让整轮退出、该条不算异常且其余行被吞。
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+except Exception:
+    pass
+
 OID = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 MISSING = object()
 
 def clean(v):
-    return v.replace("\t", "\\t").replace("\r", "\\r").replace("\n", "\\n")
+    # 先转义控制字符，再做 UTF-8 可编码化：单条畸形值只产出一条异常，不中止整盘扫描。
+    v = v.replace("\t", "\\t").replace("\r", "\\r").replace("\n", "\\n")
+    return v.encode("utf-8", "backslashreplace").decode("utf-8")
 
 def emit(short, reason, parent):
     # 边查边出：即便后续步骤抛错，已检出的行也已经写到 stdout，不会被一起吞掉。
@@ -194,7 +206,8 @@ print("--TOTAL--\t%d" % total, flush=True)
 
 # 用隔离仓库跑 scan()/输出全链路：不碰本仓 refs。
 scan_self_test() {
-  local tmp bad=0
+  local tmp bad=0 real_py
+  real_py=$(command -v python3 || true)
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/ccp-selftest.XXXXXX") || { echo "  ❌ mktemp 失败"; return 1; }
   mkdir -p "$tmp/tools"
   cp "$script_path" "$tmp/tools/check_collab_parents.sh"
@@ -252,6 +265,40 @@ scan_self_test() {
     echo "  ❌ 扫描路径（全合规仓库）被误判为异常（exit=${okstatus}）"
     bad=1
   fi
+  # ── 畸形编码：lone surrogate（JSON 合法但无法 UTF-8 编码）────────────────────
+  # 旧实现 print 抛 UnicodeEncodeError ⇒ 整轮 exit 2，该条既不算异常、其余行也丢失。
+  # 现在必须 exit 1、恰好记这一条，且文本与 JSON 条数一致。
+  local sur stext sjson sstatus sjstatus stcount sjcount
+  sur=$( cd "$tmp" && printf '{"id":"t","kind":"comment","parent":"\\ud800"}' \
+        | git hash-object -w --stdin ) || sur=""
+  ( cd "$tmp" && git update-ref refs/collab/inbox/0011-surrogate "$sur" ) >/dev/null 2>&1
+  stext=$(bash "$tmp/tools/check_collab_parents.sh" 2>/dev/null); sstatus=$?
+  sjson=$(bash "$tmp/tools/check_collab_parents.sh" --json 2>/dev/null); sjstatus=$?
+  stcount=$(printf '%s\n' "$stext" | grep -cE '^  [0-9a-f]{10}' || true)
+  sjcount=$(printf '%s\n' "$sjson" | grep -c '"entry"' || true)
+  if [ "$sstatus" -eq 1 ] && [ "$sjstatus" -eq 1 ] && [ "$stcount" -eq 1 ] && [ "$sjcount" -eq 1 ] \
+     && printf '%s\n' "$stext" | grep -q ' shape '; then
+    echo "  ✅ lone surrogate（\ud800）⇒ exit 1，记为该条异常，文本/JSON 均 1 条"
+  else
+    echo "  ❌ lone surrogate：text exit=$sstatus/$stcount 条，json exit=$sjstatus/$sjcount 条（期望各 1）"
+    bad=1
+  fi
+  ( cd "$tmp" && git update-ref -d refs/collab/inbox/0011-surrogate ) >/dev/null 2>&1
+
+  # ── 阴性对照：引用数统计失败必须 fail-closed（旧实现 exit 0 + ✅）──────────────
+  local fakewc wout wst
+  fakewc="$tmp/fakewc"
+  mkdir -p "$fakewc"
+  printf '#!/bin/sh\nexit 1\n' > "$fakewc/wc"
+  chmod +x "$fakewc/wc"
+  wout=$(PATH="$fakewc:$PATH" bash "$tmp/tools/check_collab_parents.sh" 2>/dev/null); wst=$?
+  if [ "$wst" -eq 2 ] && ! printf '%s' "$wout" | grep -q '✅'; then
+    echo "  ✅ 阴性对照（wc 失败导致引用数不可得）⇒ exit 2，未误报合规"
+  else
+    echo "  ❌ 阴性对照（坏 wc）：exit=${wst}（期望 2），或误报合规"
+    bad=1
+  fi
+
   # ── 阴性对照：解析器不可用时必须 fail-closed（旧实现全绿）──────────────────
   local fake="$tmp/fakebin" nout nst
   mkdir -p "$fake"
@@ -290,6 +337,36 @@ FAKE
     echo "  ❌ 阴性对照（扫描数与 ref 数不符）：exit=${nst}（期望 2），或误报合规"
     bad=1
   fi
+  # N4：扫描走真 python3，只有 JSON 转换那一次调用失败 ⇒ --json 必须 exit 2。
+  local fakejson jsonmarker jout jst
+  if [ -z "$real_py" ]; then
+    echo "  ❌ 阴性对照（JSON 转换失败）：找不到真实 python3，用例无法构造"
+    bad=1
+  else
+    fakejson="$tmp/fakejson"
+    jsonmarker="$tmp/jsonstage.marker"
+    mkdir -p "$fakejson"
+    cat > "$fakejson/python3" <<FAKE
+#!/bin/sh
+# 第一次调用（扫描）交给真实 python3；第二次（JSON 转换）直接失败。
+if [ -e '$jsonmarker' ]; then
+  cat >/dev/null
+  exit 1
+fi
+: > '$jsonmarker'
+exec '$real_py' "\$@"
+FAKE
+    chmod +x "$fakejson/python3"
+    rm -f "$jsonmarker"
+    jout=$(PATH="$fakejson:$PATH" bash "$tmp/tools/check_collab_parents.sh" --json 2>/dev/null); jst=$?
+    if [ "$jst" -eq 2 ] && ! printf '%s' "$jout" | grep -q '✅'; then
+      echo "  ✅ 阴性对照（真实扫描 + JSON 转换失败）⇒ exit 2，未误报合规"
+    else
+      echo "  ❌ 阴性对照（JSON 转换失败）：exit=${jst}（期望 2），或误报合规"
+      bad=1
+    fi
+  fi
+
   rm -rf "$tmp"
   return "$bad"
 }
@@ -334,12 +411,29 @@ case "$mode" in
   scan)
     refs=$(git for-each-ref --format='%(objectname)' refs/collab/inbox 2>/dev/null)
     [ -n "$refs" ] || { echo "check_collab_parents: refs/collab/inbox 为空（没有协作条目）" >&2; exit 2; }
-    ref_count=$(git for-each-ref --format='%(refname)' refs/collab/inbox | wc -l | tr -d ' ')
+    # 对账用已取到的 $refs 计行：不再重跑 git for-each-ref（第二次取数可能与第一次
+    # 不一致，且它自己的失败会被管道吞掉）。wc/tr 失败时 ref_count 会是空串或非数字，
+    # 必须显式校验——否则 `[ -ne ]` 报 integer expression expected 后 if 判假，
+    # 对账整段被跳过 ⇒ 假绿（2026-10-27 复评实测：坏 wc + 2 refs ⇒ exit 0 + ✅）。
+    ref_count=$(printf '%s\n' "$refs" | wc -l | tr -d '[:space:]')
+    case "${ref_count}" in
+      ''|*[!0-9]*)
+        echo "check_collab_parents: 无法统计 refs/collab/inbox 引用数（ref_count='${ref_count}'，按环境错误处理）" >&2
+        exit 2
+        ;;
+    esac
+    if [ "$ref_count" -lt 1 ]; then
+      echo "check_collab_parents: refs/collab/inbox 引用数为 0（与已取到的非空 refs 矛盾，按环境错误处理）" >&2
+      exit 2
+    fi
     rows_file=$(mktemp "${TMPDIR:-/tmp}/ccp-rows.XXXXXX") || {
       echo "check_collab_parents: mktemp 失败" >&2; exit 2;
     }
     trap 'rm -f "$rows_file"' EXIT
-    if ! scan "$rows_file"; then
+    # 扫描失败（任何非 0，含被信号杀死）必须落 2；不能因为写在 if 里就漏掉。
+    scan "$rows_file"
+    scan_rc=$?
+    if [ "$scan_rc" -ne 0 ]; then
       # 扫描器不可信 ⇒ 2；但中断前已检出的行仍然展示出来，不让它们消失。
       if grep -qE '^[0-9a-f]{10}\t' "$rows_file" 2>/dev/null; then
         echo "check_collab_parents: 扫描中断前已检出的异常行（不完整）：" >&2
@@ -347,7 +441,14 @@ case "$mode" in
       fi
       exit 2
     fi
-    # 对账：扫到的条目数必须等于 ref 数，否则说明有 ref 没被读到（截断/漏读）⇒ 不可信
+    # 对账：扫到的条目数必须等于 ref 数，否则说明有 ref 没被读到（截断/漏读）⇒ 不可信。
+    # scan() 已保证 scan_total 是数字；这里再防一层，避免算术失败被 if 判假静默吞掉。
+    case "${scan_total:-}" in
+      ''|*[!0-9]*)
+        echo "check_collab_parents: 扫描条目数不是数字（'${scan_total:-}'，按环境错误处理）" >&2
+        exit 2
+        ;;
+    esac
     if [ "$scan_total" -ne "$ref_count" ]; then
       echo "check_collab_parents: 扫描条目数 $scan_total ≠ refs/collab/inbox 引用数 ${ref_count}（扫描不完整，按环境错误处理）" >&2
       exit 2
