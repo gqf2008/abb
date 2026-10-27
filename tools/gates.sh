@@ -61,7 +61,20 @@ case "$base" in
 esac
 
 export TMPDIR="$base"
-export CARGO_TARGET_DIR="$base/abb-target"
+# **每个 worktree 用自己的 target 目录**（卡 abb-target-dir-per-worktree-20261022）。
+#
+# 为什么：原来固定写 `$base/abb-target`，多个 worktree 并行时全部指向同一个目录，
+# cargo 的文件锁互相饿等——实测单次 `cargo build` 卡 25+ 分钟无进展、系统 load 到 12.4、
+# `check_test_isolation.sh` 连续超时（测试本身只要 15 秒），而这些超时**看起来像测试失败**。
+#
+# 命名用 worktree 目录名：它天然唯一、可读（能一眼看出是哪个 worktree 的产物），且同一个
+# worktree 反复跑仍是同一个路径 ⇒ 增量缓存照旧生效。
+# 例外：`ABB_TARGET_SHARED=1` 时退回共用目录（给「只有一个 worktree、想省磁盘」的场景留退路）。
+if [ "${ABB_TARGET_SHARED:-0}" = "1" ]; then
+  export CARGO_TARGET_DIR="$base/abb-target"
+else
+  export CARGO_TARGET_DIR="$base/abb-target-$(basename "$repo_root")"
+fi
 # Windows 原生进程（rustc/link、cmd）**不认 `TMPDIR`**（那是 POSIX 约定），只看 `TMP`/`TEMP`：
 # 不补这两个，link/rustc 的 scratch 仍留在系统盘 C: 的 `%TEMP%`。cygpath 只在 MSYS/Cygwin 存在，
 # 正好当平台判据，并把 `/e/tmp` 转成原生 `E:\tmp`。
