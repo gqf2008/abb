@@ -716,6 +716,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **恰好在本分钟认领**（fired == due_min）的 once 任务也必须被 retired 收走。
+    ///
+    /// 这是 [`is_retired_once`] 用 `>=` 而不是 `>` 的理由：变异自验实测——把 `>=` 改成
+    /// `>` 后，上面那个「9:05 才认领」的用例**照样绿**（因为 9:05 > 9:00），但「9:00
+    /// 准时认领」的任务就会因为 `fired == due_min` 而永远不被收走，永久滞留在
+    /// jobs.json 里。本用例专钉这个等价边界。
+    #[test]
+    fn once_claimed_exactly_on_due_minute_is_still_retired() {
+        let dir = temp_dir("once-exact");
+        let s = store_at(&dir, &[once_job("a", "2026-08-05 09:00")], &[]);
+        assert_eq!(
+            s.claim_due(&dt(2026, 8, 5, 9, 0)).len(),
+            1,
+            "准时应认领（fired == due_min）"
+        );
+        assert_eq!(s.claim_due(&dt(2026, 8, 5, 9, 1)).len(), 0);
+        // 定义表必须已收走（`>` 变异下这里仍是 1 条）
+        let raw = std::fs::read_to_string(dir.join("jobs.json")).unwrap();
+        let left: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
+        assert!(
+            left.is_empty(),
+            "准点认领的 once 必须被 retired 收走，实测剩余 {left:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 计时账与定义分文件：写计时账不会把 CLI 新增的任务抹掉。
     #[test]
     fn state_write_does_not_clobber_jobs_file() {

@@ -51,6 +51,7 @@ summaries/
 context_tokens.json
 agent-pids.json
 jobs.json
+jobs-state.json
 pending.json
 pending_outbox.json
 buzz-reply-ledger.json
@@ -579,6 +580,30 @@ mod tests {
             .peel_to_blob()
             .unwrap();
         assert_eq!(std::str::from_utf8(blob.content()).unwrap(), content);
+    }
+
+    /// 每个**进度型**运行态文件都必须在清单里：`snapshot` 用 `index.add_all(["*"])`
+    /// （等价 `git add -A`），漏一个就是每天一个无意义 commit，把 #209 的删除恢复点历史
+    /// 洗成噪声。`jobs-state.json` 是调度器的计时账（每分钟都可能变），由卡
+    /// `abb-schedule-claim-due-20261028` 引入——与它的定义文件 `jobs.json` 同列。
+    ///
+    /// 为什么是硬编码清单而不是扫描：清单是本仓的单一事实源，新运行态文件必须显式登记；
+    /// 这条断言就是逼人登记的那一步（漏登记时它红，而不是等人从 git log 里发现噪声）。
+    #[test]
+    fn gitignore_covers_runtime_state_files() {
+        for name in [
+            "sessions.json",
+            "jobs.json",
+            "jobs-state.json",
+            "pending.json",
+            "pending_outbox.json",
+            "agent-pids.json",
+        ] {
+            assert!(
+                GITIGNORE.lines().any(|l| l.trim() == name),
+                "运行时状态文件 {name} 必须进 .gitignore 清单（否则被 add -A 摄入删除保护快照）"
+            );
+        }
     }
 
     #[test]
