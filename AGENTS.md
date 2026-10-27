@@ -62,7 +62,7 @@ entire runtime directory; empty means default); per-bot workspaces under
   「什么都没发生」）。写走 `collab_entry` / `collab_claim` 两个工具（`actor` 必须是 `--key`
   绑定的 principal），重活（构建、测试、push）仍在工具调用之外跑，收尾只写一条 entry。
   **看板内容不要走 `read_resource`**：本项目 board 约 580 KB，而 ki 的读工具硬截断 20 KiB
-  （拿到的是断掉的 JSON 残片）；唤醒后用 CLI 取全文 —— `walgit collab board` / `collab board --json`。
+  （拿到的是断掉的 JSON 残片）；唤醒后用 CLI 取全文 —— `walgit collab board` / `walgit collab board --format json`。
   同理 `walgit://refs/<owner>/<repo>` **不要订**：实测该仓库 4514 条 ref（`inbox` 3625、
   `ci-artifacts` 516、tag 166、`refs/heads` 1），摘要按字典序预算 464 条**全部**是
   `refs/collab/ci-artifacts/*`，分支/inbox 一条不回；而它的 `_meta.version` 是全量 ref 的流式
