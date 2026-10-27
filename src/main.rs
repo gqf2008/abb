@@ -180,9 +180,11 @@ pub fn atomic_write_text_if_changed(path: &std::path::Path, text: &str) -> std::
 /// “静默换成 0644”不是。
 ///
 /// **每个失败分支都要清 tmp**：`fs::write` / `set_permissions` / `rename` 任一处失败
-/// 都删掉 `tmp.<uuid>`，否则会永久残留——而 `src/tidy.rs` 的临时文件规则只认 `.tmp`
-/// 与 `.tmp.<纯数字>`（那个“纯数字”约束是为了不误删 `notes.tmp.md` 这类用户文档名），
-/// **不认 uuid 后缀**，残留就没人清。
+/// 都删掉 `tmp.<uuid>`，否则会永久残留。清理面实际只覆盖**工作区根目录**：
+/// `src/tidy.rs::collect_temp_files` 只 `read_dir(workspace)` 不递归、且跳过非文件，
+/// 而本函数的目标多在结构目录或 `~/.agent-bridge`（syschat 的 `sessions/`、attachments
+/// 的 meta、config 备份）——**那边的残留仍然没人清**。别把这里的 remove_file 当成
+/// 全局兼底（评审 155 的 tidy-scope-root-only）。
 pub fn atomic_write_sensitive(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
     if let Err(e) = std::fs::write(&tmp, text) {

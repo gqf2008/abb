@@ -198,7 +198,12 @@ fn collect_temp_files(workspace: &Path, now_secs: u64) -> Vec<std::path::PathBuf
                 //（编辑器崩溃残留 file.tmp.123）——"notes.tmp.md"/"backup.bak.docx" 是
                 // 用户文档名，子串匹配会永久误删（审查修复；与 core.<pid> 同规则）。
                 name.ends_with(s)
-                    || name.find(&format!("{s}.")).is_some_and(|i| {
+                    // 用 `rfind` 而不是 `find`（评审 155 的 tidy-find-first）：与
+                    // `with_extension` 的「替换扩展名」语义对齐——只判**最后一个**
+                    // `.tmp.` 之后的部分。若用 find，`notes.tmp.final.json` 的中间名是
+                    // `notes.tmp.final.tmp.<uuid>`，取到 `final.tmp.<uuid>` ⇒ 既非数字也非
+                    // uuid ⇒ 永远清不掉（实测 false）。
+                    || name.rfind(&format!("{s}.")).is_some_and(|i| {
                         // 后缀必须非空且是**纯数字**或 **uuid**（同 core.<pid> 规则；
                         // "x.tmp." 尾部带点空串 all() 恒真会误删——审查修复）。
                         //
@@ -435,12 +440,19 @@ mod tests {
             ".DS_Store",
             "core",
             "core.1234",
-            // 卡 `abb-symlink-hardening-20261028`：原子写的中间名 `tmp.<uuid>` 必须被清，
-            // 否则写失败后的残留永远无人回收（tidy 旧规则只认纯数字后缀）。
-            // 带横线（with_extension 会在末尾追加，故常见于 `.json.tmp.<uuid>` 形态）
-            // 与 simple() 无横线两种都要认得。
+            // 卡 `abb-symlink-hardening-20261028`：原子写的中间名 `tmp.<uuid>` 必须被清。
+            //
+            // **真实形态是「替换扩展名」而不是末尾追加**（评审 155 实测纠正）：
+            // `path.with_extension("tmp.<uuid>")` 对 `jobs-state.json` 得
+            // `jobs-state.tmp.<uuid>`，对 `sessions.json` 得 `sessions.tmp.<uuid>`。
+            // 两种形态都列，既钉住真实生产者、也保留历史注释里写错的那个。
+            "jobs-state.tmp.1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+            "sessions.tmp.1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
             "jobs.json.tmp.1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
-            "sessions.json.tmp.1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
+            // rfind 修复的判别点（评审 155 的 tidy-find-first）：文件名自身含 `.tmp.`
+            // 时，中间名是 `notes.tmp.final.tmp.<uuid>`。用 find 会取到
+            // `final.tmp.<uuid>`（既非数字也非 uuid）⇒ 漏清；rfind 取最后一段 ⇒ 命中。
+            "notes.tmp.final.tmp.1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
         ] {
             std::fs::write(ws.join(f), "x").unwrap();
             // 命中的必须是超 24h mtime 护栏的（活着的编辑器临时文件不删）
@@ -493,8 +505,13 @@ mod tests {
             ".DS_Store",
             "core",
             "core.1234",
+            "jobs-state.tmp.1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+            "sessions.tmp.1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
             "jobs.json.tmp.1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
-            "sessions.json.tmp.1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
+            // rfind 修复的判别点（评审 155 的 tidy-find-first）：文件名自身含 `.tmp.`
+            // 时，中间名是 `notes.tmp.final.tmp.<uuid>`；用 find 会取到
+            // `final.tmp.<uuid>`（既非数字也非 uuid）⇒ 漏清；rfind 取最后一段 ⇒ 命中。
+            "notes.tmp.final.tmp.1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
         ]
         .iter()
         .map(|s| s.to_string())

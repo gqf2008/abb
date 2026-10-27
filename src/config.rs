@@ -1658,20 +1658,18 @@ impl Config {
     }
 
     /// 写草稿：与 save 相同的原子写 + 0600（含密钥，权限必须收紧）。
+    ///
+    /// 改用共享的 `atomic_write_sensitive`（卡 `abb-symlink-hardening-20261028`，评审 155 的
+    /// config-save-draft-duplicate）：原来的手写版用**固定 tmp 名**
+    /// `draft.json.tmp` + `fs::write`（会跟随符号链接）、且 chmod / rename 失败**都不清 tmp**
+    /// ——正是共享实现里刚补的两个分支。共享版 = uuid 唯一 tmp + 0600 + 逐分支 `remove_file`。
     pub fn save_draft(&self) -> Result<()> {
         let p = Self::draft_path();
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = p.with_extension("draft.json.tmp");
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp, text)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&tmp, &p)?;
+        crate::atomic_write_sensitive(&p, &text)?;
         Ok(())
     }
 
