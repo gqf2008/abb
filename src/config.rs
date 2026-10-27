@@ -1659,10 +1659,17 @@ impl Config {
 
     /// 写草稿：与 save 相同的原子写 + 0600（含密钥，权限必须收紧）。
     ///
-    /// 改用共享的 `atomic_write_sensitive`（卡 `abb-symlink-hardening-20261028`，评审 155 的
-    /// config-save-draft-duplicate）：原来的手写版用**固定 tmp 名**
-    /// `draft.json.tmp` + `fs::write`（会跟随符号链接）、且 chmod / rename 失败**都不清 tmp**
-    /// ——正是共享实现里刚补的两个分支。共享版 = uuid 唯一 tmp + 0600 + 逐分支 `remove_file`。
+    /// 改用共享的 `atomic_write_sensitive`（卡 `abb-symlink-hardening-20261028`）。
+    ///
+    /// 旧实现是手写的：`p.with_extension("draft.json.tmp")` + `fs::write` + chmod + rename。
+    /// 注意那个固定名实际长这样（评审 156 实测纠正）：`draft_path()` 是
+    /// `bridge_dir()/config.draft.json`，而 `with_extension` **替换**扩展名 ⇒
+    /// 得到 `config.draft.draft.json.tmp`，不是注释里曾写的 `draft.json.tmp`。
+    ///
+    /// 换掉它的两个真实理由：① **固定名** 带回 #137 的并发互踩面（uuid 唯一名消除）；
+    /// ② chmod / rename 失败**都不清 tmp**（共享实现逐分支 remove_file）。
+    /// 注：`fs::write` 跟随符号链接这一点**不是**差异——共享实现同样是 `fs::write`，
+    /// 两者都跟随；那一条由 uuid 名的不可预测性解决，不是切换函数解决的。
     pub fn save_draft(&self) -> Result<()> {
         let p = Self::draft_path();
         if let Some(parent) = p.parent() {

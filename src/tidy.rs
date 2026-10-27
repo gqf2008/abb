@@ -203,6 +203,12 @@ fn collect_temp_files(workspace: &Path, now_secs: u64) -> Vec<std::path::PathBuf
                     // `.tmp.` 之后的部分。若用 find，`notes.tmp.final.json` 的中间名是
                     // `notes.tmp.final.tmp.<uuid>`，取到 `final.tmp.<uuid>` ⇒ 既非数字也非
                     // uuid ⇒ 永远清不掉（实测 false）。
+                    //
+                    // 知情的代价（评审 156 的 tidy-rfind-double-tmp-digit-widening）：
+                    // 当文件名含多个 `.tmp.` 且**末段是纯数字**时，rfind 比 find 放宽了
+                    // 删除面——`a.tmp.123.tmp.456` 的后缀是 `456` ⇒ 判临时文件（find 时
+                    // 后缀是 `123.tmp.456`，不命）。不为此加额外判据：这类命名本身病态，
+                    // 且命中仍要过 24h mtime 护栏，而非fresh 文件不受影响。
                     || name.rfind(&format!("{s}.")).is_some_and(|i| {
                         // 后缀必须非空且是**纯数字**或 **uuid**（同 core.<pid> 规则；
                         // "x.tmp." 尾部带点空串 all() 恒真会误删——审查修复）。
@@ -442,10 +448,11 @@ mod tests {
             "core.1234",
             // 卡 `abb-symlink-hardening-20261028`：原子写的中间名 `tmp.<uuid>` 必须被清。
             //
-            // **真实形态是「替换扩展名」而不是末尾追加**（评审 155 实测纠正）：
-            // `path.with_extension("tmp.<uuid>")` 对 `jobs-state.json` 得
-            // `jobs-state.tmp.<uuid>`，对 `sessions.json` 得 `sessions.tmp.<uuid>`。
-            // 两种形态都列，既钉住真实生产者、也保留历史注释里写错的那个。
+            // **两类真实生产者并存**（评审 155/156）：
+            // - main.rs 的 `with_extension(format!("tmp.{uuid}"))` ⇒ `x.tmp.<uuid>`；
+            // - sessions.rs:491 / deliver.rs:196 用 `with_extension(format!("json.tmp.{uuid}"))`
+            //   ⇒ `x.json.tmp.<uuid>`（`with_extension` 是**替换**扩展名，不是追加）。
+            // 两条都钉住。别把后者当「历史写错的形态」删掉——它有真实生产者。
             "jobs-state.tmp.1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
             "sessions.tmp.1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
             "jobs.json.tmp.1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
