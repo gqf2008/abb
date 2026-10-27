@@ -71,6 +71,17 @@ pub fn verify(identity: &ProcIdentity) -> IdentityStatus {
     //
     // 顺序很关键：上面两条 `Dead` 已经在最前面——旧记录对应的进程若真的没了（升级前就
     // 崩掉了，这是最常见的情形），照样走 `Dead` 自动恢复，升级零感知。
+    //
+    // ⚠️ 本守门只保护「旧格式记录 → 新二进制」这一向（卡 `abb-proc-sysctl-nb-20261028`
+    // NB-4）。**反方向没有保护，也无法在旧代码里保护**：新格式 `macos-…` 已落盘后若
+    // 回滚到 3.2.3（旧二进制），旧代码会拿 `ps -o lstart=` 文本去跟 `macos-…` 逐字比 ⇒
+    // `Dead` ⇒ `recover_keepalives` 退避后重拉，而旧代际 keepalive 是 `setsid` 独立进程
+    // 组、可能仍活着 ⇒ **双实例**（重复投递/重复计费）。
+    //
+    // 因此：**本版（含本卡）的升级不可回滚到 3.2.3 及更早版本**。发布/升级说明里必须
+    // 点明这一条。机制性的根治办法是给 `ProcIdentity` 落一个 `format_version` 字段、
+    // 让未来任何格式变更双向可判——但那要改序列化格式、且旧代码对未知版本也读不懂，
+    // 收益有限，故此处先以显式警示收口。
     #[cfg(target_os = "macos")]
     if !identity
         .start_token

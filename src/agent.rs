@@ -672,6 +672,17 @@ fn write_agent_pids(bot_key: &str, pids: &[u32]) {
     }
 }
 
+/// 命令行「是不是本桥 spawn 的 agent」——**纯函数**，不读系统。
+///
+/// 抽出来是为了可测性（卡 `abb-proc-sysctl-nb-20261028` NB-2）：原来唯一的断言是
+/// `assert!(!process_is_agent(std::process::id()))`，前提是「测试二进制不是 claude/codex/pi」。
+/// 但该判据本身就是命令行子串匹配，而测试 harness 的 argv 里带着过滤参数——只要参数值含
+/// `claude`（例如 `--skip claude_heal_on_first_round_writes_no_pending`）或 argv[0] 路径含
+/// `claude`，那条断言就会**误红**（靠环境碰巧而非靠设计）。现在正反两侧都用合成字符串测。
+fn command_is_agent(cmd: &str) -> bool {
+    cmd.contains("claude") || cmd.contains("codex") || pi_command_matches(cmd)
+}
+
 /// 目标 pid 是否还是「本桥 spawn 的 agent」：存活且命令行匹配 claude/codex/pi。
 /// Windows 无 ps 语义，直接信任 pid 文件（taskkill /F）。
 ///
@@ -682,11 +693,8 @@ fn write_agent_pids(bot_key: &str, pids: &[u32]) {
 fn process_is_agent(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        let cmd = unix_process_command(pid);
-        match cmd {
-            Some(cmd) => {
-                cmd.contains("claude") || cmd.contains("codex") || pi_command_matches(&cmd)
-            }
+        match unix_process_command(pid) {
+            Some(cmd) => command_is_agent(&cmd),
             None => false,
         }
     }
@@ -782,10 +790,30 @@ mod tests {
             !cmd.contains('\u{1f}'),
             "argv 分隔符必须回填成空格，否则 pi 的首 token 匹配会失准：{cmd}"
         );
-        assert!(
-            !process_is_agent(std::process::id()),
-            "测试二进制不是 claude/codex/pi，必须判否（防 pid 复用误杀）"
-        );
+    }
+
+    /// NB-2：判据的正反两侧用**合成字符串**测，不依赖测试二进制的 argv。
+    ///
+    /// 旧写法靠 `!process_is_agent(std::process::id())`，而测试 harness 的 argv 里带过滤
+    /// 参数——`--skip claude_xxx` 之类就会让那条断言误红（卡 `abb-proc-sysctl-nb-20261028`
+    /// NB-2，评审指出）。本用例与 `--skip` 滤器无关，怎么写都稳定。
+    #[test]
+    fn command_is_agent_matches_agents_and_rejects_others() {
+        // 正侧：三种后端都必须判是（含 argv 中间带 claude 的情形——真实测试 harness 就这样）
+        assert!(command_is_agent(
+            "/Users/x/.npm-global/bin/claude --dangerously-skip-permissions"
+        ));
+        assert!(command_is_agent(
+            "/usr/bin/node /usr/lib/codex/cli.js serve"
+        ));
+        assert!(command_is_agent(
+            "/Users/x/.local/bin/pi -p --skip claude_heal_on_first_round_writes_no_pending"
+        ));
+        // 反侧：无关进程（这条不靠 argv，靠合成串）
+        assert!(!command_is_agent("/bin/bash -c 'echo ABB_KEEPALIVE_1'"));
+        assert!(!command_is_agent("/usr/bin/python3 tools/script.py"));
+        assert!(!command_is_agent("/sbin/init"));
+        assert!(!command_is_agent(""));
     }
 
     /// 后处理纯函数：首个非空行（trim）；空输入/全空白 → 空串。

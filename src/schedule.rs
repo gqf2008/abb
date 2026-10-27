@@ -147,11 +147,17 @@ impl JobStore {
     }
 
     fn save_locked(&self, data: &[Job]) {
-        let tmp = self.path.with_extension("json.tmp");
+        // 用共享原子写（uuid 唯一 tmp），而不是手写 `jobs.json.tmp` + rename：
+        //
+        // 1. **符号链接写面**（卡 `abb-proc-sysctl-nb-20261028` NB-3）：`fs::write` 是
+        //    O_CREAT|O_TRUNC、**会跟随符号链接**。固定 tmp 名时，受限会话预放
+        //    `jobs.json.tmp → ~/.zshrc`，我们下一次写定义就跟随链接覆盖工作区外的真实
+        //    文件。guard 的 `.tmp` 剪尾只拦 Write/Edit 工具这条路，写入侧没堵——现在补上。
+        //    uuid 唯一 tmp 名让「预放」从根上不可预测。
+        // 2. **并发写方互踩**（#137）：固定 tmp 名时进程 A rename 后进程 B 拿不到 tmp
+        //    → ENOENT。CLI 与应用双写 jobs.json 正是这个场景。
         if let Ok(text) = serde_json::to_string_pretty(data) {
-            if fs::write(&tmp, text).is_ok() {
-                let _ = fs::rename(&tmp, &self.path);
-            }
+            let _ = crate::atomic_write_text(&self.path, &text);
         }
     }
 
@@ -180,16 +186,13 @@ impl JobStore {
     /// 就能被单测钉住；告警文案本身仍不在测试覆盖内（与 `pending.rs::save` 同款形状）。
     fn try_save_state(&self, fired: &HashMap<String, i64>) -> std::io::Result<()> {
         use std::io::Error;
-        let tmp = self.state_path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(fired)
             .map_err(|e| Error::other(format!("序列化失败: {e}")))?;
-        fs::write(&tmp, &text)
-            .map_err(|e| Error::other(format!("写 tmp={} 失败: {e}", tmp.display())))?;
-        fs::rename(&tmp, &self.state_path).map_err(|e| {
-            // 替换失败的残留 tmp 已无意义：目录权限/占用类错误会一直复现，留着只会堆积。
-            let _ = fs::remove_file(&tmp);
-            Error::other(format!("替换 {} 失败: {e}", self.state_path.display()))
-        })
+        // 同 [`Self::save_locked`]：改用 uuid 唯一 tmp 的共享原子写，堵住
+        // 「预放 `jobs-state.json.tmp` 符号链接 → 写入时跟随覆盖工作区外文件」这条
+        // 写入侧旁路（卡 `abb-proc-sysctl-nb-20261028` NB-3；guard 只拦工具面）。
+        crate::atomic_write_text(&self.state_path, &text)
+            .map_err(|e| Error::other(format!("写字计账 {} 失败: {e}", self.state_path.display())))
     }
 
     pub fn remove(&self, id: &str) -> bool {
@@ -314,12 +317,20 @@ fn claimable(job: &Job, fired: Option<i64>, now: &DateTime, now_min: i64) -> boo
                 return job.is_due(now);
             };
             // 「本分钟已认领 / 时钟回拨」（`fired >= now_min`）不需要显式守卫：此时
-            // `lo = (fired + 1).max(…)` 必然 `lo > now_min`，`lo..=now_min` 是空区间，
-            // 下面的 `any` 返回 false。**不要去这里补 `if now_min <= fired { return false }`**
-            // ——它与空区间完全等价（评审实测：整段删除的变异下全部用例照绿），留着只会让
-            // 读者误以为去重靠那道守卫，而不是靠「区间为空」这个真正的拦截点（卡 F3）。
-            // 上一次认领之后的最近一次匹配（含当前分钟）。
-            let lo = (fired + 1).max(now_min - CRON_CATCHUP_MAX_MINUTES);
+            // `lo > now_min`，`lo..=now_min` 是空区间，下面的 `any` 返回 false。**不要去
+            // 这里补 `if now_min <= fired { return false }`**——它与空区间等价（评审实测：
+            // 整段删除的变异下全部用例照绿），留着只会让读者误以为去重靠那道守卫。
+            //
+            // `saturating_add` 而不是 `+ 1`（卡 `abb-proc-sysctl-nb-20261028` NB-1）：
+            // `fired` 来自 `jobs-state.json`，是磁盘上的数据而不是本进程算出来的不变量。
+            // 若它被写成 `i64::MAX`（人工编辑/位翻转/未来的 bug），`fired + 1` 在 debug 档
+            // 直接 panic（调度循环死掉，所有定时任务静默停摆），在 release 档（本仓
+            // `[profile.release]` 未设 `overflow-checks`，跟随默认=关）wrap 成 `i64::MIN`
+            // ⇒ `lo = now_min - 2880` ⇒ 区间非空 ⇒ **重复认领一个已经跑过的分钟点**。
+            // 饱和加法把异常值导回「空区间」这一侧，正好是我们要的 fail-closed。
+            let lo = fired
+                .saturating_add(1)
+                .max(now_min - CRON_CATCHUP_MAX_MINUTES);
             (lo..=now_min)
                 .rev()
                 .any(|m| c.matches(&DateTime::from_unix(m * 60)))
@@ -702,6 +713,61 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// NB-1（卡 `abb-proc-sysctl-nb-20261028`）：计时账里的 `fired` 是**磁盘数据**，
+    /// 不是本进程算出来的不变量。异常值（`i64::MAX` / `i64::MAX - 1`）不得让调度循环
+    /// panic，也不得 wrap 成负数后重复认领。
+    ///
+    /// 改前（`fired + 1`）两个编译档两种坏：debug 档 `attempt to add with overflow`
+    /// （调度循环死掉，所有定时任务静默停摆）；release 档（本仓未设 overflow-checks）
+    /// wrap 成 `i64::MIN` ⇒ `lo = now_min - 2880` ⇒ 区间非空 ⇒ **重复认领已跑过的分钟点**。
+    #[test]
+    fn extreme_fired_value_neither_panics_nor_reclaims() {
+        for extreme in [i64::MAX, i64::MAX - 1] {
+            let dir = temp_dir(&format!("extreme-{extreme}"));
+            // 高频表达式：任何「区间非空」的误判都会立刻变成一个认领。
+            let s = store_at(&dir, &[cron_job("a", "* * * * *")], &[("a", extreme)]);
+            let got = s.claim_due(&dt(2026, 8, 5, 9, 0));
+            assert!(
+                got.is_empty(),
+                "fired={extreme} 必须被饱和加法导回空区间（不认领），实际认领 {} 条",
+                got.len()
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// NB-3（卡 `abb-proc-sysctl-nb-20261028`）：原子写必须用**不可预测**的 tmp 名。
+    ///
+    /// `fs::write` 是 O_CREAT|O_TRUNC、会跟随符号链接：固定 tmp 名（`jobs-state.json.tmp`）
+    /// 时，受限会话预放 `jobs-state.json.tmp → 工作区外的真实文件`，我们下一次落盘就跟随
+    /// 链接覆盖它。guard 的 `.tmp` 剪尾只拦 Write/Edit 工具这条路，写入侧靠这个用例守。
+    #[test]
+    fn atomic_write_does_not_follow_preseeded_symlink() {
+        let dir = temp_dir("symlink");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "ORIGINAL").unwrap();
+        // 预放固定 tmp 名为指向受害者的符号链接（模拟受限会话的预置）。
+        let evil_tmp = dir.join("jobs-state.json.tmp");
+        std::os::unix::fs::symlink(&victim, &evil_tmp).unwrap();
+
+        let s = store_at(&dir, &[cron_job("a", "0 9 * * *")], &[]);
+        assert_eq!(
+            s.claim_due(&dt(2026, 8, 5, 9, 0)).len(),
+            1,
+            "认领并落盘计时账"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL",
+            "预置的 jobs-state.json.tmp 符号链接不得被跟随（否则工作区外文件被覆盖）"
+        );
+        // 计时账本身要真的写进去了
+        let state = std::fs::read_to_string(dir.join("jobs-state.json")).unwrap();
+        assert!(state.contains("\"a\""), "计时账应正常落盘：{state}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 新建任务**不得**回溯：否则刚建的 `* * * * *` 会把 48 小时全补一遍。
     #[test]
     fn new_job_never_backfills_history() {
@@ -852,9 +918,12 @@ mod tests {
         // 先恢复权限：否则后面任一条断言失败，清理步骤都会用一个次生错误把真因淡掉。
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let err = detected.expect_err("只读目录下的写盘失败必须返回 Err（不能静默）");
+        // 错误上下文要带出**可定位的信息**，才能排障。注意不能断言固定 tmp 名：
+        // 现在走 `crate::atomic_write_text`（uuid 唯一 tmp，卡 NB-3），错误里带的是目标
+        // 路径 + 随机 tmp。断言留在「目标文件名」上，与 tmp 命名策略解耦。
         assert!(
-            err.to_string().contains("jobs-state.json.tmp"),
-            "错误上下文应带出失败的 tmp 路径（排障靠它），实得：{err}"
+            err.to_string().contains("jobs-state.json"),
+            "错误上下文应带出目标路径（排障靠它），实得：{err}"
         );
         assert_eq!(claimed.len(), 1, "计时账写失败不得影响认领结果");
         assert_eq!(claimed[0].id, "a");
