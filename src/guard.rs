@@ -429,6 +429,12 @@ fn check_file_paths(tool: &str, input: &serde_json::Value, workspace: &Path) -> 
 ///   （#326 F1）。选前缀而非两个精确名的理由：① 一次性覆盖当前两个名字 + 未来派生的
 ///   同族名（尾随点/空格变体已在上面归一后落入本判定）；② 误伤面仅限「本就是桥状态
 ///   保留名」的命名族，agent 无正当写需求；③ 与 jobs.json 一样只禁写不禁读
+/// - 尾部 `.tmp` 先剪掉再判定：原子写的**中间名**（`<最终名>.json.tmp`）写的是同一块
+///   字节面，只认最终名就留下一条符号链接旁路——受限会话预放
+///   `jobs-state.json.tmp → ~/.zshrc`，桥下一次写计时账跟随链接覆盖**工作区外**的真实
+///   文件（评审 F4；`jobs.json.tmp` 早就有同一形态）。剪尾而非广谱拦 `*.json.tmp` 的
+///   理由：误伤面——用户/agent 自己的 `data.json.tmp`（原子写的常见命名）是正当写，
+///   而「剪掉 .tmp 后命中本名单」只会是桥状态名的 tmp 兄弟，本无正当写需求。
 /// - 文件名后缀 `.agents.md` / `.claude.md`：会话级 AGENTS.md（`<escaped>.AGENTS.md`）会被
 ///   注入每个会话 prompt（含 owner 全权限会话）——granted 能写 = 持久化提权，与裸
 ///   AGENTS.md 同列；顺带覆盖任何 `x.agents.md` 形态（安全优先，改名即可）
@@ -449,8 +455,12 @@ fn is_bridge_state_path(p: &str) -> bool {
     let path = std::path::Path::new(p);
     if let Some(name) = path.file_name() {
         let name = trim_trail(&name.to_string_lossy().to_ascii_lowercase());
+        // 原子写中间名 `<最终名>.json.tmp` 与最终名同级（写的是同一块字节面）：剪掉尾部
+        // `.tmp` 再判名单 ⇒ `jobs.json.tmp` / `jobs-state.json.tmp` / `sessions.json.tmp`
+        // 自动落入，而 `data.json.tmp` 这类非桥状态名不受影响（不做 `*.json.tmp` 广谱拦）。
+        let name = name.strip_suffix(".tmp").unwrap_or(name.as_str());
         if matches!(
-            name.as_str(),
+            name,
             "jobs.json"
                 // 定时任务的**计时账**（`job_id → 上次认领的分钟点`）。与 jobs.json 同属桥执行
                 // 状态：能写它就能把某任务抬成「已跑过」而**静默啕掉一条定时任务**
@@ -2011,6 +2021,62 @@ mod tests {
             check_file_paths("Write", &serde_json::json!({"file_path": "a.txt"}), &ws),
             Decision::Allow
         );
+        let _ = root;
+    }
+
+    /// F4：原子写的**中间名**（`<桥状态名>.json.tmp`）同样是写面。
+    ///
+    /// `schedule.rs::save_locked` / `save_state_locked` 与 `syschat.rs::save` 都是「先写
+    /// `X.json.tmp` 再 rename」。名单只认最终名时，受限会话可以预放一个符号链接
+    /// `jobs-state.json.tmp → ~/.zshrc`，桥下一次写计时账就**跟随链接覆盖工作区外的真实文件**
+    /// （`jobs.json.tmp` 早就有同一形态，本卡新增的计时账把面又扩大一格）。
+    ///
+    /// 同时钉住取舍：只拦「剪掉 .tmp 后命中名单」的名字，**不**广谱拦 `*.json.tmp`
+    /// ——用户/agent 自己的 `data.json.tmp` 是正当原子写，不能误伤。
+    #[test]
+    fn file_paths_deny_bridge_state_tmp_names() {
+        let (root, ws, _guard) = temp_guard_env();
+        let ws = workspace_canon(&ws);
+        for p in [
+            "jobs.json.tmp",
+            "./jobs-state.json.tmp",
+            "sub/../jobs.json.tmp",
+            "JOBS-STATE.JSON.TMP", // 大小写变体（macOS 不区分大小写）
+            "jobs.json.tmp.",      // APFS 剪尾后即 jobs.json.tmp
+            "sessions.json.tmp",   // syschat 的原子写中间名，同类一并覆盖
+        ] {
+            // 逐个在盘上建出文件：否则「工作区外」那道闸会抢先拒绝，测到的是目录闸而不是名单
+            // （与 file_paths_deny_bridge_state_files 同款讲究：变异自验不能假绿）。
+            let abs = Path::new(&ws).join(p);
+            std::fs::create_dir_all(abs.parent().expect("有父目录")).expect("建目录");
+            std::fs::write(&abs, "x").expect("建文件");
+            for tool in ["Write", "Edit"] {
+                match check_file_paths(tool, &serde_json::json!({"file_path": p}), &ws) {
+                    Decision::Deny(reason) => assert!(
+                        reason.contains("桥状态"),
+                        "{tool} {p} 应被状态名单拒，实际被别的闸拒了：{reason}"
+                    ),
+                    Decision::Allow => {
+                        panic!("{tool} {p} 必须拒写（否则可预放符号链接覆盖工作区外文件）")
+                    }
+                }
+            }
+            // 只禁写不禁读（与 jobs.json 同口径）
+            assert_eq!(
+                check_file_paths("Read", &serde_json::json!({"file_path": p}), &ws),
+                Decision::Allow,
+                "读应放行：{p}"
+            );
+        }
+        // 负向对照：不是桥状态名的 tmp 名必须放行——这就是不做 `*.json.tmp` 广谱拦的理由。
+        for p in ["data.json.tmp", "notes.md.tmp"] {
+            std::fs::write(Path::new(&ws).join(p), "x").expect("建文件");
+            assert_eq!(
+                check_file_paths("Write", &serde_json::json!({"file_path": p}), &ws),
+                Decision::Allow,
+                "{p} 不是桥状态名，原子写不得误伤"
+            );
+        }
         let _ = root;
     }
 

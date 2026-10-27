@@ -42,7 +42,7 @@ const TZ_OFFSET_SECS: i64 = 8 * 3600;
 /// `* * * * *` 任务在停机一天后要连续跑 1440 轮）。
 ///
 /// 这个值也是「表达式永不命中」（如 `0 0 30 2 *`）时每个 tick 的扫描上界——2880 次纯整数
-/// 比较，微秒量级，且下一 tick 就因 `now_min <= fired` 短路。
+/// 比较，微秒量级（`fired` 就落在窗口内时实际扫描区间更短）。
 const CRON_CATCHUP_MAX_MINUTES: i64 = 48 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -156,13 +156,40 @@ impl JobStore {
     }
 
     /// 计时账落盘（原子替换）。写失败不影响本进程内的判定（内存已更新）。
+    ///
+    /// 但**写失败必须留痕**（评审 F1）：三个 `if let Ok` 套住的旧写法把序列化/写盘/替换
+    /// 三步的失败全吞了，而这种降级的后果正是本卡要消除的那类缺陷——计时账没落盘就等于
+    /// 「重启后会重跑本轮」（cron 的副作用可能是发消息、跑 agent、烧 token），却没有任何
+    /// 日志线索，排障时只能靠猜。
+    ///
+    /// 频率上界：本函数只在真有认领/回收时被调用，而调度循环本身按分钟去重
+    /// （`service.rs` 的 `last_min`）⇒ 至多每分钟一次告警，不必额外限频。
+    /// 用 `crate::log!` 而非 `tracing::warn!`：根二进制没有装 tracing subscriber，
+    /// `tracing::warn!` 在本仓等于静默丢弃。
     fn save_state_locked(&self, fired: &HashMap<String, i64>) {
-        let tmp = self.state_path.with_extension("json.tmp");
-        if let Ok(text) = serde_json::to_string_pretty(fired) {
-            if fs::write(&tmp, text).is_ok() {
-                let _ = fs::rename(&tmp, &self.state_path);
-            }
+        if let Err(e) = self.try_save_state(fired) {
+            crate::log!("[schedule] ⚠️ 计时账写盘失败（重启后可能重跑本轮）: {e}");
         }
+    }
+
+    /// 计时账落盘本体，**返回结果**而不是自己吞掉。
+    ///
+    /// 拆出来是为了可测：[`save_state_locked`] 的告警走 `crate::log!`（写 stdout，测试
+    /// 无法捕获），只断言「claim_due 不 panic + 返回值对」的话，把实现退回静默旧写法
+    /// 用例**照绿**（实测如此）——那就只是装饰。返回 `Err` 后，「失败被识别到」这件事
+    /// 就能被单测钉住；告警文案本身仍不在测试覆盖内（与 `pending.rs::save` 同款形状）。
+    fn try_save_state(&self, fired: &HashMap<String, i64>) -> std::io::Result<()> {
+        use std::io::Error;
+        let tmp = self.state_path.with_extension("json.tmp");
+        let text = serde_json::to_string_pretty(fired)
+            .map_err(|e| Error::other(format!("序列化失败: {e}")))?;
+        fs::write(&tmp, &text)
+            .map_err(|e| Error::other(format!("写 tmp={} 失败: {e}", tmp.display())))?;
+        fs::rename(&tmp, &self.state_path).map_err(|e| {
+            // 替换失败的残留 tmp 已无意义：目录权限/占用类错误会一直复现，留着只会堆积。
+            let _ = fs::remove_file(&tmp);
+            Error::other(format!("替换 {} 失败: {e}", self.state_path.display()))
+        })
     }
 
     pub fn remove(&self, id: &str) -> bool {
@@ -286,9 +313,11 @@ fn claimable(job: &Job, fired: Option<i64>, now: &DateTime, now_min: i64) -> boo
                 // 首次（新任务 / 计时账丢失）：只看当前分钟，不回溯
                 return job.is_due(now);
             };
-            if now_min <= fired {
-                return false; // 本分钟（或时钟回拨）已处理过
-            }
+            // 「本分钟已认领 / 时钟回拨」（`fired >= now_min`）不需要显式守卫：此时
+            // `lo = (fired + 1).max(…)` 必然 `lo > now_min`，`lo..=now_min` 是空区间，
+            // 下面的 `any` 返回 false。**不要去这里补 `if now_min <= fired { return false }`**
+            // ——它与空区间完全等价（评审实测：整段删除的变异下全部用例照绿），留着只会让
+            // 读者误以为去重靠那道守卫，而不是靠「区间为空」这个真正的拦截点（卡 F3）。
             // 上一次认领之后的最近一次匹配（含当前分钟）。
             let lo = (fired + 1).max(now_min - CRON_CATCHUP_MAX_MINUTES);
             (lo..=now_min)
@@ -698,6 +727,33 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// F3 的等价点：`fired >= now_min`（本分钟已认领 / 时钟回拨）必须不认领。
+    ///
+    /// 拦截实际靠的是**空区间**——`lo = (fired + 1).max(…)` 在 `fired >= now_min` 时必然
+    /// `lo > now_min`，`lo..=now_min` 为空。原来那行 `if now_min <= fired { return false }`
+    /// 已按评审建议删除（它整段删除后全部用例照绿 ⇒ 不影响任何可观察行为，只误导读者）。
+    /// 本用例把那个性质钉在一个位置上：谁要是把 `lo` 算错（比如退回 `fired.max(…)`），
+    /// 这里立刻红。
+    #[test]
+    fn cron_not_claimed_at_or_before_fired_minute() {
+        let dir = temp_dir("fired-guard");
+        let nine = dt(2026, 8, 5, 9, 0).to_unix().div_euclid(60);
+        let s = store_at(&dir, &[cron_job("a", "* * * * *")], &[("a", nine)]);
+        assert_eq!(
+            s.claim_due(&dt(2026, 8, 5, 9, 0)).len(),
+            0,
+            "fired == now_min（本分钟已认领）不得再认领"
+        );
+        assert_eq!(
+            s.claim_due(&dt(2026, 8, 5, 8, 50)).len(),
+            0,
+            "时钟回拨（fired > now_min）不得去补已跑过的分钟点"
+        );
+        // 对照：时间正常前进一分钟必须认领——证明上面的 0 不是「表达式不匹配」造成的假绿。
+        assert_eq!(s.claim_due(&dt(2026, 8, 5, 9, 1)).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// once：认领即 at-most-once；下一次认领把它作为已完成项从定义表收走。
     #[test]
     fn once_is_claimed_at_most_once_and_then_retired() {
@@ -761,6 +817,57 @@ mod tests {
             1,
             "CLI 新增的任务要被认领到（计时账写盘不得覆盖定义）"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F1：计时账**写盘失败必须留痕**且不影响认领结果。
+    ///
+    /// 写不下去 ⇒ 重启后重跑本轮（cron 副作用可能是发消息/跑 agent/烧 token）；旧实现把
+    /// 「序列化 / 写盘 / rename」三层 `if let Ok` 静默套在一起，这种降级在日志里完全不可见。
+    /// 这里把目录权限改成 0o500 造真实写失败，钉两件事：
+    /// ① [`JobStore::try_save_state`] 返回 `Err`（失败被**识别到**，不是静默吞掉）；
+    /// ② `claim_due` 不得 panic、必须照常返回认领结果（告警不影响调度）。
+    /// 告警文案本身不过测（`crate::log!` 写 stdout，测试捕获不到）。
+    #[cfg(unix)]
+    #[test]
+    fn state_write_failure_is_loud_but_claim_still_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("state-readonly");
+        let s = store_at(&dir, &[cron_job("a", "0 9 * * *")], &[]);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // 探测权限是否真生效：root 无视目录权限位，那样本用例测不到「写失败」这一支。
+        if std::fs::write(dir.join(".probe"), "x").is_ok() {
+            let _ = std::fs::remove_file(dir.join(".probe"));
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+            eprintln!("跳过：当前用户可写只读目录（疑似 root），造不出写盘失败");
+            return;
+        }
+        let t = dt(2026, 8, 5, 9, 0);
+        let claimed = s.claim_due(&t);
+        // 关键断言（先于任何后续清理做）：失败必须被**识别到**。若实现退回「三层 if let Ok
+        // 静默吞掉」的旧写法，这一行会变成 Ok(()) 而立刻红——否则本用例就只能证明
+        // 「claim_due 不 panic」，而旧静默实现下同样成立（实测照绿），等于装饰。
+        let detected = s.try_save_state(&HashMap::new());
+        // 先恢复权限：否则后面任一条断言失败，清理步骤都会用一个次生错误把真因淡掉。
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = detected.expect_err("只读目录下的写盘失败必须返回 Err（不能静默）");
+        assert!(
+            err.to_string().contains("jobs-state.json.tmp"),
+            "错误上下文应带出失败的 tmp 路径（排障靠它），实得：{err}"
+        );
+        assert_eq!(claimed.len(), 1, "计时账写失败不得影响认领结果");
+        assert_eq!(claimed[0].id, "a");
+        // 盘上计时账仍是空的（写失败了）—— 重启场景下这就是「会重跑本轮」的直接证据
+        let on_disk = std::fs::read_to_string(dir.join("jobs-state.json")).unwrap();
+        assert!(
+            serde_json::from_str::<HashMap<String, i64>>(&on_disk)
+                .unwrap()
+                .is_empty(),
+            "写失败的计时账不应落盘，实得 {on_disk}"
+        );
+        // 但内存记账仍然生效：同一进程内同一分钟不重复认领
+        assert_eq!(s.claim_due(&t).len(), 0, "内存里的认领记账仍生效");
         std::fs::remove_dir_all(&dir).ok();
     }
 

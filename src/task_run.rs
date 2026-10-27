@@ -3166,18 +3166,23 @@ mod tests {
         );
         store.add(task.clone()).unwrap();
         let mut child = spawn_probe("while :; do sleep 1; done");
+        // 同 PID 但启动标记是**旧代际**：verify 必须判 Dead，不能误杀无关进程。
+        //
+        // fixture 用「真采集 + 篡改代际」而非写死的合成字符串，因为 `verify()` 现在会把
+        // **本代不认识的格式**（例如升级前 `ps -o lstart=` 落盘的老值）判成 `Unknown`
+        // 而不是 `Dead`（见 `task_identity::verify` 的迁移守门）。本用例要踩的是「代际
+        // 不同」这条判据，不是「无法核验」那条；后者会保留身份（按可能存活处理），
+        // 与这里的 `pid.is_none()` 断言是两回事。
+        let mut stale_identity =
+            crate::task_identity::capture(child.id()).expect("探针进程必须可采集代际身份");
+        stale_identity.start_token.push_str("-stale");
         states
             .set(
                 &task.id,
                 TaskRuntime {
                     kind: TaskStateKind::Running,
                     pid: Some(child.id()),
-                    // 同 PID 但启动标记/命令行是旧代际：verify 必须判 Dead，不能误杀无关进程。
-                    proc_identity: Some(crate::task_identity::ProcIdentity {
-                        pid: child.id(),
-                        start_token: "stale-start-token".into(),
-                        command_line: "stale-command".into(),
-                    }),
+                    proc_identity: Some(stale_identity),
                     started_at: Some(1),
                     ..Default::default()
                 },

@@ -674,18 +674,20 @@ fn write_agent_pids(bot_key: &str, pids: &[u32]) {
 
 /// 目标 pid 是否还是「本桥 spawn 的 agent」：存活且命令行匹配 claude/codex/pi。
 /// Windows 无 ps 语义，直接信任 pid 文件（taskkill /F）。
+///
+/// macOS 走 `proc_sysctl`（`KERN_PROCARGS2`）而不是 `/bin/ps`：后者是 **setuid root**，
+/// 执行层 sandbox-exec 下任何 setuid 二进制都 exec 不了（126 EPERM）⇒ 在沙箱里这个判据
+/// 会恒为 false，残留 agent 永远清不掉（卡 `abb-task-identity-setuid-20261028`）。
+/// argv 用 `\u{1f}` 连接，这里回填成空格再交给原有的子串/首 token 匹配，语义与 `ps` 一致。
 fn process_is_agent(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        let out = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "command="])
-            .output();
-        match out {
-            Ok(o) if o.status.success() => {
-                let cmd = String::from_utf8_lossy(&o.stdout);
+        let cmd = unix_process_command(pid);
+        match cmd {
+            Some(cmd) => {
                 cmd.contains("claude") || cmd.contains("codex") || pi_command_matches(&cmd)
             }
-            _ => false,
+            None => false,
         }
     }
     #[cfg(windows)]
@@ -693,6 +695,24 @@ fn process_is_agent(pid: u32) -> bool {
         let _ = pid;
         true
     }
+}
+
+/// 取进程命令行（已把 argv 分隔符回填为空格）。Linux / 其它 unix 仍用 `ps`（非 setuid，
+/// 行为与历史一致）；macOS 用原生 sysctl。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn unix_process_command(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn unix_process_command(pid: u32) -> Option<String> {
+    crate::proc_sysctl::command_line(pid).map(|cmd| cmd.replace('\u{1f}', " "))
 }
 
 /// pi 进程命令行匹配：npm 全局 bin 的 `pi` 是指向 cli.js 的软链，ps 显示的是解析后的
@@ -747,6 +767,26 @@ pub fn kill_stale_agents(bot_key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// macOS 上取命令行不得依赖 `/bin/ps`（setuid，沙箱内 exec 必失败）。
+    ///
+    /// 判别力：把 `unix_process_command` 换回 `ps`，在隔离沙箱里 `expect` 必红
+    /// （本仓单测就是在这种环境下跑的，卡 `abb-task-identity-setuid-20261028`）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_process_command_comes_from_sysctl_not_ps() {
+        let cmd = unix_process_command(std::process::id())
+            .expect("原生路径必须能读到本进程命令行（沙箱内 ps 不可用）");
+        assert!(!cmd.is_empty(), "命令行不得为空");
+        assert!(
+            !cmd.contains('\u{1f}'),
+            "argv 分隔符必须回填成空格，否则 pi 的首 token 匹配会失准：{cmd}"
+        );
+        assert!(
+            !process_is_agent(std::process::id()),
+            "测试二进制不是 claude/codex/pi，必须判否（防 pid 复用误杀）"
+        );
+    }
 
     /// 后处理纯函数：首个非空行（trim）；空输入/全空白 → 空串。
     #[test]

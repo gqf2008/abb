@@ -44,6 +44,8 @@ mod pending;
 mod permreq;
 mod platform;
 mod proc_group;
+#[cfg(target_os = "macos")]
+mod proc_sysctl;
 mod proto;
 mod redact;
 mod runtime;

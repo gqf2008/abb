@@ -115,14 +115,12 @@ fn pid_alive(pid: u32) -> bool {
 
 #[cfg(target_os = "macos")]
 fn is_zombie(pid: u32) -> bool {
-    // ps -o stat= -p pid，含 'Z' 即僵尸
-    std::process::Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.contains('Z'))
-        .unwrap_or(false)
+    // 旧实现是 `ps -o stat= -p pid`（含 'Z' 即僵尸）—— macOS 的 `/bin/ps` 是 **setuid root**，
+    // 而执行层 sandbox-exec 下任何 setuid 二进制都无法 exec（126 EPERM），于是这条判断在沙箱里
+    // 永远拿不到结果（卡 `abb-task-identity-setuid-20261028`）。改用 sysctl 原生查 `p_stat`：
+    // 不 exec、不依赖权限位，且**对僵尸也能查**（`proc_pidinfo` 对僵尸报 ESRCH，不可用）。
+    // 语义与旧实现逐字对齐：查不到 → false（不当僵尸），pid_alive 回落到 kill(0) 的结论。
+    crate::proc_sysctl::is_zombie(pid)
 }
 #[cfg(all(unix, not(target_os = "macos")))]
 fn is_zombie(pid: u32) -> bool {
