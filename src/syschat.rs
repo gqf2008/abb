@@ -4380,6 +4380,49 @@ mod tests {
         (SessionStore::new_at(base.clone()), base)
     }
 
+    /// B1 回归守卫（卡 `abb-proc-sysctl-nb-20261028`，评审 154 finding 5）：
+    /// `SessionStore::save` 必须用 uuid 唯一 tmp 名，不能预放符号链接。
+    ///
+    /// 为什么必须有这条：把 `save` 退回固定 `sessions.json.tmp` + `fs::write` 后，
+    /// 完整 `--bin agent-bridge` 套件（1360 条）**仍然全绿**——这个漏洞类的修复
+    /// 在 syschat / syschat_sched 上零回归覆盖，只有临时探针能抓到。此用例把它收进仓。
+    #[test]
+    fn session_store_save_does_not_follow_preseeded_symlink() {
+        let (store, base) = tmp_store("symlink-save");
+        std::fs::create_dir_all(&base).unwrap();
+        let victim = base.join("victim.txt");
+        std::fs::write(&victim, "ORIGINAL").unwrap();
+        // 旧实现会跟随这条链接（fs::write = O_CREAT|O_TRUNC）
+        std::os::unix::fs::symlink(&victim, base.join("sessions.json.tmp")).unwrap();
+
+        let mut st = store.load();
+        store.ensure_current(&mut st);
+        store.save(&st).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL",
+            "预置的 sessions.json.tmp 符号链接不得被跟随（否则工作区外文件被覆盖）"
+        );
+        // 真内容要落到位（不是靠“写失败”通过的）
+        assert!(
+            base.join("sessions.json").exists(),
+            "sessions.json 应正常落盘"
+        );
+        // 顺带钉住 0o600（旧代码显式 set_permissions，现在靠 atomic_write_sensitive）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(base.join("sessions.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "会话文件必须保持 0o600，实得 {mode:o}");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn session_store_new_list_switch_and_isolation() {
         let (store, base) = tmp_store("iso");

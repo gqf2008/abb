@@ -287,6 +287,28 @@ mod tests {
         (SchedStore::at(path.clone()), path)
     }
 
+    /// B1 回归守卫（卡 `abb-proc-sysctl-nb-20261028`，评审 154 finding 5）：
+    /// `save` 必须用 uuid 唯一 tmp 名。直接测模块内的 `save(path, data)`。
+    #[test]
+    fn save_does_not_follow_preseeded_symlink() {
+        let (_, path) = tmp_store("symlink-save");
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "ORIGINAL").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("scheduled.json.tmp")).unwrap();
+
+        save(&path, &[]);
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL",
+            "预置的 scheduled.json.tmp 符号链接不得被跟随"
+        );
+        assert!(path.exists(), "scheduled.json 应正常落盘");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 两个加分钟档：解析结果 = now + 偏移，且格式就是 once 任务的分钟粒度串。
     /// 判别力（负向）：把 `5 * 60` 写成 `5`（当秒用）⇒ 断言红。
     #[test]
