@@ -26,7 +26,7 @@ fi
 export CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}"
 
-(cd "$repo_root" && cargo test "$@")
+(cd "$repo_root" && cargo test --locked "$@")
 
 if [ -e "$tmp_home/.agent-bridge" ]; then
   files="$(find "$tmp_home/.agent-bridge" -type f -print | sort)"

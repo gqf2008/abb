@@ -367,8 +367,7 @@ mod tests {
     /// 探测：能读到时长与视频尺寸；坏文件/缺 ffprobe ⇒ `None`。
     #[test]
     fn probe_reads_duration_and_size() {
-        let dir = std::env::temp_dir().join(format!("abb-mediaplay-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testtmp::TempPath::new("abb-mediaplay");
         let Some(p) = make_sample(&dir) else {
             return; // 没有 ffmpeg：跳过（不是失败）
         };
@@ -376,14 +375,12 @@ mod tests {
         assert_eq!(info.video, Some((160, 120)));
         assert!((info.duration_ms as i64 - 1000).abs() < 300, "{info:?}");
         assert!(!probe(Path::new("/no/such/file.mp4")).is_some());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 海报：抽出首帧且**第二次命中缓存**（同路径同宽 ⇒ 同一个文件）。
     #[test]
     fn poster_is_extracted_and_cached() {
-        let dir = std::env::temp_dir().join(format!("abb-mediaplay-poster-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testtmp::TempPath::new("abb-mediaplay-poster");
         let Some(p) = make_sample(&dir) else {
             return;
         };
@@ -393,7 +390,6 @@ mod tests {
         let b = poster(&p, 96).expect("第二次应命中缓存");
         assert_eq!(a, b, "同一路径 + 同一宽 ⇒ 同一个缓存文件");
         assert!(first_len > 0);
-        let _ = std::fs::remove_dir_all(&dir);
         // 海报缓存落在 AGENT_BRIDGE_HOME 下；隔离门禁要求测试不留运行数据文件。
         let _ = std::fs::remove_file(&a);
     }
@@ -401,8 +397,7 @@ mod tests {
     /// 播放器：起播后能拿到帧，`stop()` 幂等且能再次起播。
     #[test]
     fn player_streams_frames_and_stops() {
-        let dir = std::env::temp_dir().join(format!("abb-mediaplay-play-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testtmp::TempPath::new("abb-mediaplay-play");
         let Some(p) = make_sample(&dir) else {
             return;
         };
@@ -428,6 +423,5 @@ mod tests {
         assert!(pl.position_ms() > 0);
         pl.stop();
         pl.stop(); // 幂等
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -108,7 +108,7 @@ mkdir -p "$CARGO_TARGET_DIR"
 cd "$repo_root"
 echo "== ABB 门禁（中间产物外置于 ${CARGO_TARGET_DIR}）=="
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked
 tools/check_test_isolation.sh
 # 兜底：清掉 TMPDIR 里陈旧的测试夹具（见脚本头注；根因修复在 src/testtmp.rs 的 RAII 归属）。
