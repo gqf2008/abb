@@ -2,14 +2,48 @@
 //! 自然语言由 claude --json-schema 解析成 Job{kind,time|cron,prompt}（见 bridge.rs 拦截逻辑），
 //! 本模块只负责：持久化（~/.agent-bridge/workspaces/<bot>/jobs.json）+ 判断「到点了吗/下次何时」。
 //! 不引 cron 解析依赖：标准 5 段中文 cron（分 时 日 月 周）手写求值，够用且可测。
+//!
+//! ## 定义与计时账分离（`jobs.json` / `jobs-state.json`）
+//!
+//! [`Job`] 是**定义**（谁来跑、跑什么），落在 `jobs.json`；「这一分钟已经认领过」是
+//! **运行态**，落在同目录的 `jobs-state.json`（`job_id → 上次认领的分钟点`）。
+//! 分两个文件是刻意的，与 `task_store` 的 `tasks.json` / `tasks-state.json` 同一口径：
+//!
+//! - CLI 在**别的进程**往 `jobs.json` 追加任务（本模块靠 mtime 热重载看到它），而计时账每
+//!   分钟都要写。合成一个文件就得「读-改-写」整表，两边并发写会互相覆盖——轻则丢一个刚
+//!   建的任务，重则把计时改回旧值导致重跑。
+//! - 计时账写失败只影响「重启后可能重跑一次」，不会污染用户的定义文件。
+//!
+//! ## 为什么计时账必须落盘
+//!
+//! 旧实现只靠调度循环内存里的 `last_min` + `running` 集合去重：进程重启就会把「本分钟已
+//! 触发过」忘掉 ⇒ 同一分钟内重启会**重跑一次**（cron 的副作用可能是发消息、跑 agent、烧
+//! token）。落盘后 [`JobStore::claim_due`] 是「认领即记账」：返回给调用方的任务已经记为
+//! 「这一分钟用掉了」，重启看不到重跑的窗口。
+//!
+//! 停摆之后怎么办：进程挂了几小时再起来，我们不重放整段历史（那会一次爆出成百上千轮），
+//! 而是**只补最近一次**错过的分钟点（[`CRON_CATCHUP_MAX_MINUTES`]，与 `task_run` 的
+//! `CRON_CATCHUP_WINDOW_SECS` = 48h 同量级）。补跑与首跑共用同一条认领路径，所以「补一轮」
+//! 之后同一轮内不会再补。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// 本地时区偏移（小时）。服务跑在 Asia/Shanghai（UTC+8），与 chrono_lite 一致。
 const TZ_OFFSET_SECS: i64 = 8 * 3600;
+
+/// cron 逾期补跑的扫描窗口（分钟）= 48 小时。
+///
+/// 与 `task_run::CRON_CATCHUP_WINDOW_SECS` 对齐：换句柄执行位的长任务会占住分钟点，进程
+/// 重启也会空过一段。窗口内的最近一个匹配分钟补跑一次；更早的不再追溯（否则一个
+/// `* * * * *` 任务在停机一天后要连续跑 1440 轮）。
+///
+/// 这个值也是「表达式永不命中」（如 `0 0 30 2 *`）时每个 tick 的扫描上界——2880 次纯整数
+/// 比较，微秒量级，且下一 tick 就因 `now_min <= fired` 短路。
+const CRON_CATCHUP_MAX_MINUTES: i64 = 48 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -54,9 +88,17 @@ pub struct Job {
 
 pub struct JobStore {
     path: PathBuf,
+    /// 计时账文件（`jobs-state.json`，与 `path` 同目录）。见模块文档「定义与计时账分离」。
+    state_path: PathBuf,
     data: Mutex<Vec<Job>>,
+    /// `job_id → 上次认领的分钟点`（unix 秒 / 60）。落盘于 [`JobStore::state_path`]。
+    ///
+    /// 「认领」而非「跑完」：`claim_due` 一返回就记账，所以执行中用尽轮次/崩溃都不会让
+    /// 同一分钟重跑。代价是「认领了但没跑成」会丢这一轮——与 `task_run` 的认领语义一致
+    /// （宁可少跑一次，不可重跑一次：cron 副作用可能是发消息/改文件）。
+    fired: Mutex<HashMap<String, i64>>,
     /// 上次加载 jobs.json 时的文件 mtime。CLI（codex）在另一进程往 jobs.json 写新任务，
-    /// service 内存里这份不会自动看到 → 这里在 due_jobs 前按 mtime 热重载，避免漏触发。
+    /// service 内存里这份不会自动看到 → 这里在 claim_due 前按 mtime 热重载，避免漏触发。
     loaded_mtime: Mutex<Option<std::time::SystemTime>>,
 }
 
@@ -71,10 +113,18 @@ impl JobStore {
         } else {
             Vec::new()
         };
+        // 计时账读失败按空表：最坏是「重启后可能重跑一次」——不能因此不启动调度。
+        let state_path = path.with_file_name("jobs-state.json");
+        let fired = fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<HashMap<String, i64>>(&t).ok())
+            .unwrap_or_default();
         let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         JobStore {
             path,
+            state_path,
             data: Mutex::new(data),
+            fired: Mutex::new(fired),
             loaded_mtime: Mutex::new(mtime),
         }
     }
@@ -105,6 +155,16 @@ impl JobStore {
         }
     }
 
+    /// 计时账落盘（原子替换）。写失败不影响本进程内的判定（内存已更新）。
+    fn save_state_locked(&self, fired: &HashMap<String, i64>) {
+        let tmp = self.state_path.with_extension("json.tmp");
+        if let Ok(text) = serde_json::to_string_pretty(fired) {
+            if fs::write(&tmp, text).is_ok() {
+                let _ = fs::rename(&tmp, &self.state_path);
+            }
+        }
+    }
+
     pub fn remove(&self, id: &str) -> bool {
         let mut d = self.data.lock().unwrap();
         let before = d.len();
@@ -113,20 +173,128 @@ impl JobStore {
         if changed {
             self.save_locked(&d);
         }
+        drop(d);
+        // 定义没了，计时账也不该留着（否则长跑服务里已删任务的键会永久堆积）。
+        let mut fired = self.fired.lock().unwrap();
+        if fired.remove(id).is_some() {
+            self.save_state_locked(&fired);
+        }
         changed
     }
 
-    /// 取出所有「现在已到点」的任务（once: time<=now；cron: 当前分钟匹配且非本分钟刚触发过）。
-    /// 调用方负责执行后对 once 任务 remove。
-    pub fn due_jobs(&self, now: &DateTime) -> Vec<Job> {
+    /// 认领此刻到点的任务（**认领即记账，返回值不要再拿 `is_due` 复核**）。
+    ///
+    /// 调用方负责执行后对 once 任务 remove；cron 任务留在表里，下一分钟重新判定。
+    ///
+    /// 记账所以必须在这里做（而不是在调用方）：判据是「这一分钟有没有用过」，而调用方
+    /// 是异步派发的——若把记账交给调用方，认领与记账之间的崩溃/重启窗口就能重跑一次。
+    ///
+    /// 顺带回收已跑过的 once 任务（[`is_retired_once`]）：以前靠 run_job 收尾 remove，
+    /// 中途崩掉的 once 任务会永久留在 jobs.json 里（现在它再也不会被认领，就变成僵尸项）。
+    pub fn claim_due(&self, now: &DateTime) -> Vec<Job> {
         self.refresh(); // 先按 mtime 热重载（CLI 可能在别进程加了新任务）
-        self.data
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|j| j.is_due(now))
-            .cloned()
-            .collect()
+        let now_min = now.to_unix().div_euclid(60);
+        let mut claimed = Vec::new();
+        let mut retired = Vec::new();
+        let mut fired = self.fired.lock().unwrap();
+        {
+            let mut jobs = self.data.lock().unwrap();
+            // 清掉已删任务的陈旧计时项：本函数是唯一写 entries 的地方。
+            if fired.keys().any(|id| !jobs.iter().any(|j| &j.id == id)) {
+                fired.retain(|id, _| jobs.iter().any(|j| &j.id == id));
+            }
+            for j in jobs.iter() {
+                // 先查「已完成的一轮性任务」：认证过一次就不再认领，且从定义表里收走。
+                // 顺序重要：必须在 claimable 前，否则 fired 落盘后就会永远停在表里。
+                if is_retired_once(j, fired.get(&j.id).copied()) {
+                    retired.push(j.id.clone());
+                    continue;
+                }
+                if !claimable(j, fired.get(&j.id).copied(), now, now_min) {
+                    continue;
+                }
+                fired.insert(j.id.clone(), now_min);
+                claimed.push(j.clone());
+            }
+            if !retired.is_empty() {
+                jobs.retain(|j| !retired.contains(&j.id));
+                self.save_locked(&jobs);
+            }
+        }
+        for id in &retired {
+            fired.remove(id);
+        }
+        if !claimed.is_empty() || !retired.is_empty() {
+            self.save_state_locked(&fired);
+        }
+        claimed
+    }
+}
+
+/// 一轮性任务是否「已跑过（或被认领过）」⇒ 可从定义表收走（纯函数，单测点）。
+///
+/// 语义是 **at-most-once**：一次性的提醒/动作宁可少跑一次，不可重跑（重跑意味着用户
+/// 收到两条一模一样的提醒，或是同一份改动的第二次应用）。旧实现在跑完才 remove，
+/// 认领与 remove 之间崩溃就会重跑——这就是本函数要堵的窗口。
+///
+/// 表达式非法时不收（`None`）：留给用户看见并修正，而不是默默清掉。
+fn is_retired_once(job: &Job, fired: Option<i64>) -> bool {
+    if job.kind != JobKind::Once {
+        return false;
+    }
+    let Some(t) = parse_once(&job.schedule) else {
+        return false;
+    };
+    let due_min = t.to_unix().div_euclid(60);
+    fired.is_some_and(|f| f >= due_min)
+}
+
+/// 该任务此刻可否被**认领**（纯函数，单测点）。
+///
+/// 与 [`Job::is_due`] 的区别：`is_due` 只回答「现在到点了吗」，是时间函数；本函数还看
+/// **计时账**（`fired`），是「这一分钟该不该真跑」的判据。之所以单独成函数而不是写进
+/// `claim_due` 的循环：循环里只能测「跑一遍看结果」，而这里的每条分支（首次/本分钟已认领/
+/// 补跑窗口/未到点）都能被直接钉住。
+///
+/// - `once`：到点且**没认领过**。`once` 不靠 remove 去重——调用方在跑完才 remove，
+///   中间崩溃/超时就会重跑；按 `due_min` 记账后，认领过一次就再也不认领。
+/// - `cron`：上次认领之后、到现在之间的区间里有一个匹配分钟（含当前）。扫 `now_min`
+///   往后最多 [`CRON_CATCHUP_MAX_MINUTES`]，找到就认领（补跑**一次**）；本轮认领后
+///   `fired = now_min`，所以同一轮内不会连续补多个。
+/// - `fired` 缺失（新任务或计时账丢失）：只看当前分钟，**不回溯**——否则刚建的
+///   `* * * * *` 会把 48 小时全补一遍。
+fn claimable(job: &Job, fired: Option<i64>, now: &DateTime, now_min: i64) -> bool {
+    match job.kind {
+        JobKind::Once => {
+            // 「到点」的定义复用 [`Job::is_due`]，不在这里重写一遍（重写就会与表达式
+            // 语义漂移：两个地方各判一次，改一处就静默不一致）。
+            if !job.is_due(now) {
+                return false;
+            }
+            let Some(t) = parse_once(&job.schedule) else {
+                return false;
+            };
+            let due_min = t.to_unix().div_euclid(60);
+            // 已认领过这个（或更晚的）分钟点 → 不重复
+            !fired.is_some_and(|f| f >= due_min)
+        }
+        JobKind::Cron => {
+            let Some(c) = CronExpr::parse(&job.schedule) else {
+                return false;
+            };
+            let Some(fired) = fired else {
+                // 首次（新任务 / 计时账丢失）：只看当前分钟，不回溯
+                return job.is_due(now);
+            };
+            if now_min <= fired {
+                return false; // 本分钟（或时钟回拨）已处理过
+            }
+            // 上一次认领之后的最近一次匹配（含当前分钟）。
+            let lo = (fired + 1).max(now_min - CRON_CATCHUP_MAX_MINUTES);
+            (lo..=now_min)
+                .rev()
+                .any(|m| c.matches(&DateTime::from_unix(m * 60)))
+        }
     }
 }
 
@@ -202,7 +370,12 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 impl Job {
-    /// 该任务在 `now` 是否到点。
+    /// 该任务在 `now` 是否到点（**纯时间判据，不含计时账**）。
+    ///
+    /// 只回答「现在是不是又到点了」；能不能真跑由 [`JobStore::claim_due`] 结合
+    /// 计时账决定。保留本函数是为了可独立单测 cron/once 的表达式语义，
+    /// 也可给「下次何时」类展示用——**但不要在调度循环里直接拿它筛任务**：
+    /// 它不知道这一分钟是不是已经跑过。
     pub fn is_due(&self, now: &DateTime) -> bool {
         match self.kind {
             JobKind::Once => match parse_once(&self.schedule) {
@@ -328,6 +501,7 @@ fn parse_field(s: &str, lo: u32, hi: u32) -> Option<Field> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn dt(y: i64, mo: u32, d: u32, h: u32, mi: u32) -> DateTime {
         parse_once(&format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")).unwrap()
@@ -415,6 +589,153 @@ mod tests {
         assert!(!j.is_due(&dt(2026, 8, 5, 8, 59)));
         assert!(j.is_due(&dt(2026, 8, 5, 9, 0)));
         assert!(j.is_due(&dt(2026, 8, 5, 9, 1)));
+    }
+
+    /// 测试用隔离根（绝不碰真实 HOME 下的 `~/.agent-bridge`）。
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("abb-sched-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn cron_job(id: &str, expr: &str) -> Job {
+        Job {
+            id: id.into(),
+            kind: JobKind::Cron,
+            schedule: expr.into(),
+            prompt: "p".into(),
+            chat_id: "oc_x".into(),
+            note: String::new(),
+            targets: Vec::new(),
+            role: crate::config::SenderRole::Owner,
+        }
+    }
+
+    fn once_job(id: &str, at: &str) -> Job {
+        Job {
+            id: id.into(),
+            kind: JobKind::Once,
+            schedule: at.into(),
+            prompt: "p".into(),
+            chat_id: "oc_x".into(),
+            note: String::new(),
+            targets: Vec::new(),
+            role: crate::config::SenderRole::Owner,
+        }
+    }
+
+    /// 写 jobs.json + （可选）种子计时账，再按生产路径构造 store。
+    fn store_at(dir: &std::path::Path, jobs: &[Job], fired: &[(&str, i64)]) -> JobStore {
+        let path = dir.join("jobs.json");
+        std::fs::write(&path, serde_json::to_string_pretty(jobs).unwrap()).unwrap();
+        let state: HashMap<String, i64> = fired.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        std::fs::write(
+            dir.join("jobs-state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        JobStore::at(path)
+    }
+
+    /// 同一分钟内重复认领必须为空（旧实现靠内存 `last_min`，重启就丢）。
+    #[test]
+    fn claim_is_idempotent_within_the_same_minute() {
+        let dir = temp_dir("same-min");
+        let s = store_at(&dir, &[cron_job("a", "0 9 * * *")], &[]);
+        let t = dt(2026, 8, 5, 9, 0);
+        assert_eq!(s.claim_due(&t).len(), 1, "到点应认领");
+        assert_eq!(s.claim_due(&t).len(), 0, "同一分钟不得重复认领");
+        // 模拟重启：计时账在盘上，所以新实例也不重跑
+        let s2 = JobStore::at(dir.join("jobs.json"));
+        assert_eq!(
+            s2.claim_due(&t).len(),
+            0,
+            "重启后同一分钟不得重跑（这就是落盘要解决的问题）"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 停机错过分钟点：恢复后**补跑一次**，且只补一次。
+    #[test]
+    fn cron_catches_up_one_missed_point_then_stops() {
+        let dir = temp_dir("catchup");
+        // 昨天 9:00 跑过（进程随后挂了），今天 9:10 才起来。
+        let yesterday9 = dt(2026, 8, 4, 9, 0).to_unix().div_euclid(60);
+        let s = store_at(&dir, &[cron_job("a", "0 9 * * *")], &[("a", yesterday9)]);
+        let t = dt(2026, 8, 5, 9, 10);
+        assert_eq!(s.claim_due(&t).len(), 1, "错过的 9:00 应补跑一次");
+        assert_eq!(s.claim_due(&t).len(), 0, "补跑不得在同一轮内重复");
+        assert_eq!(
+            s.claim_due(&dt(2026, 8, 5, 9, 11)).len(),
+            0,
+            "补跑后该分钟的其它时刻不再触发"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 新建任务**不得**回溯：否则刚建的 `* * * * *` 会把 48 小时全补一遍。
+    #[test]
+    fn new_job_never_backfills_history() {
+        let dir = temp_dir("no-backfill");
+        let s = store_at(&dir, &[cron_job("a", "0 9 * * *")], &[]);
+        assert_eq!(
+            s.claim_due(&dt(2026, 8, 5, 12, 0)).len(),
+            0,
+            "无计时账时只看当前分钟"
+        );
+        assert_eq!(s.claim_due(&dt(2026, 8, 5, 9, 0)).len(), 1, "到点才认领");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 高频表达式在停机后也只补一轮，不把整段窗口刷出来。
+    #[test]
+    fn every_minute_job_catches_up_only_once() {
+        let dir = temp_dir("every-min");
+        let nine = dt(2026, 8, 5, 9, 0).to_unix().div_euclid(60);
+        let s = store_at(&dir, &[cron_job("a", "* * * * *")], &[("a", nine)]);
+        assert_eq!(s.claim_due(&dt(2026, 8, 5, 9, 5)).len(), 1, "只补最近一轮");
+        assert_eq!(s.claim_due(&dt(2026, 8, 5, 9, 5)).len(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// once：认领即 at-most-once；下一次认领把它作为已完成项从定义表收走。
+    #[test]
+    fn once_is_claimed_at_most_once_and_then_retired() {
+        let dir = temp_dir("once");
+        let s = store_at(&dir, &[once_job("a", "2026-08-05 09:00")], &[]);
+        assert_eq!(s.claim_due(&dt(2026, 8, 5, 8, 59)).len(), 0, "未到点");
+        assert_eq!(s.claim_due(&dt(2026, 8, 5, 9, 5)).len(), 1, "过期仍补跑");
+        assert_eq!(
+            s.claim_due(&dt(2026, 8, 5, 9, 6)).len(),
+            0,
+            "已认领的 once 不得重跑（旧实现在 remove 前崩溃就会重跑）"
+        );
+        // 定义表已收走 → 重启也没了
+        let s2 = JobStore::at(dir.join("jobs.json"));
+        assert_eq!(s2.claim_due(&dt(2026, 8, 5, 9, 7)).len(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 计时账与定义分文件：写计时账不会把 CLI 新增的任务抹掉。
+    #[test]
+    fn state_write_does_not_clobber_jobs_file() {
+        let dir = temp_dir("sep");
+        let s = store_at(&dir, &[cron_job("a", "0 9 * * *")], &[]);
+        assert_eq!(s.claim_due(&dt(2026, 8, 5, 9, 0)).len(), 1);
+        // CLI 在另一进程追加任务（mtime 热重载路径）
+        let mut jobs = vec![cron_job("a", "0 9 * * *")];
+        jobs.push(cron_job("b", "0 10 * * *"));
+        std::fs::write(
+            dir.join("jobs.json"),
+            serde_json::to_string_pretty(&jobs).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            s.claim_due(&dt(2026, 8, 5, 10, 0)).len(),
+            1,
+            "CLI 新增的任务要被认领到（计时账写盘不得覆盖定义）"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

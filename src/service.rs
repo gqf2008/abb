@@ -1022,7 +1022,9 @@ async fn run_bot(
                     continue;
                 }
                 last_min = Some(min_key);
-                let due = bridge.jobs.due_jobs(&now);
+                // 认领（不是「查询」）：返回即记账落盘，所以同分钟内重启不会重跑。
+                // 被认领但本轮跳过的（上一轮还没跑完）也算用掉这一分钟——与旧行为一致。
+                let due = bridge.jobs.claim_due(&now);
                 for job in due {
                     {
                         let mut r = running.lock().unwrap();

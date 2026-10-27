@@ -421,8 +421,8 @@ fn check_file_paths(tool: &str, input: &serde_json::Value, workspace: &Path) -> 
 }
 
 /// 桥状态/指令文件判定（文件名 + 路径组件，大小写不敏感——macOS 文件系统不区分大小写）：
-/// - 文件名命中清单：jobs.json / pending.json / sessions.json / CLAUDE.md / AGENTS.md /
-///   .mcp.json（`sub/../jobs.json` 式穿越由 file_name 取最终文件名天然覆盖）
+/// - 文件名命中清单：jobs.json / jobs-state.json / pending.json / sessions.json /
+///   CLAUDE.md / AGENTS.md / .mcp.json（`sub/../jobs.json` 式穿越由 file_name 取最终文件名天然覆盖）
 /// - 迁移标记族按**前缀** `jobs.json.migrated` 拦截（覆盖 `jobs.json.migrated` 与
 ///   `jobs.json.migrated.bak`）：标记是「已迁移、旧 job 循环不启动」的执行时信任凭据，
 ///   落在 agent 自己的工作区，受限会话 Write 一个出来就能让该 bot 旧 job 静默搁浅
@@ -452,6 +452,11 @@ fn is_bridge_state_path(p: &str) -> bool {
         if matches!(
             name.as_str(),
             "jobs.json"
+                // 定时任务的**计时账**（`job_id → 上次认领的分钟点`）。与 jobs.json 同属桥执行
+                // 状态：能写它就能把某任务抬成「已跑过」而**静默啕掉一条定时任务**
+                // （拒用式攻击，且无任何日志线索）；反之把条目删掉可诱发重复执行。
+                // 只禁写不禁读（与 jobs.json 同口径）。
+                | "jobs-state.json"
                 | "pending.json"
                 | "sessions.json"
                 | "claude.md"
@@ -1922,6 +1927,42 @@ mod tests {
             check_file_paths(
                 "Write",
                 &serde_json::json!({"file_path": "sub/../jobs.json"}),
+                &ws
+            ),
+            Decision::Allow
+        );
+        // 计时账（jobs-state.json）：写它可把任务抬成「已跑过」而静默啕掉一轮，
+        // 或删条目诱发重跑——与 jobs.json 同等禁写。
+        assert_ne!(
+            check_file_paths(
+                "Write",
+                &serde_json::json!({"file_path": "jobs-state.json"}),
+                &ws
+            ),
+            Decision::Allow
+        );
+        assert_ne!(
+            check_file_paths(
+                "Edit",
+                &serde_json::json!({"file_path": "./jobs-state.json"}),
+                &ws
+            ),
+            Decision::Allow
+        );
+        // 大小写变体同禁（macOS 文件系统不区分大小写）
+        assert_ne!(
+            check_file_paths(
+                "Write",
+                &serde_json::json!({"file_path": "JOBS-STATE.JSON"}),
+                &ws
+            ),
+            Decision::Allow
+        );
+        // 读允许（与 jobs.json 同口径：只禁写不禁读）
+        assert_eq!(
+            check_file_paths(
+                "Read",
+                &serde_json::json!({"file_path": "jobs-state.json"}),
                 &ws
             ),
             Decision::Allow
