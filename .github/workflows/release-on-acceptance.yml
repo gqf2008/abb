@@ -58,9 +58,12 @@ jobs:
             echo "❌ tag v$NEW_VER 已存在，请检查版本号"; exit 1
           fi
           sed -i "s/^version = \"$VER\"/version = \"$NEW_VER\"/" Cargo.toml
+          # 同步 Cargo.lock 的根包版本：只改 Cargo.toml 会让 lock 停在旧版本，
+          # v3.2.0 / v3.2.2 两个 tag 就是这样漂移的（从 tag 跑 --locked 直接失败）。
+          cargo metadata --format-version 1 >/dev/null
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
-          git add Cargo.toml
+          git add Cargo.toml Cargo.lock
           git commit -m "chore(release): v$NEW_VER — 验收通过发版；验收说明: $ACCEPTANCE"
           git tag "v$NEW_VER"
           git push origin main
