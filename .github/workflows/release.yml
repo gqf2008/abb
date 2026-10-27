@@ -395,6 +395,13 @@ jobs:
             -f tag_name="${{ github.ref_name }}" -f target_commitish="${{ github.sha }}" \
             -q '.body' > /tmp/notes-generated.md
           printf '%s\n' '> ⚠️ **macOS 版仅支持 Apple Silicon（M 系列，arm64）**；Intel Mac 请勿下载。' | cat - /tmp/notes-generated.md > /tmp/notes-final.md
+          # 进程身份代际格式变更的不可回滚声明（卡 abb-proc-sysctl-nb-20261028 NB-4）：
+          # `ProcIdentity.start_token` 从 `ps -o lstart=` 文本换成了 `macos-<sec>.<usec>`。
+          # 新版本落盘后若回滚到 3.2.3 及更早，旧二进制会拿两种格式逐字比对 ⇒ 判 Dead ⇒
+          # 重拉 keepalive，而旧代际进程（setsid 独立进程组）可能仍活着 ⇒ 双实例，
+          # 重复投递/重复计费。新代码已在 verify() 里把未知格式判 Unknown 挡住正向路径，
+          # 但旧代码读不懂新格式，反向只能靠这条声明。
+          printf '%s\n' '> ⛔ **升级后请勿回滚到 v3.2.3 及更早版本**：进程身份格式已变更，回滚会导致 keepalive 任务出现双实例（重复投递/重复计费）。' | cat - /tmp/notes-final.md > /tmp/notes-with-rollback.md && mv /tmp/notes-with-rollback.md /tmp/notes-final.md
 
       - uses: softprops/action-gh-release@v2
         with:

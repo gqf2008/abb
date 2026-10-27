@@ -258,16 +258,17 @@ fn read_list(path: &Path) -> Vec<ScheduledMsg> {
         .unwrap_or_default()
 }
 
-/// 原子落盘（tmp + rename），与 `schedule.rs::save_locked` 同款。
+/// 原子落盘（uuid 唯一 tmp + rename），与 `schedule.rs::save_locked` 同款。
+///
+/// 卡 `abb-proc-sysctl-nb-20261028` NB-3：固定 `*.json.tmp` 会被 `fs::write`
+/// （O_CREAT|O_TRUNC）**跟随符号链接**——受限会话预放一条链接就能让本函数覆盖工作区
+/// 外的真实文件。改用 uuid tmp 名后预放不可预测。
 fn save(path: &Path, data: &[ScheduledMsg]) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let tmp = path.with_extension("json.tmp");
     if let Ok(text) = serde_json::to_string_pretty(data) {
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
+        let _ = crate::atomic_write_text(path, &text);
     }
 }
 

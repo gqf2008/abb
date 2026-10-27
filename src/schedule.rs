@@ -713,6 +713,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// NB-3 的另一半（评审 N2）：`save_locked`（定义文件）与 `try_save_state`（计时账）
+    /// 是两条独立的写入路径，只测一条不能证明另一条也安全。这里命中 `save_locked`：
+    /// 预放 `jobs.json.tmp` 符号链接，再用 `remove` 触发一次定义表落盘。
+    #[test]
+    fn save_locked_does_not_follow_preseeded_symlink() {
+        let dir = temp_dir("symlink-jobs");
+        let victim = dir.join("victim2.txt");
+        std::fs::write(&victim, "ORIGINAL").unwrap();
+        let evil_tmp = dir.join("jobs.json.tmp");
+        std::os::unix::fs::symlink(&victim, &evil_tmp).unwrap();
+
+        let s = store_at(
+            &dir,
+            &[cron_job("a", "0 9 * * *"), cron_job("b", "0 10 * * *")],
+            &[],
+        );
+        // remove 走 save_locked（定义表真的变了）——不是空写。
+        assert!(s.remove("b"), "删掉一个任务以触发 save_locked");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL",
+            "预置的 jobs.json.tmp 符号链接不得被跟随"
+        );
+        let on_disk = std::fs::read_to_string(dir.join("jobs.json")).unwrap();
+        assert!(on_disk.contains("\"a\""), "定义表应正常落盘：{on_disk}");
+        assert!(!on_disk.contains("\"b\""), "被删的任务不应还在：{on_disk}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// NB-1（卡 `abb-proc-sysctl-nb-20261028`）：计时账里的 `fired` 是**磁盘数据**，
     /// 不是本进程算出来的不变量。异常值（`i64::MAX` / `i64::MAX - 1`）不得让调度循环
     /// panic，也不得 wrap 成负数后重复认领。

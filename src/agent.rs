@@ -799,15 +799,18 @@ mod tests {
     /// NB-2，评审指出）。本用例与 `--skip` 滤器无关，怎么写都稳定。
     #[test]
     fn command_is_agent_matches_agents_and_rejects_others() {
-        // 正侧：三种后端都必须判是（含 argv 中间带 claude 的情形——真实测试 harness 就这样）
+        // 正侧：三种后端都必须判是。
+        // 注意 pi 这例**不能**带 claude/codex 字样——否则 `contains("claude")` 先命中，
+        // `pi_command_matches` 分支实际没被验到（评审 N1 变异实测：删掉 pi 分支仍绿）。
         assert!(command_is_agent(
             "/Users/x/.npm-global/bin/claude --dangerously-skip-permissions"
         ));
         assert!(command_is_agent(
             "/usr/bin/node /usr/lib/codex/cli.js serve"
         ));
+        assert!(command_is_agent("/Users/x/.local/bin/pi -p hi"));
         assert!(command_is_agent(
-            "/Users/x/.local/bin/pi -p --skip claude_heal_on_first_round_writes_no_pending"
+            "/usr/local/bin/node /Users/x/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js -p"
         ));
         // 反侧：无关进程（这条不靠 argv，靠合成串）
         assert!(!command_is_agent("/bin/bash -c 'echo ABB_KEEPALIVE_1'"));

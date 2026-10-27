@@ -136,7 +136,13 @@ fn rename_replace_retry(tmp: &std::path::Path, path: &std::path::Path) -> std::i
 /// #170：rename 覆盖目标被占用时（os error 5）走 `rename_replace_retry` 短暂重试。
 pub fn atomic_write_text(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
-    std::fs::write(&tmp, text)?;
+    // 写失败也要清残留（评审 N3）：`?` 直接返回会让一个「建了但没写进内容」的 tmp
+    // 永久留在目录里。频率极低，但定时任务每分钟写一次、失败若持续就能堆起来，
+    // 而 tmp 名带 uuid、tidy 的 `.tmp.<纯数字>` 规则和 guard 的 `.tmp` 剪尾都不认它。
+    if let Err(e) = std::fs::write(&tmp, text) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     match rename_replace_retry(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {

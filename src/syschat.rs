@@ -221,18 +221,12 @@ impl SessionStore {
 
     fn save(&self, state: &SessionState) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.base)?;
-        let tmp = self.state_path().with_extension("json.tmp");
-        std::fs::write(
-            &tmp,
-            serde_json::to_string_pretty(state).unwrap_or_default(),
-        )?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp, self.state_path())?;
-        Ok(())
+        // 用 uuid 唯一 tmp 名的共享原子写（卡 `abb-proc-sysctl-nb-20261028` NB-3）：
+        // 固定 `syschat.json.tmp` 会被 `fs::write`（O_CREAT|O_TRUNC）**跟随符号链接**，
+        // 受限会话预放一条链接就能让本函数覆盖工作区外的真实文件。
+        // 与 `schedule.rs` 同一修法；0o600 由 `atomic_write_sensitive` 保证。
+        let text = serde_json::to_string_pretty(state).unwrap_or_default();
+        crate::atomic_write_sensitive(&self.state_path(), &text)
     }
 
     /// 保证「至少一个会话、current 有效」；改动过返回 true。首次还把旧版单会话历史迁入默认会话。
