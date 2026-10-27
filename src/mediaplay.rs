@@ -394,6 +394,8 @@ mod tests {
         assert_eq!(a, b, "同一路径 + 同一宽 ⇒ 同一个缓存文件");
         assert!(first_len > 0);
         let _ = std::fs::remove_dir_all(&dir);
+        // 海报缓存落在 AGENT_BRIDGE_HOME 下；隔离门禁要求测试不留运行数据文件。
+        let _ = std::fs::remove_file(&a);
     }
 
     /// 播放器：起播后能拿到帧，`stop()` 幂等且能再次起播。
