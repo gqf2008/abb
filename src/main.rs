@@ -171,13 +171,31 @@ pub fn atomic_write_text_if_changed(path: &std::path::Path, text: &str) -> std::
 /// 文件；0o600 对齐 config.json 的敏感工件权限（历史/迁移标记等对话内容）。
 /// 失败时清理残留 tmp（历史.rs 的 write_entries/set_marker 与 sessions.rs save_locked
 /// 原先各自手写此模式，收敛为共享实现）。
+///
+/// **chmod 失败的取舍（知情决定，卡 `abb-symlink-hardening-20261028`）**：`chmod(0o600)`
+/// 失败会**返回 Err**（不像旧 `syschat::save` 那样 `let _ =` 忽略）。代价：在 chmod
+/// 不可用的挂载上（`AGENT_BRIDGE_HOME` 指到 SMB / exFAT 之类）以前能落盘、现在会失败。
+/// 选择放在「失败」这一侧的理由：本函数用于敏感内容（对话历史 / 迁移标记 / 会话槽位），
+/// 写下一个所有人可读的文件比写失败更坏——“写不进去”是用户能看见并修的故障，
+/// “静默换成 0644”不是。
+///
+/// **每个失败分支都要清 tmp**：`fs::write` / `set_permissions` / `rename` 任一处失败
+/// 都删掉 `tmp.<uuid>`，否则会永久残留——而 `src/tidy.rs` 的临时文件规则只认 `.tmp`
+/// 与 `.tmp.<纯数字>`（那个“纯数字”约束是为了不误删 `notes.tmp.md` 这类用户文档名），
+/// **不认 uuid 后缀**，残留就没人清。
 pub fn atomic_write_sensitive(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
-    std::fs::write(&tmp, text)?;
+    if let Err(e) = std::fs::write(&tmp, text) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
     match rename_replace_retry(&tmp, path) {
         Ok(()) => Ok(()),

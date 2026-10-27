@@ -173,10 +173,12 @@ fn write_chat_json(
     if matches!(std::fs::read_to_string(&path), Ok(have) if have == want) {
         return;
     }
-    let tmp = dir.join(".chat.json.tmp");
-    if std::fs::write(&tmp, want.as_bytes()).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    // 用 uuid 唯一 tmp 名的共享原子写（卡 `abb-symlink-hardening-20261028`）：
+    // 固定 `.chat.json.tmp` + `fs::write`（O_CREAT|O_TRUNC）**会跟随符号链接**，
+    // 而这个目录就在**工作区内**（`workspace_dir(bot_key).join(dir_name(chat_id))`）——
+    // 是同一修复类里可达性最高的一处。受限会话当前无 `ln`/`cp`/`mv` 所以无实操通路，
+    // 但这是「白名单没开口」而非「结构上不可能」。
+    let _ = crate::atomic_write_text(&path, &want);
 }
 
 /// fnv64 → 8 位小写十六进制。命名空间含 `chat_id`（`bot_key` 已在父目录里，不必重复）。
@@ -374,6 +376,37 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("chat.json")).unwrap()).unwrap();
         assert_eq!(v["thread_id"], "t2");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 卡 `abb-symlink-hardening-20261028`：`chat.json` 的原子写不得跟随预置符号链接。
+    ///
+    /// 这个目录就在**工作区内**（`workspace_dir(bot_key).join(dir_name(chat_id))`），
+    /// 是同一漏洞类里可达性最高的一处。旧实现用固定 `.chat.json.tmp` + `fs::write`
+    /// （O_CREAT|O_TRUNC，会跟随链接）⇒ 预放 `→ 工作区外文件` 就能让桥下次写 chat.json
+    /// 时覆盖它。改用 uuid 唯一 tmp 名后预放不可预测。
+    #[cfg(unix)]
+    #[test]
+    fn chat_json_write_does_not_follow_preseeded_symlink() {
+        let tmp = std::env::temp_dir().join(format!("abb-chandir-sym-{}", uuid::Uuid::new_v4()));
+        let dir = tmp.join("oc_sym");
+        let _ = std::fs::create_dir_all(&dir);
+        let victim = tmp.join("victim.txt");
+        std::fs::write(&victim, "ORIGINAL").unwrap();
+        // 旧实现的固定中间名
+        std::os::unix::fs::symlink(&victim, dir.join(".chat.json.tmp")).unwrap();
+
+        ensure_channel_dir_at(&dir, "bot_a", "oc_sym", "group", None);
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL",
+            "预置的 .chat.json.tmp 符号链接不得被跟随，否则工作区外文件被覆盖"
+        );
+        // 真内容要落到位（不是靠写失败通过的）
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("chat.json")).unwrap()).unwrap();
+        assert_eq!(v["chat_id"], "oc_sym", "chat.json 应正常落盘");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

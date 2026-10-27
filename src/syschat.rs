@@ -2810,9 +2810,10 @@ fn drop_turns_from_locked(store: &SessionStore, from: usize) -> Result<usize, St
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("建目录失败：{e}"))?;
     }
-    let tmp = path.with_extension("jsonl.tmp");
-    std::fs::write(&tmp, buf.as_bytes()).map_err(|e| format!("写入历史失败：{e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("落盘历史失败：{e}"))?;
+    // uuid 唯一 tmp 名（卡 `abb-symlink-hardening-20261028`）：与同文件 `save` 统一。
+    // 原来固定 `*.jsonl.tmp` + `fs::write` 会跟随符号链接；同一文件里并列两种写法
+    // 会让读者误以为 syschat 已收口。
+    crate::atomic_write_text(&path, &buf).map_err(|e| format!("落盘历史失败：{e}"))?;
     Ok(dropped)
 }
 
@@ -4372,6 +4373,46 @@ mod tests {
         assert_eq!(derive_title("  hello\nworld  "), "hello world");
         assert_eq!(derive_title("   "), "新会话");
         assert_eq!(derive_title(&"字".repeat(40)).chars().count(), 24);
+    }
+
+    /// 卡 `abb-symlink-hardening-20261028`：历史重写（`drop_turns_from_locked`）的原子写
+    /// 也必须用 uuid 唯一 tmp 名。
+    ///
+    /// 为什么单独立一条：它和 `save` 是**两个独立写入路径**，之前只有 `save` 被覆盖；
+    /// 把本处退回固定 `*.jsonl.tmp` + `fs::write` 后，整个 `syschat::` 套件（127 条）
+    /// 仍全绿——实测确认。
+    #[cfg(unix)]
+    #[test]
+    fn drop_turns_does_not_follow_preseeded_symlink() {
+        let (store, base) = tmp_store("symlink-drop");
+        std::fs::create_dir_all(&base).unwrap();
+        let mut st = store.load();
+        store.ensure_current(&mut st);
+        // 必须先把状态落盘：`drop_turns_from_locked` 内部会重新 `load()` 并
+        // `ensure_current`，不落盘会生成一个新的 current id，我 append 的历史就落在
+        // 另一个 id 上（实测得到 dropped=0）。
+        store.save(&st).unwrap();
+        let id = st.current.clone();
+        store
+            .append_turns(&id, &[turn_of("user", "a"), turn_of("assistant", "b")])
+            .unwrap();
+
+        // 历史文件路径（与实现里的 `store.history_path(&id)` 同源），预放固定中间名。
+        let hist = store.history_path(&id);
+        let victim = base.join("victim.txt");
+        std::fs::write(&victim, "ORIGINAL").unwrap();
+        std::os::unix::fs::symlink(&victim, hist.with_extension("jsonl.tmp")).unwrap();
+
+        let dropped = drop_turns_from_locked(&store, 0).expect("截断应成功");
+        assert!(dropped > 0, "应真的截掉几轮：{dropped}");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "ORIGINAL",
+            "预置的 *.jsonl.tmp 符号链接不得被跟随"
+        );
+        assert!(hist.exists(), "历史文件应正常落盘");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     fn tmp_store(tag: &str) -> (SessionStore, std::path::PathBuf) {

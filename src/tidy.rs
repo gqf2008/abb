@@ -49,6 +49,29 @@ const STRUCTURE_DIRS: [&str; 9] = [
 ];
 /// 根目录临时/垃圾文件后缀（小写比较；.tmp.* 形态单独匹配）。
 const TEMP_SUFFIXES: [&str; 3] = [".tmp", ".swp", ".bak"];
+
+/// 纯数字串（非空）——`core.<pid>` / `file.tmp.123` 的 pid 形态。
+fn is_all_digits(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
+/// 是否标准 uuid 形态：`8-4-4-4-12` 十六进制（带横线）或 32 位无横线（`simple()`）。
+///
+/// 卡 `abb-symlink-hardening-20261028`：`atomic_write_*` 用 `tmp.<uuid>` 作原子写中间名；
+/// 只认这两种严格形态，所以 `notes.tmp.abc` / `backup.bak.v2` 这类用户文件名不会被误删。
+fn is_uuid_like(s: &str) -> bool {
+    let hex = |c: char| c.is_ascii_hexdigit();
+    if s.len() == 32 {
+        return s.chars().all(hex);
+    }
+    if s.len() != 36 {
+        return false;
+    }
+    s.char_indices().all(|(i, c)| match i {
+        8 | 13 | 18 | 23 => c == '-',
+        _ => hex(c),
+    })
+}
 /// 文档归档扩展名白名单（小写）。
 const DOC_EXTS: [&str; 8] = ["md", "txt", "docx", "pdf", "csv", "xlsx", "pptx", "rtf"];
 /// 根目录指令文件：永不归档（bot 级指引 / 受限记忆文件，桥会注入它们）。
@@ -176,10 +199,16 @@ fn collect_temp_files(workspace: &Path, now_secs: u64) -> Vec<std::path::PathBuf
                 // 用户文档名，子串匹配会永久误删（审查修复；与 core.<pid> 同规则）。
                 name.ends_with(s)
                     || name.find(&format!("{s}.")).is_some_and(|i| {
-                        // 后缀必须非空纯数字（同 core.<pid> 规则；"x.tmp." 尾部带点
-                        // 空串 all() 恒真会误删——审查修复）
+                        // 后缀必须非空且是**纯数字**或 **uuid**（同 core.<pid> 规则；
+                        // "x.tmp." 尾部带点空串 all() 恒真会误删——审查修复）。
+                        //
+                        // uuid 分支是卡 `abb-symlink-hardening-20261028` 补的：
+                        // `atomic_write_text` / `atomic_write_sensitive` 用
+                        // `tmp.<uuid>` 作原子写的中间名，残留时旧规则清不掉，会永久堆积。
+                        // 只认标准 uuid 形态（8-4-4-4-12 十六进制、可带 simple 无横线变体），
+                        // 所以 "notes.tmp.abc" 这类用户文档名仍不会被误删。
                         let suffix = &name[i + s.len() + 1..];
-                        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+                        !suffix.is_empty() && (is_all_digits(suffix) || is_uuid_like(suffix))
                     })
             });
         if !is_temp {
@@ -406,6 +435,12 @@ mod tests {
             ".DS_Store",
             "core",
             "core.1234",
+            // 卡 `abb-symlink-hardening-20261028`：原子写的中间名 `tmp.<uuid>` 必须被清，
+            // 否则写失败后的残留永远无人回收（tidy 旧规则只认纯数字后缀）。
+            // 带横线（with_extension 会在末尾追加，故常见于 `.json.tmp.<uuid>` 形态）
+            // 与 simple() 无横线两种都要认得。
+            "jobs.json.tmp.1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+            "sessions.json.tmp.1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
         ] {
             std::fs::write(ws.join(f), "x").unwrap();
             // 命中的必须是超 24h mtime 护栏的（活着的编辑器临时文件不删）
@@ -427,6 +462,10 @@ mod tests {
             "a.tmp.notes.md",
             "core.",
             "a.tmp.",
+            // uuid 规则只认严格形态：非十六进制 / 长度不对的“类 uuid”仍是用户文件名
+            "notes.tmp.abc",
+            "report.tmp.2026-11-01",
+            "backup.bak.v2",
         ] {
             std::fs::write(ws.join(f), "x").unwrap();
             set_mtime_old(&ws.join(f), ORPHAN_FRESH_SECS + 60); // 拨旧：误删只发生在超龄分支
@@ -454,6 +493,8 @@ mod tests {
             ".DS_Store",
             "core",
             "core.1234",
+            "jobs.json.tmp.1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+            "sessions.json.tmp.1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
         ]
         .iter()
         .map(|s| s.to_string())
