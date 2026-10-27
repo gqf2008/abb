@@ -29,7 +29,8 @@
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$repo_root"
+script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+cd "$repo_root" || exit 2
 
 mode="scan"
 json=0
@@ -44,9 +45,6 @@ while [ $# -gt 0 ]; do
 done
 
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "check_collab_parents: 不是 git 仓库" >&2; exit 2; }
-
-refs=$(git for-each-ref --format='%(objectname)' refs/collab/inbox 2>/dev/null)
-[ -n "$refs" ] || { echo "check_collab_parents: refs/collab/inbox 为空（没有协作条目）" >&2; exit 2; }
 
 # 单条检查：输出「状态<TAB>说明」；状态为 ok / bad。
 check_one() {
@@ -120,8 +118,51 @@ if need:
 for r in rows:
     print("%s\t%s\t%s" % r)
 print("--TOTAL--\t%d" % total, file=sys.stderr)
-' 2> >(grep -o '[0-9]*' > /tmp/ccp_total) 
+' 2>/dev/null
   return 0
+}
+
+# 用隔离仓库跑 scan()/输出全链路：不碰本仓 refs。
+scan_self_test() {
+  local tmp bad=0
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/ccp-selftest.XXXXXX") || { echo "  ❌ mktemp 失败"; return 1; }
+  mkdir -p "$tmp/tools"
+  cp "$script_path" "$tmp/tools/check_collab_parents.sh"
+  (
+    cd "$tmp" || exit 1
+    git init -q .
+    root=$(printf '{"id":"t","kind":"issue","parent":""}' | git hash-object -w --stdin)
+    ok=$(printf '{"id":"t","kind":"comment","parent":"%s"}' "$root" | git hash-object -w --stdin)
+    shape=$(printf '{"id":"t","kind":"comment","parent":"PLACEHOLDER"}' | git hash-object -w --stdin)
+    missing=$(printf '{"id":"t","kind":"comment","parent":"7a41f9095e2f4a2b8e9c3d7b1a2e8c4d9f6a0b3c"}' | git hash-object -w --stdin)
+    git update-ref refs/collab/inbox/0001-root "$root"
+    git update-ref refs/collab/inbox/0002-ok "$ok"
+    git update-ref refs/collab/inbox/0003-shape "$shape"
+    git update-ref refs/collab/inbox/0004-missing "$missing"
+  ) >/dev/null 2>&1
+  local text json tstatus jstatus tcount jcount
+  text=$(bash "$tmp/tools/check_collab_parents.sh" 2>/dev/null); tstatus=$?
+  json=$(bash "$tmp/tools/check_collab_parents.sh" --json 2>/dev/null); jstatus=$?
+  tcount=$(printf '%s\n' "$text" | grep -cE '^  [0-9a-f]{10}' || true)
+  jcount=$(printf '%s\n' "$json" | grep -c '"entry"' || true)
+  if [ "$tstatus" -eq 1 ] && [ "$jstatus" -eq 1 ] && [ "$tcount" -eq 2 ] && [ "$jcount" -eq 2 ]; then
+    echo "  ✅ 扫描路径（坏形态 + 末行 missing）⇒ exit 1，文本/JSON 均 2 条"
+  else
+    echo "  ❌ 扫描路径：text exit=$tstatus/$tcount 条，json exit=$jstatus/$jcount 条（期望各 1/2）"
+    bad=1
+  fi
+  # 阳性对照：全合规仓库必须 exit 0（防「恒红」）
+  ( cd "$tmp" && git update-ref -d refs/collab/inbox/0003-shape && git update-ref -d refs/collab/inbox/0004-missing ) >/dev/null 2>&1
+  local okstatus
+  bash "$tmp/tools/check_collab_parents.sh" >/dev/null 2>&1; okstatus=$?
+  if [ "$okstatus" -eq 0 ]; then
+    echo "  ✅ 扫描路径（全合规仓库）⇒ exit 0"
+  else
+    echo "  ❌ 扫描路径（全合规仓库）被误判为异常（exit=$okstatus）"
+    bad=1
+  fi
+  rm -rf "$tmp"
+  return "$bad"
 }
 
 case "$mode" in
@@ -136,23 +177,34 @@ case "$mode" in
       esac
     done
     # 阳性对照：真实存在的完整 oid 必须判 ok（否则守卫会误报一切）
-    real=$(git rev-parse "$(git for-each-ref --format='%(objectname)' refs/collab/inbox | head -1)")
-    res=$(check_one "$real")
-    case "$res" in
-      ok*) echo "  ✅ 阳性对照（真实 oid）⇒ ok" ;;
-      *) echo "  ❌ 阳性对照被误判为异常（守卫会误报一切）"; fail=1 ;;
-    esac
+    real=$(git for-each-ref --format='%(objectname)' refs/collab/inbox | head -1)
+    [ -n "$real" ] || real=$(git rev-parse HEAD 2>/dev/null)
+    if [ -z "$real" ]; then
+      echo "  ❌ 阳性对照：仓库里没有任何对象可用（无协作条目、无 HEAD）"
+      fail=1
+    else
+      res=$(check_one "$real")
+      case "$res" in
+        ok*) echo "  ✅ 阳性对照（真实 oid）⇒ ok" ;;
+        *) echo "  ❌ 阳性对照被误判为异常（守卫会误报一切）"; fail=1 ;;
+      esac
+    fi
     # 根节点（空 parent）必须放行
     res=$(check_one "")
     case "$res" in
       ok*) echo "  ✅ 根节点（空 parent）⇒ ok" ;;
       *) echo "  ❌ 根节点被误判"; fail=1 ;;
     esac
+    # 扫描路径自测：上面的 check_one 只验单条判据，验不到 scan()/输出这一层。
+    # 曾因此漏掉「文本模式吞末行」（28 vs 29 两条路给出不同答案）。
+    scan_self_test || fail=1
     [ "$fail" -eq 0 ] && { echo "── 自测通过"; exit 0; }
     echo "── 自测失败"; exit 1
     ;;
 
   scan)
+    refs=$(git for-each-ref --format='%(objectname)' refs/collab/inbox 2>/dev/null)
+    [ -n "$refs" ] || { echo "check_collab_parents: refs/collab/inbox 为空（没有协作条目）" >&2; exit 2; }
     if [ "$json" -eq 1 ]; then
       # **只扫一次**：原写法先管道给 python 再调 scan >/dev/null 跑第二遍，
       # 3781 条 × 每条 2 个 git 子进程 ⇒ 单次数分钟，`--json` 直接超时。
@@ -168,7 +220,7 @@ print(json.dumps({"bad": [{"entry": r[0], "reason": r[1], "parent": r[2]} for r 
     # scan() 恒 return 0（它只产出异常行）；「有没有异常」由**输出是否为空**决定。
     [ -n "$rows" ] && status=1 || status=0
     if [ -n "$rows" ]; then
-      printf '%s' "$rows" | while IFS=$'\t' read -r entry reason parent; do
+      printf '%s\n' "$rows" | while IFS=$'\t' read -r entry reason parent; do
         [ -z "$entry" ] && continue
         printf '  %s  %-8s parent=%s\n' "$entry" "$reason" "$parent"
       done
