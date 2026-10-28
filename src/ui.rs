@@ -729,6 +729,12 @@ const BLUR_HIDE_DELAY_MS: u64 = 120;
 ///    （跑 `run_gui` 会触发自启自愈、改用户真实的 `~/Library/LaunchAgents/`）。
 ///
 /// `timer` 由调用方持有并保活（drop 即取消）；单槽：`start` 会覆盖上一次待执行的隐藏。
+///
+/// `app_active` 是**注入的**进程激活态读取口（生产传 `platform::app_is_active`）。为什么是
+/// 「取一次的函数」而不是「一个 bool」：`[NSApp isActive]` 必须**在延时之后**才读——blur 回调
+/// 里同步读永远为真（见 [`BLUR_HIDE_DELAY_MS`]），提前求值会让 macOS 的失焦隐藏永不触发。
+/// 注入点因此落在「延时后那一拍」：这个函数怎么取值与平台无关，平台差异只剩调用方传进来的
+/// 那一个函数（非 macOS 恒 `true`），**不引入任何代码路径分支**。
 fn handle_syschat_focus_event(
     ev: &slint::winit_030::winit::event::WindowEvent,
     timer: &slint::Timer,
@@ -736,6 +742,7 @@ fn handle_syschat_focus_event(
     bubble: &slint::Weak<AnchorBubble>,
     settings: &slint::Weak<SettingsWindow>,
     speaker: &Rc<RefCell<platform::Speaker>>,
+    app_active: impl Fn() -> bool + 'static,
 ) -> bool {
     let slint::winit_030::winit::event::WindowEvent::Focused(focused) = ev else {
         return false;
@@ -760,7 +767,7 @@ fn handle_syschat_focus_event(
             // 让 §1 的 debug 探针窗在别的 app 抢焦点时仍留在屏上，供人工/合成拖拽取证。
             // 判据函数本身不动（D5 的口径与单测照旧），这里只是在外面加一道开关。
             if std::env::var("ABB_VERIFY_KEEP_VISIBLE").is_err()
-                && should_hide_on_blur(w.window().is_visible(), platform::app_is_active())
+                && should_hide_on_blur(w.window().is_visible(), app_active())
             {
                 hide_syschat(&w, &bwp, &swp, &spp);
             }
@@ -9536,7 +9543,16 @@ pub fn run_gui() -> Result<()> {
             // D5：**失焦即隐藏**（接线在 [`handle_syschat_focus_event`]，那里有判据/延时的完整理由）。
             // ⚠️ 必须挂在这个**已有**的钩子上：`on_winit_window_event` 是单槽 `set`，
             // 另起一个会把 ⌘V / Finder 拖放 / 红点关闭整条顶掉（且不会报错）。
-            handle_syschat_focus_event(ev, &blur_timer, &cw2, &bw_close2, &sw2, &sp_hook);
+            //    `app_active` 传真实探针（读取发生在延时之后，见该函数注释）。
+            handle_syschat_focus_event(
+                ev,
+                &blur_timer,
+                &cw2,
+                &bw_close2,
+                &sw2,
+                &sp_hook,
+                platform::app_is_active,
+            );
             // Windows：圆角 SetWindowRgn 硬裁剪（与设置窗同半径）；其它平台空操作。
             handle_platform_window_event(w, ev);
             EventResult::Propagate
@@ -11296,10 +11312,18 @@ mod tests {
             "对话窗的 winit 事件钩子是单槽 set：只能有一个（D5 的失焦隐藏必须并进那一个）"
         );
         assert!(
-            prod.contains(
-                "should_hide_on_blur(w.window().is_visible(), platform::app_is_active())"
-            ),
+            prod.contains("should_hide_on_blur(w.window().is_visible(), app_active())"),
             "失焦隐藏应走判据函数（`should_hide_on_blur`）而不是就地写条件"
+        );
+        // 激活态必须**注入**进来（延时后才读）：写死成 `platform::app_is_active()` 就又回到
+        // 「测试没法注入」的局面，`app_is_active` 就再也无法在 Windows 上把延时链跑起来。
+        assert!(
+            prod.contains("app_active: impl Fn() -> bool + 'static"),
+            "激活态要从调用边界注入（`app_active: impl Fn() -> bool`）"
+        );
+        assert!(
+            prod.contains("platform::app_is_active,"),
+            "生产调用点必须把真实探针 `platform::app_is_active` 传进去"
         );
     }
 

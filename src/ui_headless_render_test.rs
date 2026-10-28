@@ -1829,18 +1829,20 @@ fn settings_self_managed_hit_zones_route_press_with_pointer_coords() {
     );
 }
 
-/// D5 端到端：`Focused(false)` → 延时 → 判定「焦点已离开本进程」→ 窗口真的被隐藏。
+/// D5 端到端（**真实平台集成层**）：`Focused(false)` → 延时 → 判定「焦点已离开本进程」→ 窗口真的被隐藏。
 ///
 /// 为什么能在无头环境里跑整条链：本进程（`cargo test` 的测试二进制）不是一个激活态的 App，
 /// `platform::app_is_active()` 会返回 `false`（实测：`[NSApp isActive]` 在测试进程里为 false，
 /// 且调用安全——`sharedApplication` 只取单例，不起 UI），所以「失焦 ⇒ 应隐藏」这一支在测试里
 /// 就是**正面路径**；反面（焦点还在本进程 ⇒ 不隐藏）由 `ui::tests::blur_hide_*` 的纯函数用例覆盖。
 ///
-/// **只在 macOS 跑**：非 macOS 的 `platform::app_is_active()` 恒 `true`（Windows 的焦点概念
-/// 落在窗口上，D5 的「失焦 ⇒ 隐藏」是 macOS 焦点/Dock 语义的需求，不在 Windows 引入新行为），
-/// 所以整条链在 Windows 上**按设计**永不触发——这不是可以靠换替身朗读进程修好的。
-/// Windows 侧覆盖：判据由 `ui::tests::blur_hide_*` 三条纯函数用例跨平台兜底；「隐藏 ⇒ 停朗读 +
-/// 复位状态」由 `hide_syschat_stops_speaker_and_resets_state`（下方，跨平台）兜底。
+/// **还在 macOS 跑，但它现在只兜「真实 AppKit 集成」这一层**（真 `[NSApp isActive]` + 真 AppKit
+/// 单例真的给出 false）。延时的**时序链**本身已不再靠它覆盖：`app_active` 从环境读取改成了
+/// 注入参数（见 `ui::handle_syschat_focus_event`），`blur_*` 那几条跨平台用例在两侧都跑完整条链。
+/// Windows 侧之所以原先只能跳过：非 macOS 的 `platform::app_is_active()` 恒 `true`（Windows 的焦点
+/// 概念落在窗口上，D5 的「失焦 ⇒ 隐藏」是 macOS 焦点/Dock 语义的需求，不在 Windows 引入新行为），
+/// 所以「读真实探针」这条路在 Windows 上**按设计**永不触发——那不是换替身能修好的，而是**注入点**
+/// 该往上提一层的地方。
 ///
 /// 依赖真实墙钟：延时常量 `BLUR_HIDE_DELAY_MS` 变了本用例自动跟随（多睡 3 倍再判定），
 /// 不用固定 sleep 去猜实现细节（同 `LESSON_节流类测试断言须随真实墙钟缩放`）。
@@ -1873,6 +1875,8 @@ fn blur_hides_dialog_window_end_to_end() {
             &empty_bubble,
             &empty_settings,
             &speaker,
+            // 本用例验的就是**真实**探针：不注入替身。
+            crate::platform::app_is_active,
         ),
         "Focused(false) 应被失焦隐藏接线消费"
     );
@@ -1885,6 +1889,7 @@ fn blur_hides_dialog_window_end_to_end() {
         &empty_bubble,
         &empty_settings,
         &speaker,
+        crate::platform::app_is_active,
     );
     std::thread::sleep(std::time::Duration::from_millis(
         super::BLUR_HIDE_DELAY_MS * 3,
@@ -1907,6 +1912,7 @@ fn blur_hides_dialog_window_end_to_end() {
         &empty_bubble,
         &empty_settings,
         &speaker,
+        crate::platform::app_is_active,
     );
     std::thread::sleep(std::time::Duration::from_millis(
         super::BLUR_HIDE_DELAY_MS * 3,
@@ -1930,22 +1936,195 @@ fn blur_hides_dialog_window_end_to_end() {
     let _ = win;
 }
 
+// ─────── 失焦延时链的**跨平台**覆盖（卡 `abb-blur-delay-injectable-20261028`）───────
+//
+// 为什么这才叫覆盖：上面那条 e2e 验的是「**真实** AppKit 探针真的能给出 false」（macOS 专属的
+// 「真平台集成」那层）。而「事件 ⇒ 延时 ⇒ 判据 ⇒ 隐藏」这条**时序链**与 AppKit 无关，它原本
+// 只能在 macOS 跑，纯粋是因为 `app_is_active()` 是个写死的环境读取。现在激活态是注入参数，
+// 下面四条在 **macOS 与 Windows 上跑的是同一段生产代码**（无平台分支，只是注入值不同）。
+
+/// 失焦延时链的搭台：可见的对话窗 + 空的气泡/设置窗弱引用 + 空朗读器（不 spawn 任何进程）。
+///
+/// 这四条判据只看「窗口最终是否可见」与「激活态探针何时/是否被调」，不需要真朗读器；
+/// 朗读副作用归 [`hide_syschat_stops_speaker_and_resets_state`] 与 macOS e2e 管。
+struct BlurHarness {
+    ui: SystemChatWindow,
+    timer: slint::Timer,
+    cw: slint::Weak<SystemChatWindow>,
+    bubble: slint::Weak<AnchorBubble>,
+    settings: slint::Weak<SettingsWindow>,
+    speaker: Rc<RefCell<crate::platform::Speaker>>,
+}
+
+fn blur_harness() -> BlurHarness {
+    let (ui, win, _) = setup(vec![row("p", "占位")], SHORT_H);
+    assert!(ui.window().is_visible(), "前置控制失败：窗口没 show 上");
+    let _ = win;
+    let cw = ui.as_weak();
+    BlurHarness {
+        ui,
+        timer: slint::Timer::default(),
+        cw,
+        bubble: slint::Weak::default(),
+        settings: slint::Weak::default(),
+        speaker: Rc::new(RefCell::new(crate::platform::Speaker::new())),
+    }
+}
+
+impl BlurHarness {
+    /// 把 `Focused(focused)` 送进**生产**函数（`ui::handle_syschat_focus_event`），
+    /// 激活态由调用方注入。返回「事件是否被失焦隐藏接线消费」。
+    fn focus(&self, focused: bool, app_active: impl Fn() -> bool + 'static) -> bool {
+        let ev = slint::winit_030::winit::event::WindowEvent::Focused(focused);
+        super::handle_syschat_focus_event(
+            &ev,
+            &self.timer,
+            &self.cw,
+            &self.bubble,
+            &self.settings,
+            &self.speaker,
+            app_active,
+        )
+    }
+
+    /// 「延时到」：睡 `BLUR_HIDE_DELAY_MS` 的 **3 倍**再让定时器跑一拍。
+    /// 断言一律跟随这个常量缩放，不用固定 sleep 去猜实现细节
+    ///（同 `LESSON_节流类测试断言须随真实墙钟缩放`）。
+    fn wait_past_delay(&self) {
+        std::thread::sleep(Duration::from_millis(super::BLUR_HIDE_DELAY_MS * 3));
+        slint::platform::update_timers_and_animations();
+    }
+
+    /// 「同一拍」：不睡，只让定时器跑一拍（延时**未到**的那一侧）。
+    fn tick_now(&self) {
+        slint::platform::update_timers_and_animations();
+    }
+}
+
+/// (a) 失焦 + 进程已失活 ⇒ 延时到后**隐藏**（两侧都跑）。
+///
+/// 判别力：把判据里的 `!app_active` 取反（变成「活跃才隐藏」）⇒ 本用例红。
+#[test]
+fn blur_hides_after_delay_when_process_inactive() {
+    let h = blur_harness();
+    assert!(
+        h.focus(false, || false),
+        "Focused(false) 应被失焦隐藏接线消费"
+    );
+    h.wait_past_delay();
+    assert!(
+        !h.ui.window().is_visible(),
+        "注入「进程已失活」后，延时到点仍没隐藏：失焦隐藏的延时/判定链断了"
+    );
+}
+
+/// (b) 失焦但进程**仍活跃** ⇒ 不隐藏（两侧都跑）。
+///
+/// 同时钉住「判定真的跑到了」：只断言「窗口还可见」分不清「判据说别藏」与「整条链压根没跑」
+///（后者也可见），所以数探针被调用的次数。
+///
+/// 判别力：把判据里的 `!app_active` 取反 ⇒ 本用例红（活跃时反而藏）；把定时器那半段删掉
+///（不再排延时隐藏）⇒ 探针调用计数变 0，本用例红。
+#[test]
+fn blur_keeps_window_when_process_still_active() {
+    let h = blur_harness();
+    let calls = Rc::new(Cell::new(0u32));
+    let calls2 = calls.clone();
+    assert!(
+        h.focus(false, move || {
+            calls2.set(calls2.get() + 1);
+            true
+        }),
+        "Focused(false) 应被失焦隐藏接线消费"
+    );
+    h.wait_past_delay();
+    assert_eq!(
+        calls.get(),
+        1,
+        "延时后的判定没跑到（激活态探针调用次数应为 1）：本条的「可见」不算证据"
+    );
+    assert!(
+        h.ui.window().is_visible(),
+        "焦点还在本进程内（进程仍活跃）时不该隐藏：点/拖气泡会把对话框藏掉"
+    );
+}
+
+/// (c) 延时**未到** ⇒ 不隐藏（两侧都跑）；同时给一个正面对照，证明它不是「永不隐藏」的假绿。
+///
+/// 判别力：把 `BLUR_HIDE_DELAY_MS` 改成 0（或删掉 `timer.start` 的延时）⇒ 第一段断言红
+///（同一拍就把窗口藏掉了）。
+#[test]
+fn blur_does_not_hide_before_delay_elapses() {
+    let h = blur_harness();
+    assert!(
+        h.focus(false, || false),
+        "Focused(false) 应被失焦隐藏接线消费"
+    );
+    h.tick_now();
+    assert!(
+        h.ui.window().is_visible(),
+        "延时未到就隐藏了：`BLUR_HIDE_DELAY_MS` 的时序（等 AppKit 那一拍）被抹掉了"
+    );
+    h.wait_past_delay();
+    assert!(
+        !h.ui.window().is_visible(),
+        "正面对照：延时到点后必须隐藏（否则上面那条「未到不隐藏」只是恒真假绿）"
+    );
+}
+
+/// 延时链的**顺序**语义：激活态探针必须在延时**之后**才被读取（两侧都跑）。
+///
+/// 为什么单列一条：`bool` 参数能让 (a)(b)(c) 全绿，但它把读取提前到了 blur 回调里——而
+/// `[NSApp isActive]` 在那一刻**恒为 true**（`applicationDidResignActive:` 还没发），
+/// macOS 的失焦隐藏就永不触发。这正是 `BLUR_HIDE_DELAY_MS` 存在的全部理由，
+/// 所以「什么时候读」与「读到什么」同等重要，两者各钉一条。
+#[test]
+fn blur_hide_reads_app_active_after_delay() {
+    let h = blur_harness();
+    let t0 = std::time::Instant::now();
+    let seen = Rc::new(Cell::new(None));
+    let seen2 = seen.clone();
+    assert!(
+        h.focus(false, move || {
+            seen2.set(Some(t0.elapsed()));
+            false
+        }),
+        "Focused(false) 应被失焦隐藏接线消费"
+    );
+    h.wait_past_delay();
+    let elapsed = seen
+        .get()
+        .expect("激活态探针从未被调用：延时后的判定那一拍没跑到");
+    assert!(
+        elapsed >= Duration::from_millis(super::BLUR_HIDE_DELAY_MS),
+        "激活态在延时之前就被读了（{elapsed:?} < {}ms）：生产上会读到「还激活着」⇒ 失焦隐藏永不触发",
+        super::BLUR_HIDE_DELAY_MS
+    );
+    assert!(
+        !h.ui.window().is_visible(),
+        "正面对照：本条注入「已失活」，延时到点应隐藏"
+    );
+}
+
 /// 跨平台：`hide_syschat` 的副作用（停朗读 / 复位朗读态 / 隐藏窗口）**不依赖**失焦语义。
 ///
-/// 为什么需要：失焦隐藏在 Windows 上按设计永不触发（`platform::app_is_active()` 恒 `true`），
-/// 所以 `blur_hides_dialog_window_end_to_end` 只在 macOS 跑。本用例直接调 `hide_syschat`，
-/// 不需要焦点/定时器，也不需要真实朗读器（只说一个替身进程），给 Windows 侧兜住「隐藏 ⇒ 朗读停掉」这条链。
+/// 为什么需要：它验的是「隐藏 ⇒ 朗读停掉」这条**副作用**链，不碰焦点/定时器/真 AppKit。
+///（失焦的**时序链**已由上面四条 `blur_*` 跨平台用例覆盖，不再需要靠本用例凑覆盖。）
 ///
 /// 替身朗读：Windows 没有 `/bin/sleep`，也不能 `spawn_with("ping", "-n 30 127.0.0.1")`——
 /// `spawn_with` 只传一个 argv，ping 会把带空格的一整串当畸形选项立刻退出（2026-10-28 本机实测）；
 /// `cmd /c ping …` 作为单 argv 才能挂住。代价是 `kill(cmd)` 不连带杀 ping（本机实测），它会自己
-/// 跑完——次数取 5（≈4s）收短尾巴。
+/// 跑完——次数取 3（≈2s）收短尾巴。
+///
+/// **失败模式叮嘱**：要是这条替身起不来，报的是上面那句
+/// 「前置控制失败：起不了替身朗读进程」而不是下面的断言——所以看到它红，先查替身进程
+///（`/bin/sleep` / `cmd` 是否可执行、argv 形状是否被接受），不要先去读「朗读没停」的断言。
 #[test]
 fn hide_syschat_stops_speaker_and_resets_state() {
     let (ui, win, _) = setup(vec![row("p", "占位")], SHORT_H);
     assert!(ui.window().is_visible(), "前置控制失败：窗口没 show 上");
     let (dummy_prog, dummy_arg) = if cfg!(windows) {
-        ("cmd", "/c ping -n 5 127.0.0.1")
+        ("cmd", "/c ping -n 3 127.0.0.1")
     } else {
         ("/bin/sleep", "30")
     };
