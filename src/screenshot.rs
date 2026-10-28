@@ -16,7 +16,12 @@
 //! PNG 头校验 [`looks_like_png`] / 引导文案 [`permission_guidance`] / 临时文件名 [`temp_png_path`]。
 //! 真正「按下去能截到图」要在真机上肉眼验（合成点击打不进 app，见交接文档 §1）——**未验**。
 
-use std::path::{Path, PathBuf};
+// `Path` 只被 macOS 专属的 capture_args / interpret（及其单测）用；非 macOS 下
+// 只有 `PathBuf` 被 Outcome::Captured 持有。条件导入避免 windows clippy 的
+// `unused_imports`（v3.2.4 CI 最后一条）。
+#[cfg(target_os = "macos")]
+use std::path::Path;
+use std::path::PathBuf;
 
 /// 功能区那颗钮传给 Rust 的功能名（`ui/app.slint` 的 `composer-todo("截图")`）。
 /// 两边逐字一致才能落到截屏分支（有守卫测试钉住）。
