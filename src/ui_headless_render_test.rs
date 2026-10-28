@@ -317,6 +317,121 @@ fn settle_w(window: &Rc<MinimalSoftwareWindow>, w: u32, h: u32) -> Frame {
     Frame { buf, w, h }
 }
 
+// ---------------------------------------------------------------------------
+// 字形可画性探针（卡 `abb-render-font-glyph-sensitivity-20261028`）
+// ---------------------------------------------------------------------------
+//
+// 背景：渲染类断言（v11 面板的 ✓、v10 的墨迹包围盒、chart 的 `ink_groups`）都读「像素上有
+// 没有墨迹」。而「环境字体链缺这个字形」与「布局/颜色坏了」在像素上是**同一个现象**——
+// 都是没有墨迹。于是同一份代码在 CI 绿、在某人机器上必红，红的样子却像是代码坏了：
+// 作者本机（Windows 10，默认字体链不含 U+2713）就是这样，而同一提交在 windows-latest 与
+// macOS 全绿。修法不是给断言放水，而是**先问环境能不能画，再断言我们画了没有**——
+// 顺序照搬 `crates/abb-chart` 的逐字符覆盖校验（`docs/upstream-charton-raster-font-findings.md`）。
+
+/// 变异自验开关：把列出的字形当作「本机画不出」。
+///
+/// 为什么要有它：`glyph_ink_probe` 的负结果只出现在**真的缺该字形**的机器上，而本仓的
+/// 开发机（macOS）与 CI（windows-latest）默认都能画 ✓——那条分支于是就没人跑过，等于把
+/// 一条门禁交给没人验证的逻辑。开关让它在任何机器上可复跑（也方便复现「用户报红」）：
+///
+/// ```text
+/// ABB_TEST_ASSUME_MISSING_GLYPH=2713            # 十六进制码位（可写 u+2713）
+/// ABB_TEST_ASSUME_MISSING_GLYPH=✓,2714          # 直接写字符也行；逗号分隔多个
+/// ```
+fn forcibly_missing_glyph(ch: char) -> bool {
+    let Ok(spec) = std::env::var("ABB_TEST_ASSUME_MISSING_GLYPH") else {
+        return false;
+    };
+    spec.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .any(|tag| {
+            let hex = tag
+                .strip_prefix("u+")
+                .or_else(|| tag.strip_prefix("U+"))
+                .unwrap_or(tag);
+            match u32::from_str_radix(hex, 16) {
+                // 能当十六进制读就按码位比（`2713`），读不了就按字面字符比（`✓`）。
+                Ok(cp) => cp == ch as u32,
+                Err(_) => tag == ch.to_string(),
+            }
+        })
+}
+
+/// 判据（纯函数，便于直接测）：对照字符有墨迹、目标字符 0 墨迹 ⇒ 缺字形；对照也没墨迹 ⇒
+/// 渲染通路坏了（**不许**记成「缺字形」，否则真正的渲染白屏会被这条探针掩盖）。
+fn classify_glyph_ink(control: usize, target: usize, ch: char) -> Result<(), String> {
+    assert!(
+        control > 0,
+        "渲染通路坏了：对照字符 `M` 在消息区也是 0 墨迹 ⇒ 先查渲染后端 / 布局，不要记成缺字形"
+    );
+    if target > 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "默认字体链画不出 `{ch}`（U+{:04X}）：同一条文字栈里 ASCII `M` 有 {control} 像素墨迹、\
+         它 0 像素 ⇒ 环境缺这个字形，不是布局 bug",
+        ch as u32
+    ))
+}
+
+/// 走**同一条文字栈**（Slint → parley/fontique → 系统字体）渲一个只含该字符的段落，数消息区
+/// 里的暗像素。`p` 行是纯文本块，默认字体族与 v11 面板的 ✓ 相同（都没指名字体）。
+fn glyph_ink_probe(ch: char) -> usize {
+    let (ui, win, _m) = setup(vec![row("p", &ch.to_string())], SHORT_H);
+    let _ = settle_w(&win, W, SHORT_H);
+    let f = settle_w(&win, W, SHORT_H);
+    let y0 = ui.get_dbg_flick_y().round().max(0.0) as u32;
+    let h = ui.get_dbg_flick_h().round().max(0.0) as u32;
+    let mut n = 0;
+    for y in y0..(y0 + h).min(f.h) {
+        for x in 4..W - 4 {
+            if is_dark(f.px(x, y)) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// 这个字形在本机能画吗？能 ⇒ `Ok(())`（调用方的像素断言照跑）；不能 ⇒ `Err(原因)`（调用方
+/// **大声跳过那一条**断言，其余照跑）。
+fn glyph_drawable(ch: char) -> Result<(), String> {
+    if forcibly_missing_glyph(ch) {
+        return Err(format!(
+            "`{ch}`（U+{:04X}）被 `ABB_TEST_ASSUME_MISSING_GLYPH` 标记为缺字形（变异自验开关）",
+            ch as u32
+        ));
+    }
+    classify_glyph_ink(glyph_ink_probe('M'), glyph_ink_probe(ch), ch)
+}
+
+/// 严格模式（`CI` 或 `ABB_TEST_NO_SKIP` 存在）下「缺字形」不再跳过，而是**直接红**。
+///
+/// 为什么必须有它：`eprintln!` 在**通过**的用例里会被 libtest 捕获（不加 `--nocapture`
+/// 根本看不到），所以「大声跳过」在本机其实只剩一句得靠人加参数才看得见的话。CI 是最不能
+/// 无声放水的地方（那里的字体是已知的：macOS 与 windows-latest 都能画 ✓），于是 CI 一律严格：
+/// 缺字形 ⇒ 红、逼人来看；本机（字体因人而异）才允许带明确理由跳过。
+fn strict_no_skip() -> bool {
+    std::env::var_os("CI").is_some() || std::env::var_os("ABB_TEST_NO_SKIP").is_some()
+}
+
+/// 缺字形时的处置（`strict` 由 [`strict_no_skip`] 给，形参化是为了能直接测两个分支）：
+/// 严格 ⇒ panic（门禁不得无声变绿）；宽松 ⇒ 返回要打到 stderr 的跳过说明。
+fn glyph_skip_notice(what: &str, why: &str, strict: bool) -> String {
+    assert!(
+        !strict,
+        "{what} 的像素断言需要该字形，但环境画不出，而当前是严格模式（CI / ABB_TEST_NO_SKIP）：\
+         {why}\n\
+         （若确属 CI 镜像字体变化，请把它当成环境变更处理，而不是让门禁静默变绿）"
+    );
+    format!(
+        "[skip] {what} 的像素断言未执行（环境不满足）：{why}\n\
+         [skip] 其余断言照跑；在这台机器上复跑这条跳过：\
+         ABB_TEST_ASSUME_MISSING_GLYPH=2713 cargo test -- --nocapture"
+    )
+}
+
 /// 一段会换行的长中文正文（约 6 行）。
 const LONG: &str = "这是一段会换行的长正文，用来把消息区撑高：怹在本机读写文件、执行命令，\
 并把结果贴回这个对话框里，供你继续追问；重复若干次以制造多行高度。";
@@ -2406,18 +2521,34 @@ fn v11_panels_anchor_and_usage_meter_match_design() {
         "模型面板 accent 行 = 锚点 + padding2 + 标题28（第 1 行）"
     );
     // 当前模型行**不再有右侧 provider**（右侧留给 ✓）——✓ 是墨色，故该行右侧应有墨迹。
-    assert!(
-        bbox(
-            &f2,
-            mxx as u32 + 200,
-            myy as u32 + 30,
-            mxx as u32 + 248,
-            myy as u32 + 60,
-            is_dark
-        )
-        .is_some(),
-        "当前项右侧没有 ✓（或右侧 tag 未清空）"
-    );
+    //
+    // 前提校验（卡 `abb-render-font-glyph-sensitivity-20261028`）：这条断言的真前提是
+    // 「环境字体能画出 U+2713」。缺该字形的机器（实测：Windows 10 中文默认字体链）上它必红，
+    // 而红的样子与「布局/颜色坏了」**完全一样**（都没有墨迹）——下一个人会先查代码。
+    // 所以先探针：画不出就**大声跳过这一条**（说明跳过了什么、如何复现），其余断言照跑；
+    // 画得出则照原样断言，任何「我们的 UI 把 ✓ 画没了」的回归**照旧必红**。
+    match glyph_drawable('✓') {
+        Ok(()) => {
+            assert!(
+                bbox(
+                    &f2,
+                    mxx as u32 + 200,
+                    myy as u32 + 30,
+                    mxx as u32 + 248,
+                    myy as u32 + 60,
+                    is_dark
+                )
+                .is_some(),
+                "当前项右侧没有 ✓（或右侧 tag 未清空）"
+            );
+        }
+        Err(why) => {
+            eprintln!(
+                "{}",
+                glyph_skip_notice("v11 面板的「当前项 ✓」", &why, strict_no_skip())
+            );
+        }
+    }
 
     // ④ 用量条结构（稿 `.tok` + `.meter`）：56×9；E3 之前无数据源 ⇒ 内条 0 宽。
     ui.set_model_menu_open(false);
@@ -4211,5 +4342,88 @@ fn send_button_default_label_is_chinese() {
         ui.get_dbg_send_text(),
         "⏹ 停止",
         "生成中的按钮文案不该被 `send-label` 影响"
+    );
+}
+
+// --- 字形可画性探针的自测（卡 `abb-render-font-glyph-sensitivity-20261028`）--------------
+// 为什么这几条必须有：探针本身是一段**替门禁做决定**的逻辑——它说「缺字形」就跳过断言。
+// 没人验证的判官等于给门禁留了一扇隐形后门，所以三个结局（有墨迹 / 缺字形 / 渲染通路坏）
+// 各自钉一条。
+
+/// 判据三分：都有墨迹 ⇒ 可画；对照有、目标 0 ⇒ 缺字形（原因里要带码位，且必须说清是**环境
+/// 字体**而不是布局）；对照也没墨迹 ⇒ 不许记成缺字形（见下一条）。
+#[test]
+fn glyph_ink_classification_separates_missing_glyph_from_broken_renderer() {
+    assert!(
+        classify_glyph_ink(34, 12, '✓').is_ok(),
+        "两个都有墨迹 ⇒ 可画"
+    );
+    let why = classify_glyph_ink(34, 0, '✓').expect_err("目标 0 墨迹 ⇒ 缺字形");
+    assert!(why.contains("U+2713"), "原因要带码位便于排查：{why}");
+    assert!(
+        why.contains("缺这个字形") && why.contains("不是布局"),
+        "原因必须把「字体缺字形」与「布局坏了」分开：{why}"
+    );
+}
+
+/// 渲染通路本身坏掉（对照 `M` 也没墨迹）时**不许**返回「缺字形」：那会把白屏/后端故障
+/// 伪装成环境字体问题，比原来的红更难查。
+#[test]
+#[should_panic(expected = "渲染通路坏了")]
+fn glyph_ink_classification_never_blames_font_when_renderer_is_dead() {
+    let _ = classify_glyph_ink(0, 0, '✓');
+}
+
+/// 宽松模式（本机）：缺字形 ⇒ 返回带 `[skip]` 与原因的说明（不 panic，其余断言照跑）。
+#[test]
+fn glyph_skip_notice_is_loud_and_actionable_when_lax() {
+    let msg = glyph_skip_notice("v11 的 ✓", "字体链没有 U+2713", false);
+    assert!(msg.contains("[skip]"), "跳过必须带 [skip] 前缀：{msg}");
+    assert!(msg.contains("U+2713"), "要带原因：{msg}");
+    assert!(
+        msg.contains("ABB_TEST_ASSUME_MISSING_GLYPH"),
+        "要给出复跑入口：{msg}"
+    );
+}
+
+/// 严格模式（CI / `ABB_TEST_NO_SKIP`）：缺字形不许变成绿，必须红在「门禁被跳」这件事上。
+#[test]
+#[should_panic(expected = "严格模式")]
+fn glyph_skip_notice_refuses_to_weaken_the_gate_under_ci() {
+    let _ = glyph_skip_notice("v11 的 ✓", "字体链没有 U+2713", true);
+}
+
+/// 变异自验入口（验收 5）：`ABB_TEST_ASSUME_MISSING_GLYPH` 把 ✓ 标成缺字形后，`glyph_drawable`
+/// 必须返回 `Err`（调用方据此走「环境不满足」分支）——**不得**报成断言失败。
+/// 同时钉住三种写法（hex / `u+` 前缀 / 字面字符）与「不命中别的码位」。
+#[test]
+fn missing_glyph_overlay_marks_only_the_listed_glyph() {
+    let _g = crate::lark_user::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("ABB_TEST_ASSUME_MISSING_GLYPH", "2713");
+    let why = glyph_drawable('✓').expect_err("被标记为缺字形时必须走跳过分支");
+    assert!(why.contains("ABB_TEST_ASSUME_MISSING_GLYPH"), "{why}");
+    for spec in ["u+2713", "U+2713", "✓", "2714, 2713", " 2713 "] {
+        std::env::set_var("ABB_TEST_ASSUME_MISSING_GLYPH", spec);
+        assert!(forcibly_missing_glyph('✓'), "写法 `{spec}` 应命中");
+    }
+    std::env::set_var("ABB_TEST_ASSUME_MISSING_GLYPH", "2714");
+    assert!(!forcibly_missing_glyph('✓'), "别的码位不该命中");
+    std::env::remove_var("ABB_TEST_ASSUME_MISSING_GLYPH");
+    assert!(!forcibly_missing_glyph('✓'), "开关未设时不命中");
+}
+
+/// 探针机构本身要能在本机跑通（对照字符 `M` 必须有墨迹）：否则每条探针都会 panic，
+/// 而「环境缺字形」的判定就永远走不到。这一条不依赖 ✓ 是否存在，所以在任何机器上都成立。
+#[test]
+fn glyph_probe_machinery_works_on_this_host() {
+    let _g = crate::lark_user::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("ABB_TEST_ASSUME_MISSING_GLYPH");
+    assert!(
+        glyph_ink_probe('M') > 0,
+        "ASCII `M` 在消息区应留下墨迹：探针（或渲染台）坏了，先修它再谈缺字形"
     );
 }
