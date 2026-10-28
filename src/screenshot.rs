@@ -31,6 +31,13 @@ pub const ACTION_NAME: &str = "截图";
 const SCREENCAPTURE: &str = "/usr/sbin/screencapture";
 
 /// 一次截屏请求的结局。
+///
+/// `Captured` / `Cancelled` / `NeedsPermission` 只由 macOS 的 [`capture`] 构造；非 macOS 的
+/// 回落只会返回 `Failed`。所以非 macOS 下这三个变体是「必然无人构造」，windows clippy
+/// `-D warnings` 会以 dead_code 判红（v3.2.4 CI）。用 `cfg_attr` 而不是把变体整块 cfg 掉：
+/// 枚举是平台无关的协议面，保留全部变体能让调用方（附件/状态行）在两种平台上写同一套
+/// match，少一堆 `cfg` 分支。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// 截到了图，落在给的临时路径（调用方负责落地进附件目录 / 清理）。
@@ -46,6 +53,7 @@ pub enum Outcome {
 
 /// `screencapture` 的参数（纯函数）：`-i` 交互式（选区 **或** 选窗，Esc 取消）、
 /// `-x` 不播快门声（对话窗里放一声「咔嚓」是噪音），最后是目标文件。
+#[cfg(target_os = "macos")]
 pub fn capture_args(out: &Path) -> Vec<String> {
     vec![
         "-i".to_string(),
@@ -55,11 +63,13 @@ pub fn capture_args(out: &Path) -> Vec<String> {
 }
 
 /// 临时 PNG 路径。带 pid：同一秒里连点两次（或另一份 ABB 在跑）不会互相覆盖。
+#[cfg(target_os = "macos")]
 pub fn temp_png_path(dir: &Path, ts: u64, pid: u32) -> PathBuf {
     dir.join(format!("abb-screenshot-{ts}-{pid}.png"))
 }
 
 /// PNG 头（`\x89PNG\r\n\x1a\n`）：用来挡住「工具退出码 0 但写了半张图」这种假成功。
+#[cfg(target_os = "macos")]
 pub fn looks_like_png(bytes: &[u8]) -> bool {
     bytes.len() > 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
 }
@@ -71,6 +81,7 @@ pub fn looks_like_png(bytes: &[u8]) -> bool {
 /// - 没有文件：退出码非零且 stderr 里有可读信息 ⇒ `Failed`（把 stderr 原样带出来，
 ///   不吞掉系统给的原因）；否则 ⇒ `Cancelled`（`screencapture -i` 取消时既可能留空文件
 ///   也没有明确 stderr，**如实当成取消而不是失败**——它不是错误，报成错误会让用户以为坏了）。
+#[cfg(target_os = "macos")]
 pub fn interpret(exit_ok: bool, stderr: &str, out: &Path) -> Outcome {
     match std::fs::read(out) {
         Ok(bytes) if looks_like_png(&bytes) => Outcome::Captured(out.to_path_buf()),
@@ -93,6 +104,7 @@ pub fn interpret(exit_ok: bool, stderr: &str, out: &Path) -> Outcome {
 ///
 /// 三件事必须说全，缺一句用户就卡住：**要哪项权限**、**去哪儿开**、**开完要不要重启**
 /// （TCC 对已运行进程的授权不是立刻生效的，这是最常见的一句「我明明勾了」）。
+#[cfg(target_os = "macos")]
 pub fn permission_guidance() -> String {
     "截屏需要「屏幕录制」权限：系统设置 → 隐私与安全性 → 屏幕录制 → 勾选 ABB。\
      （刚勾上时系统常常要重启一次 ABB 才认，勾完再点一次 ✂ 即可。）"
@@ -150,6 +162,7 @@ mod tests {
     use super::*;
 
     /// 参数口径：交互式选区/选窗 + 静音 + 目标文件在最后（`screencapture` 的位置参数）。
+    #[cfg(target_os = "macos")]
     #[test]
     fn capture_args_are_interactive_quiet_and_end_with_the_target() {
         let p = Path::new("/tmp/x.png");
@@ -166,6 +179,7 @@ mod tests {
 
     /// 临时文件名带 pid：同一秒连点两次不互相覆盖（否则第二张会覆盖第一张，
     /// 而第一张可能已经被 `land_attachments` 复制走了——看起来是「截了两张只进来一张」）。
+    #[cfg(target_os = "macos")]
     #[test]
     fn temp_paths_are_unique_per_second_and_process() {
         let d = Path::new("/tmp");
@@ -175,6 +189,7 @@ mod tests {
         assert!(temp_png_path(d, 100, 1).to_string_lossy().ends_with(".png"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn png_sniff_rejects_short_and_foreign_files() {
         assert!(looks_like_png(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"));
@@ -191,6 +206,7 @@ mod tests {
     }
 
     /// 结局判定表——**没有文件就不许说成功**（这是本模块最重要的一条判据）。
+    #[cfg(target_os = "macos")]
     #[test]
     fn interpret_never_reports_success_without_a_png() {
         let dir = std::env::temp_dir().join(format!("abb-shot-t-{}", std::process::id()));
@@ -229,6 +245,7 @@ mod tests {
     }
 
     /// 引导文案三要素：哪项权限 / 去哪儿开 / 开完可能要重启。
+    #[cfg(target_os = "macos")]
     #[test]
     fn guidance_names_permission_location_and_restart() {
         let g = permission_guidance();

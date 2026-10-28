@@ -1271,7 +1271,12 @@ fn snap_bubble_to_dialog(bubble: &AnchorBubble, dialog: &SystemChatWindow) -> bo
 /// 跟随泵的**动作判据**（纯函数，单测钉住）：只有「对话窗可见」且「对话窗矩形与上次不同」
 /// 才动气泡。
 ///
+/// macOS 专属：唯一消费者是 [`FollowPump`]（macOS 拖动期间的 16ms 泵）。
+/// Windows/Linux 上跟随走事件路径、不需要泵，所以这一族符号整体 `cfg(target_os = "macos")`
+/// ——不这样的话 Windows clippy `-D warnings` 会以 dead_code 红（v3.2.4 第三轮 CI）。
+///
 /// 第二条同时是**防抢位置**的关键：用户拖气泡时对话窗不动 ⇒ 泵不动作。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn follow_should_snap(prev_dialog: Option<Rect>, cur_dialog: Rect, visible: bool) -> bool {
     visible && prev_dialog != Some(cur_dialog)
 }
@@ -1280,6 +1285,7 @@ fn follow_should_snap(prev_dialog: Option<Rect>, cur_dialog: Rect, visible: bool
 ///
 /// 显示器互不重叠，所以中心点一跨屏就会落到缓存工作区之外 ⇒ 自动重算；
 /// 缓存命中时省掉 `current_monitor()`（跨 FFI + 显示器枚举，是原实现里最重的一步）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn work_area_cache_hit(cached: Rect, win: Rect) -> bool {
     let (cx, cy) = (win.0 + win.2 / 2, win.1 + win.3 / 2);
     cx >= cached.0 && cx < cached.0 + cached.2 && cy >= cached.1 && cy < cached.1 + cached.3
@@ -1287,6 +1293,7 @@ fn work_area_cache_hit(cached: Rect, win: Rect) -> bool {
 
 /// A：跟随泵的共享状态（事件路径与定时器路径共用）。
 #[derive(Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct FollowState {
     /// 上一次 tick 看到的对话窗矩形（逻辑像素）——[`follow_should_snap`] 的基线。
     last_dialog: Option<Rect>,
@@ -1352,6 +1359,7 @@ mod follow_macos {
 
 /// A：气泡跟随泵。macOS 上句柄就绪后由 common-modes 定时器驱动；其它平台只走事件路径。
 #[derive(Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct FollowPump {
     state: RefCell<FollowState>,
     /// v11c：自管缩放进行中 ⇒ 暂不跟随。
@@ -1654,6 +1662,8 @@ fn toggle_syschat_maximize(win: &SystemChatWindow, state: &RefCell<crate::syscha
 }
 
 /// A：泵的 16ms 节拍（稿/卡口径：16ms 合并，约一帧）。
+/// macOS 专属（唯一使用点在 [`FollowPump`] 的定时器路径）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const FOLLOW_TICK_MS: u64 = 16;
 
 /// D4/A：对话窗 `Moved` / `Resized` → 气泡贴到最近的角（跟随窗口移动/缩放/最大化）。
