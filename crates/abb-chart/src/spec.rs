@@ -451,8 +451,14 @@ fn spec_required_chars(spec: &Spec, table: &Table) -> Vec<char> {
 mod tests {
     use super::*;
 
+    /// 测试落地目录：取平台临时目录 + pid，**不得写死本机绝对路径**。
+    ///
+    /// 曾经写死 `/Volumes/DataExt/tmp/abbchart-test`（本机数据卷），在 GitHub runner 上
+    /// 该前缀不存在且不可创建 ⇒ `create_dir_all` 报 `PermissionDenied`，CI 的
+    /// `abb-chart-lint` 因此长期假红（而本机永远绿）。同文件其他用例早已统一用
+    /// `temp_dir() + pid`，这里与之一致。
     fn dir() -> PathBuf {
-        PathBuf::from("/Volumes/DataExt/tmp/abbchart-test")
+        std::env::temp_dir().join(format!("abbchart-test-{}", std::process::id()))
     }
 
     fn write_spec(name: &str, body: &str) -> PathBuf {
