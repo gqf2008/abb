@@ -716,6 +716,7 @@ mod tests {
     /// NB-3 的另一半（评审 N2）：`save_locked`（定义文件）与 `try_save_state`（计时账）
     /// 是两条独立的写入路径，只测一条不能证明另一条也安全。这里命中 `save_locked`：
     /// 预放 `jobs.json.tmp` 符号链接，再用 `remove` 触发一次定义表落盘。
+    #[cfg(unix)]
     #[test]
     fn save_locked_does_not_follow_preseeded_symlink() {
         let dir = temp_dir("symlink-jobs");
@@ -771,6 +772,7 @@ mod tests {
     /// `fs::write` 是 O_CREAT|O_TRUNC、会跟随符号链接：固定 tmp 名（`jobs-state.json.tmp`）
     /// 时，受限会话预放 `jobs-state.json.tmp → 工作区外的真实文件`，我们下一次落盘就跟随
     /// 链接覆盖它。guard 的 `.tmp` 剪尾只拦 Write/Edit 工具这条路，写入侧靠这个用例守。
+    #[cfg(unix)]
     #[test]
     fn atomic_write_does_not_follow_preseeded_symlink() {
         let dir = temp_dir("symlink");

@@ -289,6 +289,7 @@ mod tests {
 
     /// B1 回归守卫（卡 `abb-proc-sysctl-nb-20261028`，评审 154 finding 5）：
     /// `save` 必须用 uuid 唯一 tmp 名。直接测模块内的 `save(path, data)`。
+    #[cfg(unix)]
     #[test]
     fn save_does_not_follow_preseeded_symlink() {
         let (_, path) = tmp_store("symlink-save");

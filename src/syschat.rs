@@ -4382,6 +4382,7 @@ mod tests {
     /// 把本处退回固定 `*.jsonl.tmp` + `fs::write` 后，整个 `syschat::` 套件（127 条）
     /// 仍全绿——实测确认。
     #[cfg(unix)]
+    #[cfg(unix)]
     #[test]
     fn drop_turns_does_not_follow_preseeded_symlink() {
         let (store, base) = tmp_store("symlink-drop");
@@ -4427,6 +4428,7 @@ mod tests {
     /// 为什么必须有这条：把 `save` 退回固定 `sessions.json.tmp` + `fs::write` 后，
     /// 完整 `--bin agent-bridge` 套件（1360 条）**仍然全绿**——这个漏洞类的修复
     /// 在 syschat / syschat_sched 上零回归覆盖，只有临时探针能抓到。此用例把它收进仓。
+    #[cfg(unix)]
     #[test]
     fn session_store_save_does_not_follow_preseeded_symlink() {
         let (store, base) = tmp_store("symlink-save");

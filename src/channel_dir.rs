@@ -386,6 +386,7 @@ mod tests {
     /// （O_CREAT|O_TRUNC，会跟随链接）⇒ 预放 `→ 工作区外文件` 就能让桥下次写 chat.json
     /// 时覆盖它。改用 uuid 唯一 tmp 名后预放不可预测。
     #[cfg(unix)]
+    #[cfg(unix)]
     #[test]
     fn chat_json_write_does_not_follow_preseeded_symlink() {
         let tmp = std::env::temp_dir().join(format!("abb-chandir-sym-{}", uuid::Uuid::new_v4()));
