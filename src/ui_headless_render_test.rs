@@ -1138,6 +1138,54 @@ fn v10_metrics_match_design() {
         );
     }
 
+    // ── 4b. 居中判据：用 **ASCII 文案** 另量一次（卡 `abb-v10-send-center-judge-20261028`）──
+    //
+    // 为什么不能直接对 CJK 「发送」断言对称（这是本卡第一版的做法，已废弃）：
+    // 左右留白 = 内边距 + **字形侧边距**，而侧边距是字体属性。本机实测六种组合的侧边距差
+    // 最大只有 1px（默认字体「发送」15/15、Songti「发送」16/15、默认「Send」15/15、
+    // Songti「Send」15/15、「OK」默认 15/14、Songti「OK」15/16）；若为了容下 CJK 的差异把
+    // 容差放到 9px（Windows 实测 24/15），就再也打不红「文字整体偏 5px」——容差与判别力
+    // 互相打架。换成 ASCII 就把这两个目标解耦了：
+    //   · 布局偏心（文字容器被移/对齐写错）⇒ ASCII 与 CJK **一起**偏 ⇒ 本段必红；
+    //   · 单纯 CJK 字体度量 ⇒ ASCII 仍对称 ⇒ 本段不红，而 Windows 的 24/15 得到定性归因。
+    // 也就是说这一条同时是「居中的门禁」和「A/B 判决实验」（CI 日志里两行留白即答案）。
+    //
+    // 容差 2px 的出处（不是拍的）：本机六种字体/文案组合里**同一文案的左右差**最大 1px
+    //（Songti「发送」16/15、「OK」15/16），留 1px 余量 ⇒ 2px。判别力：文字容器右移 5px
+    // ⇒ 差变成 5 > 2 ⇒ 必红（变异实测见 patch note）。
+    ui.set_send_label("Send".into());
+    // 换了文案就可能换宽/换位（宽 = preferred-width + 28）⇒ 重新取几何再量，不复用上面的值。
+    let f2 = settle_w(&win, MW, MH);
+    // 口径与上面 `send_a` 一致（只在 convo-zone 以下找 accent，避免抓到消息区的强调条）。
+    let send_a2 =
+        bbox(&f2, 0, zone_top, MW, MH, is_accent).expect("发送钮（ASCII 文案）应仍是 accent 底");
+    let ascii_box_l = send_a2.0 - 2;
+    let ascii_box_r = send_a2.2 + 2;
+    let ascii_t = bbox(
+        &f2,
+        send_a2.0 + 3,
+        send_a2.1 + 3,
+        send_a2.2 - 2,
+        send_a2.3 - 2,
+        is_dark,
+    )
+    .expect("发送钮里应有 ASCII 文案墨迹（正面控制）");
+    let (apad_l, apad_r) = (ascii_t.0 - ascii_box_l, ascii_box_r - ascii_t.2);
+    // 把两组读数印出来：CI 日志里这两行就是「布局偏心 vs 字体度量」的判决依据。
+    println!("PADS CJK pad_l={pad_l} pad_r={pad_r} | ASCII pad_l={apad_l} pad_r={apad_r}");
+    assert!(
+        apad_l.min(apad_r) >= 8,
+        "ASCII 文案下内边距也被挤掉了（{apad_l}/{apad_r}）——布局问题，不是字体"
+    );
+    let skew = apad_l.abs_diff(apad_r);
+    assert!(
+        skew <= 2,
+        "ASCII 文案的发送钮文字没居中（左右留白 {apad_l} vs {apad_r}，差 {skew} > 容差 2px）：\
+         这是布局把文字放偏了（字体侧边距对 ASCII 只有 0~1px，本机实测），不是字体差异"
+    );
+    ui.set_send_label("发送".into());
+    let _ = settle_w(&win, MW, MH);
+
     // ── 5. 功能区：整体靠右、总宽 164px、与发送钮同一水平线 ──
     // v21：新增第 6 枚「📌 置顶」图标钮（窗口永远置顶，持久到 config）⇒ 宽度按 6 枚算。
     assert_eq!(
