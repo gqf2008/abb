@@ -4020,6 +4020,11 @@ export component SystemChatWindow inherits Window {
     out property <length> dbg-send-y: send-btn.y;
     out property <length> dbg-send-w: send-btn.width;
     out property <length> dbg-send-h: send-btn.height;
+    // 发送钮**实际渲染的**文案（卡 `abb-v10-send-label-guard-20261028`）：`send-label` 从写死
+    // 的字符串变成 in 属性之后，生产文案再没有任何断言守护——把默认值改成 "Send"，全部像素
+    // 断言照样绿（ASCII 与 CJK 在同一份布局下留白都是 15/15），而真实 UI 的按钮已经错了。
+    // 这里把渲染值暴露给测试，用一条与字体无关的断言钉住默认文案。
+    out property <string> dbg-send-text: send-text.text;
     // v11（卡 `abb-v11-popup-anchor`）：面板锚点用的**按钮矩形**观测面（无头出图台对稿用；
     // 同 dbg-* 口径：只读、无副作用）。面板自己的 x/y/w/h 是 in 属性，测试直接用 getter 读。
     out property <length> dbg-emoji-btn-x: root.emoji-btn-rect.x;

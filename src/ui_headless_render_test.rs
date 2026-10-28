@@ -4185,3 +4185,31 @@ fn diag_think_lines() {
     );
     write_png(&f, &dir.join("think-lines.png"));
 }
+
+/// 生产文案的守护（卡 `abb-v10-send-label-guard-20261028`）：`send-label` 从写死的字符串变成
+/// in 属性后，**默认值**再没有断言看着它。
+///
+/// 为什么必须单独一条、且必须在**从未 set 过**该属性的组件上断言：`v10_metrics_match_design`
+/// 中途会把文案换成 `"Send"` 再换回 `"发送"`，所以在那里断言等于断言「我刚设进去的值」——
+/// 实测：把默认值改成 `"Send"` 时它照样绿（这也正是本条要防的漏网）。独立 setup 才看得到默认值。
+///
+/// 判别力：默认值 `"发送"` 改成别的 ⇒ 本条红（与字体无关，比字符串不比墨迹）。
+#[test]
+fn send_button_default_label_is_chinese() {
+    let (ui, _win, _m) = setup(vec![row("p", "占位")], SHORT_H);
+    assert_eq!(
+        ui.get_dbg_send_text(),
+        "发送",
+        "发送钮空闲态文案应仍是「发送」（`send-label` 的默认值被改了？）"
+    );
+    // 反面对照：该属性确实能改（否则上面那条恒真、等于没测）。
+    ui.set_send_label("Send".into());
+    assert_eq!(ui.get_dbg_send_text(), "Send", "`send-label` 应该能改");
+    // busy 态仍是「⏹ 停止」，不受 `send-label` 影响（文案两态不能互相污染）。
+    ui.set_busy(true);
+    assert_eq!(
+        ui.get_dbg_send_text(),
+        "⏹ 停止",
+        "生成中的按钮文案不该被 `send-label` 影响"
+    );
+}
