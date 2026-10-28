@@ -1303,6 +1303,11 @@ struct FollowState {
 
 impl FollowState {
     /// 取工作区：缓存仍命中就沿用，否则用 `resolve` 重算并刷新缓存。
+    ///
+    /// 唯一调用点在 macOS 定时器路径（`FollowPump::tick_handles`），所以非 macOS 下
+    /// 是 dead_code。`allow` 必须加在**方法**上：加在 `FollowState` 结构体上不覆盖 impl
+    /// 块内的方法（v3.2.4 CI 实测：给 struct 加 `cfg_attr(allow)` 后 `work_area` 仍然红）。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn work_area(
         &mut self,
         dialog_rect: Rect,
