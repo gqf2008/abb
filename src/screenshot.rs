@@ -69,7 +69,6 @@ pub fn temp_png_path(dir: &Path, ts: u64, pid: u32) -> PathBuf {
 }
 
 /// PNG 头（`\x89PNG\r\n\x1a\n`）：用来挡住「工具退出码 0 但写了半张图」这种假成功。
-#[cfg(target_os = "macos")]
 pub fn looks_like_png(bytes: &[u8]) -> bool {
     bytes.len() > 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
 }
@@ -104,7 +103,6 @@ pub fn interpret(exit_ok: bool, stderr: &str, out: &Path) -> Outcome {
 ///
 /// 三件事必须说全，缺一句用户就卡住：**要哪项权限**、**去哪儿开**、**开完要不要重启**
 /// （TCC 对已运行进程的授权不是立刻生效的，这是最常见的一句「我明明勾了」）。
-#[cfg(target_os = "macos")]
 pub fn permission_guidance() -> String {
     "截屏需要「屏幕录制」权限：系统设置 → 隐私与安全性 → 屏幕录制 → 勾选 ABB。\
      （刚勾上时系统常常要重启一次 ABB 才认，勾完再点一次 ✂ 即可。）"
@@ -189,7 +187,6 @@ mod tests {
         assert!(temp_png_path(d, 100, 1).to_string_lossy().ends_with(".png"));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn png_sniff_rejects_short_and_foreign_files() {
         assert!(looks_like_png(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"));
@@ -245,7 +242,6 @@ mod tests {
     }
 
     /// 引导文案三要素：哪项权限 / 去哪儿开 / 开完可能要重启。
-    #[cfg(target_os = "macos")]
     #[test]
     fn guidance_names_permission_location_and_restart() {
         let g = permission_guidance();
