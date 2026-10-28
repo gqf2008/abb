@@ -1116,14 +1116,27 @@ fn v10_metrics_match_design() {
     .expect("发送钮里应有『发送』墨迹（正面控制）");
     let pad_l = t.0 - send_box_l;
     let pad_r = send_box_r - t.2;
-    assert_eq!(
-        pad_l, pad_r,
-        "『发送』应居中（左右留白 {pad_l} vs {pad_r}）"
-    );
+    // 字体无关判据：设计的内边距 14px 必须真的留出来。**不能**断言 `pad_l == pad_r` 或
+    // `pad_l ∈ 12..=20`：墨迹包围盒随字体侧边距走——同一份布局在 macOS 上是 15/15、
+    // windows-latest 上是 24/15、本机默认字体是 14/14（均为实测）。
+    // 判别力：把 `.send` 的 `+28px` 改成 `+0px` ⇒ 本机左右各剩 5px ⇒ 本条必红。
     assert!(
-        (12..=20).contains(&pad_l),
-        "发送钮内边距应 ≈14px（稿 .send{{padding:0 14px}}），实测 {pad_l}"
+        pad_l.min(pad_r) >= 8,
+        "发送钮内边距被挤掉（左右留白 {pad_l}/{pad_r}；设计 14px，字体侧边距只会让墨迹更靠内）"
     );
+    // 设计稿基线只在 macOS 上量过（默认字体 + 该平台光栅化）：exact 对称与 14px 只做基线守卫。
+    // Windows 侧由上面的 `min >= 8` 兜底（保证 padding 没被删/被挤）。
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(
+            pad_l, pad_r,
+            "『发送』应居中（左右留白 {pad_l} vs {pad_r}）"
+        );
+        assert!(
+            (12..=20).contains(&pad_l),
+            "发送钮内边距应 ≈14px（稿 .send{{padding:0 14px}}），实测 {pad_l}"
+        );
+    }
 
     // ── 5. 功能区：整体靠右、总宽 164px、与发送钮同一水平线 ──
     // v21：新增第 6 枚「📌 置顶」图标钮（窗口永远置顶，持久到 config）⇒ 宽度按 6 枚算。
@@ -1823,8 +1836,15 @@ fn settings_self_managed_hit_zones_route_press_with_pointer_coords() {
 /// 且调用安全——`sharedApplication` 只取单例，不起 UI），所以「失焦 ⇒ 应隐藏」这一支在测试里
 /// 就是**正面路径**；反面（焦点还在本进程 ⇒ 不隐藏）由 `ui::tests::blur_hide_*` 的纯函数用例覆盖。
 ///
+/// **只在 macOS 跑**：非 macOS 的 `platform::app_is_active()` 恒 `true`（Windows 的焦点概念
+/// 落在窗口上，D5 的「失焦 ⇒ 隐藏」是 macOS 焦点/Dock 语义的需求，不在 Windows 引入新行为），
+/// 所以整条链在 Windows 上**按设计**永不触发——这不是可以靠换替身朗读进程修好的。
+/// Windows 侧覆盖：判据由 `ui::tests::blur_hide_*` 三条纯函数用例跨平台兜底；「隐藏 ⇒ 停朗读 +
+/// 复位状态」由 `hide_syschat_stops_speaker_and_resets_state`（下方，跨平台）兜底。
+///
 /// 依赖真实墙钟：延时常量 `BLUR_HIDE_DELAY_MS` 变了本用例自动跟随（多睡 3 倍再判定），
 /// 不用固定 sleep 去猜实现细节（同 `LESSON_节流类测试断言须随真实墙钟缩放`）。
+#[cfg(target_os = "macos")]
 #[test]
 fn blur_hides_dialog_window_end_to_end() {
     // 注意：`Focused` 是 **winit** 的事件（Slint 的事件枚举里没有它）——
@@ -1907,6 +1927,52 @@ fn blur_hides_dialog_window_end_to_end() {
         -2,
         "隐藏后朗读态必须复位（否则下次开窗还显示「⏹ 停止朗读」）"
     );
+    let _ = win;
+}
+
+/// 跨平台：`hide_syschat` 的副作用（停朗读 / 复位朗读态 / 隐藏窗口）**不依赖**失焦语义。
+///
+/// 为什么需要：失焦隐藏在 Windows 上按设计永不触发（`platform::app_is_active()` 恒 `true`），
+/// 所以 `blur_hides_dialog_window_end_to_end` 只在 macOS 跑。本用例直接调 `hide_syschat`，
+/// 不需要焦点/定时器，也不需要真实朗读器（只说一个替身进程），给 Windows 侧兜住「隐藏 ⇒ 朗读停掉」这条链。
+///
+/// 替身朗读：Windows 没有 `/bin/sleep`，也不能 `spawn_with("ping", "-n 30 127.0.0.1")`——
+/// `spawn_with` 只传一个 argv，ping 会把带空格的一整串当畸形选项立刻退出（2026-10-28 本机实测）；
+/// `cmd /c ping …` 作为单 argv 才能挂住。代价是 `kill(cmd)` 不连带杀 ping（本机实测），它会自己
+/// 跑完——次数取 5（≈4s）收短尾巴。
+#[test]
+fn hide_syschat_stops_speaker_and_resets_state() {
+    let (ui, win, _) = setup(vec![row("p", "占位")], SHORT_H);
+    assert!(ui.window().is_visible(), "前置控制失败：窗口没 show 上");
+    let (dummy_prog, dummy_arg) = if cfg!(windows) {
+        ("cmd", "/c ping -n 5 127.0.0.1")
+    } else {
+        ("/bin/sleep", "30")
+    };
+    let speaker: Rc<RefCell<crate::platform::Speaker>> =
+        Rc::new(RefCell::new(crate::platform::Speaker::new()));
+    assert!(
+        speaker.borrow_mut().spawn_with(dummy_prog, dummy_arg),
+        "前置控制失败：起不了替身朗读进程"
+    );
+    assert!(
+        speaker.borrow_mut().is_speaking(),
+        "前置控制：替身朗读进程应在跑"
+    );
+    ui.set_speaking_turn(3);
+    let empty_bubble: slint::Weak<AnchorBubble> = slint::Weak::default();
+    let empty_settings: slint::Weak<SettingsWindow> = slint::Weak::default();
+    super::hide_syschat(&ui, &empty_bubble, &empty_settings, &speaker);
+    assert!(
+        !speaker.borrow_mut().is_speaking(),
+        "hide_syschat 必须把在跑的朗读停掉（否则窗口没了、声音还在放）"
+    );
+    assert_eq!(
+        ui.get_speaking_turn(),
+        -2,
+        "隐藏后朗读态必须复位（否则下次开窗还显示「⏹ 停止朗读」）"
+    );
+    assert!(!ui.window().is_visible(), "hide_syschat 必须隐藏对话窗");
     let _ = win;
 }
 

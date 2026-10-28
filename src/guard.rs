@@ -1739,10 +1739,15 @@ mod tests {
             Decision::Allow
         );
         // 工作区内的绝对路径也放行（agent 常用 `$PWD/...` 之外的写法）。
+        //
+        // Windows：路径**必须**用单引号包住。`split_shell` 走 POSIX 语义，无引号态把 `\`
+        // 当转义符吃掉；而 `canonicalize` 在 Windows 上返回 `\\?\C:\...` 逐字路径，去掉反斜杠
+        // 后就不再落在 `ws` 下，guard 会（正确地）判「工作区外」。单引号态原样保留字符，
+        // 两个平台都成立（2026-10-28 本机 Windows 实测；别改回裸路径）。
         let abs_ok = format!(
-            r#"$ABB_BIN chart render --spec {}/spec.json --out {}/chart.png"#,
-            ws.display(),
-            ws.display()
+            r#"$ABB_BIN chart render --spec '{}' --out '{}'"#,
+            ws.join("spec.json").display(),
+            ws.join("chart.png").display()
         );
         assert_eq!(decide(&abs_ok), Decision::Allow);
         // 子命令只放行 render；其它值（含缺子命令）一律拒。

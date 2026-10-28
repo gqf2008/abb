@@ -857,18 +857,34 @@ mod tests {
             render_to_png(&body, None, &RenderOptions::default()).unwrap()
         };
 
-        let two_five = ink_groups(&render_title("2.5"));
-        let two_five_nodot = ink_groups(&render_title("25"));
-        assert_eq!(two_five_nodot, 2, "`25` 应是 2 个字形（基线自检）");
+        // 判据用**相对差**：`2.5` 必须比 `25` 多一个墨迹组；绝对值（每组恰好 2 个字宽）
+        // 取决于字体/字号/kerning 的光栅化结果，不是不变量——windows-latest 上 `25` 就连成
+        // 1 组（2026-10-28 实测：25=1、2.5=2、1285=2、128.5=3），macOS 默认字体下是 2/3/4/5。
+        // 判别力：把小数点吞掉（`render_title("2.5")` 换成 `"25"`）⇒ 两组数相等 ⇒ 必红。
+        let g25 = ink_groups(&render_title("25"));
+        let g2_5 = ink_groups(&render_title("2.5"));
         assert_eq!(
-            two_five, 3,
-            "`2.5` 应是 3 个字形；得到 {two_five} 说明小数点被吞了（默认字体选错？）"
+            g2_5,
+            g25 + 1,
+            "小数点必须多出一个墨迹组（得 {g2_5} vs {g25}）：小数点被吞了？"
         );
+        let g1285 = ink_groups(&render_title("1285"));
+        let g128_5 = ink_groups(&render_title("128.5"));
         assert_eq!(
-            ink_groups(&render_title("128.5")),
-            5,
-            "`128.5` 应是 5 个字形"
+            g128_5,
+            g1285 + 1,
+            "小数点必须多出一个墨迹组（得 {g128_5} vs {g1285}）：小数点被吞了？"
         );
+
+        // macOS 设计基线（按 macOS 默认字体 + 该平台光栅化量出来的绝对值）。
+        // Windows 字体下绝对组数不成立，故只在 macOS 保留；覆盖不丢——上面两条相对判据
+        // 在两个平台都跑。
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(g25, 2, "`25` 应是 2 个字形（macOS 设计基线）");
+            assert_eq!(g2_5, 3, "`2.5` 应是 3 个字形（macOS 设计基线）");
+            assert_eq!(g128_5, 5, "`128.5` 应是 5 个字形（macOS 设计基线）");
+        }
     }
 
     /// `data` 指向相对路径时按规格文件目录解析（端到端，带真实文件）。

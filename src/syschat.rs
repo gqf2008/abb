@@ -4751,13 +4751,25 @@ mod tests {
         let (src, dst) = tmp_attach_dirs("sanitize");
         // 换行/冒号/引号在 macOS 上可作文件名，但会被 prompt 的 `- <路径>` 行结构与
         // Windows 落盘弄坏；控制字符同理，统一改成 `_`。
+        //
+        // Windows 侧**造不出**这个夹具：`:`（ADS/盘符）、`*`、`"` 在 NTFS 上是非法名，
+        // `\\?\` 逐字路径也解不开（2026-10-28 本机实测）。磁盘这半段只验「清洗后的名字能落地」，
+        // 清洗表本身由 `sanitize_attachment_name_edge_cases` 在**两个平台**上验。
+        #[cfg(unix)]
         let a = write_src(&src, "we\nird:na*me\".png", "x");
         let long_stem = "头".repeat(200);
         let b = write_src(&src, &format!("{long_stem}.mov"), "y");
+        #[cfg(unix)]
         let landed = land_attachments_in(&dst, &[a, b]).expect("应落地成功");
-        let n0 = landed[0].name.split_once('-').unwrap().1;
-        assert_eq!(n0, "we_ird_na_me_.png", "非法字符应换成下划线");
-        let n1 = landed[1].name.split_once('-').unwrap().1;
+        #[cfg(not(unix))]
+        let landed = land_attachments_in(&dst, &[b]).expect("应落地成功");
+        #[cfg(unix)]
+        {
+            let n0 = landed[0].name.split_once('-').unwrap().1;
+            assert_eq!(n0, "we_ird_na_me_.png", "非法字符应换成下划线");
+        }
+        // 超长截断那半段的名字在 Windows 上合法 ⇒ 两个平台都跑（不得随夹具一起门控）。
+        let n1 = landed.last().unwrap().name.split_once('-').unwrap().1;
         assert!(n1.ends_with(".mov"), "超长截断必须保留扩展名：{n1}");
         assert!(
             n1.chars().count() <= MAX_ATTACH_NAME_CHARS,
@@ -4776,6 +4788,16 @@ mod tests {
         assert_eq!(sanitize_attachment_name(".."), "attachment");
         assert_eq!(sanitize_attachment_name(""), "attachment");
         assert_eq!(sanitize_attachment_name("...."), "attachment");
+        // Windows 禁 `:` `*` `"`（`\\?\` 也解不开，本机实测）⇒ 磁盘夹具只在 Unix 侧造。
+        // 清洗表在这里覆盖两个平台（见 land_attachments_sanitizes_name_and_keeps_extension）。
+        assert_eq!(sanitize_attachment_name("a:b"), "a_b");
+        assert_eq!(sanitize_attachment_name("a*b"), "a_b");
+        assert_eq!(sanitize_attachment_name("a\"b"), "a_b");
+        assert_eq!(sanitize_attachment_name("a\nb"), "a_b");
+        assert_eq!(
+            sanitize_attachment_name("we\nird:na*me\".png"),
+            "we_ird_na_me_.png"
+        );
         // 无扩展名的超长名也要截（不得整体保留）
         let long = "a".repeat(MAX_ATTACH_NAME_CHARS + 50);
         assert_eq!(

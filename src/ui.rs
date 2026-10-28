@@ -10966,13 +10966,14 @@ mod tests {
     fn bubble_follow_target_is_none_when_already_snapped() {
         let work = (0, 0, 1920, 1080);
         let dialog = (800, 400, 520, 560);
-        // 气泡窗口位 = 可视区外侧再减 4px 透明边；上角对齐窗上缘 ⇒ 可视 y = dialog.y、窗口 y = dialog.y − 4。
-        let bubble = (800 - 10 - 36 - 4, 400 - 4, 44, 44);
+        // 气泡窗口位 = 可视区外侧再减透明边（`BUBBLE_INSET`：Windows 为 0，见常量注释）；
+        // 上角对齐窗上缘 ⇒ 可视 y = dialog.y、窗口 y = dialog.y − BUBBLE_INSET。
+        let bubble = (800 - 10 - 36 - BUBBLE_INSET, 400 - BUBBLE_INSET, 44, 44);
         assert_eq!(bubble_follow_target(dialog, bubble, work), None, "已就位");
         let moved = (900, 400, 520, 560);
         assert_eq!(
             bubble_follow_target(moved, bubble, work),
-            Some((900 - 10 - 36 - 4, 400 - 4)),
+            Some((900 - 10 - 36 - BUBBLE_INSET, 400 - BUBBLE_INSET)),
             "对话窗右移 100px：气泡也应右移 100px（增量=1:1）"
         );
     }
