@@ -3399,6 +3399,12 @@ component MenuChoiceRow inherits Rectangle {
         x: parent.width - 10px - self.width;
         height: 100%;
         text: root.tick ? "✓" : root.tag;
+        // 勾**必须**指名一个带 U+2713 的字体：中文 Windows 的默认 UI 字体（SimSun 系）没有
+        // 这个字形，Slint 的通用回退也不会去找符号字体 ⇒ 真实 UI 上「当前项」的勾直接不
+        // 显示（无头用例 `v11_panels_anchor_and_usage_meter_match_design` 在默认字体下先红）。
+        // `Segoe UI Symbol` 每个 Windows 都有；macOS/Linux 没有这个族名时落到通用回退，
+        // 与改动前「不写 font-family」同一条路径（macOS 默认字体本就有 U+2713）。
+        font-family: root.tick ? "Segoe UI Symbol" : "";
         font-size: root.tick ? 13px : 10px;
         font-weight: root.tick ? 800 : 400;
         color: root.on ? PixelTheme.on-accent : PixelTheme.dim;
