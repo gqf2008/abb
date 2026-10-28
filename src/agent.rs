@@ -679,6 +679,12 @@ fn write_agent_pids(bot_key: &str, pids: &[u32]) {
 /// 但该判据本身就是命令行子串匹配，而测试 harness 的 argv 里带着过滤参数——只要参数值含
 /// `claude`（例如 `--skip claude_heal_on_first_round_writes_no_pending`）或 argv[0] 路径含
 /// `claude`，那条断言就会**误红**（靠环境碰巧而非靠设计）。现在正反两侧都用合成字符串测。
+///
+/// Windows 上本函数无调用方（`process_is_agent` 的 windows 分支直接信任 pid 文件），
+/// 但**必须仍存在**：它是与平台无关的判据本体，且它调用的 [`pi_command_matches`]
+/// 也得随之为平台无关——v3.2.4 首轮 CI 就是因为在 Windows 上解析不到
+/// `pi_command_matches` 而 E0425 红的。`allow(dead_code)` 只抑制告警，不改变这一点。
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn command_is_agent(cmd: &str) -> bool {
     cmd.contains("claude") || cmd.contains("codex") || pi_command_matches(cmd)
 }
@@ -726,7 +732,12 @@ fn unix_process_command(pid: u32) -> Option<String> {
 /// pi 进程命令行匹配：npm 全局 bin 的 `pi` 是指向 cli.js 的软链，ps 显示的是解析后的
 /// 解释器+脚本路径（如 `node …/pi-coding-agent/dist/cli.js`）。"pi" 子串太宽（login/pid 等
 /// 都会误中），按特征匹配：首 token 基名恰为 pi，或路径含 pi-coding-agent。
-#[cfg(unix)]
+///
+/// **不加 `#[cfg(unix)]`**：本函数是纯字符串逻辑、无平台依赖，而调用方
+/// [`command_is_agent`] 是平台无关的（Windows 编译也需要它）。它历史上带过
+/// `#[cfg(unix)]`（因为唯一调用方 `process_is_agent` 的 unix 分支），抽出纯函数后
+/// 若继续保留，就会让 **Windows 构建直接 E0425**——v3.2.4 的首轮 CI 就是这么红的。
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn pi_command_matches(cmd: &str) -> bool {
     let first = cmd.split_whitespace().next().unwrap_or("");
     let base = std::path::Path::new(first)
@@ -790,6 +801,49 @@ mod tests {
             !cmd.contains('\u{1f}'),
             "argv 分隔符必须回填成空格，否则 pi 的首 token 匹配会失准：{cmd}"
         );
+    }
+
+    /// 回归守卫（v3.2.4 首轮 CI 红）：`pi_command_matches` / `command_is_agent`
+    /// **不得带 `#[cfg(unix)]`**。
+    ///
+    /// 当时把 `command_is_agent` 抽成平台无关的纯函数，但 `pi_command_matches`
+    /// 还留着历史上的 `#[cfg(unix)]` ⇒ Windows 构建直接 `error[E0425]: cannot find
+    /// function pi_command_matches in this scope`。本机只有 aarch64-apple-darwin
+    /// target，**本地永远编不出来**——只能靠源码串断言在 macOS 上提前拦住。
+    ///
+    /// 字面量用 `concat!` 拆开写，否则守卫自己的源码就会命中它（自证陷阱，
+    /// 与 `config_save_uses_the_shared_atomic_writer` 同款）。
+    #[test]
+    fn agent_command_matching_stays_platform_agnostic() {
+        let src = include_str!("agent.rs");
+        let unix_gate = concat!("cfg(unix", ")");
+        let unix_gate_all = concat!("cfg(all(unix", ")");
+        for fname in ["pi_command_matches", "command_is_agent"] {
+            let decl = format!("fn {fname}(cmd: &str) -> bool {{");
+            let at = src
+                .find(&decl)
+                .unwrap_or_else(|| panic!("找不到 {fname} 定义"));
+            // 只看定义紧上方的属性/注释区（连续行），避免扫到同文件里别的函数。
+            let head = &src[..at];
+            let hit = head
+                .lines()
+                .rev()
+                .take_while(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("#[")
+                        || t.starts_with("///")
+                        || t.starts_with("//")
+                        || t.is_empty()
+                })
+                // 只认**属性行**：`pi_command_matches` 的 doc 注释里就写着
+                // 「不加 `#[cfg(unix)]`」这几个字（解释历史），算进注释就假阳。
+                .filter(|l| l.trim_start().starts_with("#["))
+                .any(|l| l.contains(unix_gate) || l.contains(unix_gate_all));
+            assert!(
+                !hit,
+                "{fname} 不得带 cfg(unix)：command_is_agent 是平台无关的，Windows 构建会 E0425"
+            );
+        }
     }
 
     /// NB-2：判据的正反两侧用**合成字符串**测，不依赖测试二进制的 argv。
