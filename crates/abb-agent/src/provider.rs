@@ -97,8 +97,8 @@ pub fn thinking_level(env: &dyn EnvSource) -> Option<rpi_ai::types::ThinkingLeve
 /// `model.reasoning && compat.supports_reasoning_effort` 时才真发 `reasoning_effort`
 ///（`Model::new` 给的是 `reasoning: false` + `compat: None` ⇒ 只设 builder 的档位**不生效**）。
 fn mark_model_reasoning(model: &mut Model) {
-    use rpi_ai::model::StreamingProtocolCompat;
     use rpi_ai::model::OpenaiCompletionsCompat as Compat;
+    use rpi_ai::model::StreamingProtocolCompat;
     model.reasoning = true;
     // `compat` 是按 api 分叉的**枚举**，不是 flat 结构：chat 走 `OpenaiCompletions` 分支
     //（`supports_reasoning_effort` 只在这个分支里有意义），responses 分支同理。
@@ -497,7 +497,10 @@ mod tests {
         assert_eq!(thinking_level(&with("off")), None);
         assert_eq!(thinking_level(&with("OFF")), None);
         assert_eq!(thinking_level(&with(" low ")), Some(ThinkingLevel::Low));
-        assert_eq!(thinking_level(&with("Minimal")), Some(ThinkingLevel::Minimal));
+        assert_eq!(
+            thinking_level(&with("Minimal")),
+            Some(ThinkingLevel::Minimal)
+        );
         assert_eq!(thinking_level(&with("medium")), Some(ThinkingLevel::Medium));
         assert_eq!(thinking_level(&with("high")), Some(ThinkingLevel::High));
         assert_eq!(thinking_level(&with("max")), Some(ThinkingLevel::Max));
@@ -511,7 +514,14 @@ mod tests {
     #[test]
     fn mark_model_reasoning_enables_chat_compat_flag() {
         use rpi_ai::model::StreamingProtocolCompat;
-        let mut model = custom_model("m", Api::OpenaiCompletions, "openai", "http://x", 4096, true);
+        let mut model = custom_model(
+            "m",
+            Api::OpenaiCompletions,
+            "openai",
+            "http://x",
+            4096,
+            true,
+        );
         assert!(!model.reasoning, "前提：Model::new 默认不给 reasoning");
         mark_model_reasoning(&mut model);
         assert!(model.reasoning);
