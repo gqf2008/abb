@@ -26,7 +26,19 @@ fi
 export CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}"
 
-(cd "$repo_root" && cargo test --locked "$@")
+# `--show-output`：让**通过**的用例也把 stdout/stderr 打出来。理由（卡
+# `abb-blur-race-flaky-20261029` 评审 NB-1）：libtest 默认**丢弃通过用例的输出**，于是
+# 「环境不满足 ⇒ 用例大声跳过那一条」这类 `[skip]` 说明在默认跑法里完全静音——同一个变异
+# 带 `--nocapture` 能看到「实测 295ms，本拍被拖过头」，默认跑法只剩一行 `test ... ok`，
+# 门禁日志里「跳过了」和「真验过」长得一模一样。这条门禁要能看见跳过。
+#
+# 为什么不用 `--nocapture`：它会取消测试线程的 stdout 捕获、把输出与测试进度混在一起，
+# 而 `--show-output` 只在单元测试结果之后按用例分段打印，日志仍然可读。
+# `--show-output` 是**测试二进制**的参数，必须放在 `--` 之后（放在 cargo 侧会报
+# `unexpected argument`）。调用方仍按原约定传「测试名过滤」这类 cargo 侧参数，例如
+#   tools/check_test_isolation.sh blur_
+# 若真的需要透传测试二进制参数，请放宽下面这行（本仓目前没有这样的调用点）。
+(cd "$repo_root" && cargo test --locked "$@" -- --show-output)
 
 if [ -e "$tmp_home/.agent-bridge" ]; then
   files="$(find "$tmp_home/.agent-bridge" -type f -print | sort)"

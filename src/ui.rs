@@ -11107,6 +11107,30 @@ mod tests {
         assert!(should_hide_on_blur(true, false));
     }
 
+    /// 延时下界（卡 `abb-blur-race-flaky-20261029` 评审 NB-2）：`BLUR_HIDE_DELAY_MS` 存在的理由
+    /// 是「等 AppKit 把 `[NSApp isActive]` 翻成 false」，所以它必须**远大于**一次 runloop 周转
+    ///（生产注释原话）。而「延时被改小到非 0 的小值」在行为用例里抓不到：常态 `focus→tick` 只有
+    /// 约 0.1ms，1ms 的定时器在那一拍本就不该到期，`blur_does_not_hide_before_delay_elapses`
+    /// 依然绿（实测 120→1 绿，这是既有盲区，不是本卡引入）。
+    ///
+    /// 这里补一条**与被测时序无关**的语义下界：不睡觉、不看墙钟、任何机器都稳定，改小即红。
+    /// 阈值 50ms 的依据：生产观察到的 runloop 周转是**毫秒级**、而事件顺序要求「跨过一次
+    /// `applicationDidResignActive:` 派发」；50ms 离「真的取消延时」足够远，又不会误伤合理的
+    /// 调整（120 是可调参数）。
+    #[test]
+    // 这条断言的**被测对象就是这个常量**，所以「常量与常量比较」正是它的用途；
+    // clippy 的 `assertions_on_constants` 在这里是误报（它防的是「永真/永假的断言」）。
+    #[allow(clippy::assertions_on_constants)]
+    fn blur_hide_delay_stays_meaningful() {
+        assert!(
+            super::BLUR_HIDE_DELAY_MS >= 50,
+            "失焦隐藏的延时被改到 {}ms：它必须远大于一次 runloop 周转（生产注释），\
+             改到这么小等于取消延迟——而 `[NSApp isActive]` 在 blur 回调里恒为 true，\
+             失焦隐藏会彻底失效",
+            super::BLUR_HIDE_DELAY_MS
+        );
+    }
+
     #[test]
     fn blur_hide_skips_hidden_window() {
         // 窗口本来就藏着：不再重复处理（避免「已关窗又收到一次 Focused(false)」时白跑一条隐藏路径）。

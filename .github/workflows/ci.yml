@@ -181,7 +181,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: test（全量测试）
-        run: cargo test
+        # `--show-output`：让**通过**的用例也打印自己的 stdout/stderr。libtest 默认丢弃，
+        # 于是「环境不满足 ⇒ 大声跳过某一条」的 `[skip]` 说明在 CI 日志里完全静音——
+        # 「跳过去了」与「真验过」长得一模一样（卡 `abb-blur-race-flaky-20261029` 评审 NB-1）。
+        # 本地门禁 tools/check_test_isolation.sh 已带同一旗标，这里补齐 CI 那一侧。
+        run: cargo test -- --show-output
 
       # #331：Windows 分发靠 `.cargo/config.toml` 的 +crt-static 自带 CRT。
       # 在 PR 阶段就拦住「配置被删/被 RUSTFLAGS 覆盖」——否则用户装完才发现
@@ -249,4 +253,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test（macOS：含依赖 mock agent 的端到端用例）
-        run: cargo test
+        # 同 windows job：带 `--show-output` 才能看见被跳过的用例给出的 `[skip]` 理由。
+        run: cargo test -- --show-output
