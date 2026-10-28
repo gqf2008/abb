@@ -3768,6 +3768,13 @@ export component SystemChatWindow inherits Window {
 
     in property <[SysChatBlockRow]> blocks: [];
     in property <bool> busy: false;
+    // 发送钮文案（空闲态）。为什么要做成属性（卡 `abb-v10-send-center-judge-20261028`）：
+    // 发送钮的左右留白 = 内边距 + **字形侧边距**，而侧边距取决于字体与文案——CJK「发送」
+    // 与 ASCII 在同一份布局下量出来的侧边距差可以不一样（macOS 实测：默认字体 0px、
+    // Songti 1px）。若只测 CJK，就分不清「布局把文字放偏了」与「字体侧边距本来就不等」。
+    // 测试用 ASCII 另量一次即可隔离：ASCII 若对称 ⇒ 布局没问题，CJK 的不等纯属字体度量。
+    // 生产永不改它（Rust 侧不设它），所以 UI 行为与之前一致。
+    in property <string> send-label: "发送";
     in property <string> status-line: "与怹直接对话（系统级 · 整机权限）";
     in property <bool> status-is-error: false;
     // 请求滞底：Rust 每追加一条消息 / 打开对话框时递增它（处理见本组件末尾的 changed 处理器）。
@@ -5388,7 +5395,7 @@ export component SystemChatWindow inherits Window {
                                     send-text := Text {
                                         width: 100%;
                                         height: 100%;
-                                        text: root.busy ? "⏹ 停止" : "发送";
+                                        text: root.busy ? "⏹ 停止" : root.send-label;
                                         font-size: 12px;
                                         font-weight: 800;
                                         color: root.busy ? PixelTheme.text : PixelTheme.on-accent;
