@@ -2104,15 +2104,43 @@ fn blur_keeps_window_when_process_still_active() {
 #[test]
 fn blur_does_not_hide_before_delay_elapses() {
     let h = blur_harness();
+    let t0 = std::time::Instant::now();
     assert!(
         h.focus(false, || false),
         "Focused(false) 应被失焦隐藏接线消费"
     );
     h.tick_now();
-    assert!(
-        h.ui.window().is_visible(),
-        "延时未到就隐藏了：`BLUR_HIDE_DELAY_MS` 的时序（等 AppKit 那一拍）被抹掉了"
-    );
+    // **前提校验（别把机器卡顿当成实现坏了）**：`tick_now` 用的是墙钟，若这两句之间线程被
+    // 抢占超过 `BLUR_HIDE_DELAY_MS`，定时器在**这一拍就已到期**、窗口会正常隐藏——那不是
+    // 「时序被抹掉」，只是本拍来晚了。实测：在 `tick_now()` 前插 `sleep(200ms)`，旧版本会
+    // 红并输出「延时未到就隐藏了：时序被抹掉了」——一句把环境问题说成代码问题的假红
+    //（最慢的 CI runner 上最容易碰）。所以先量间隔：
+    //   · 间隔 < delay（正常）⇒ 照原样断言「还没隐藏」；
+    //   · 间隔 >= delay（本拍被拖过头）⇒ 大声说明并跳过这一条，判据挪到下面的正面对照；
+    //   · delay == 0（变异自验）⇒ **不跳过**，否则「把延时改成 0」这个变异就再也打不红了
+    //     （验收 4 的判别力靠它）。`!delay.is_zero()` 这个条件就是为了守住这一点。
+    let elapsed = t0.elapsed();
+    let delay = Duration::from_millis(super::BLUR_HIDE_DELAY_MS);
+    if elapsed >= delay && !delay.is_zero() {
+        eprintln!(
+            "[skip] 「延时未到不隐藏」这一条未执行（环境不满足）：focus→tick 实测 {elapsed:?} \
+             已 >= BLUR_HIDE_DELAY_MS={delay:?}，本拍因机器/CI 卡顿来晚了；\
+             下面的正面对照仍会验「延时到点必须隐藏」。"
+        );
+    } else {
+        // 到这里的两种情形要分开报，否则文案会自相矛盾（delay=0 时 `elapsed < delay` 不成立）：
+        //   · delay == 0 ⇒ 这是变异自验，隐藏发生在同一拍；
+        //   · 否则 ⇒ 真回归：本拍确实来得早，可窗口还是被藏了。
+        let why = if delay.is_zero() {
+            format!("延时被改成 0（focus→tick 实测 {elapsed:?}）：立即隐藏说明 `BLUR_HIDE_DELAY_MS` 已失效")
+        } else {
+            format!(
+                "延时未到就隐藏了（focus→tick 实测 {elapsed:?} < 延时 {delay:?}，说明不是卡顿）：\
+                 `BLUR_HIDE_DELAY_MS` 的时序（等 AppKit 那一拍）被抹掉了"
+            )
+        };
+        assert!(h.ui.window().is_visible(), "{why}");
+    }
     h.wait_past_delay();
     assert!(
         !h.ui.window().is_visible(),
