@@ -2423,11 +2423,39 @@ mod tests {
 
     #[test]
     fn guard_check_owner_sessions_bypass() {
-        // owner 会话（env 非 granted）→ 直接 allow，不读 stdin
-        std::env::set_var("AGENT_BRIDGE_SENDER_ROLE", "owner");
+        // owner 会话（env 非 granted）→ 直接 allow，不读 stdin。
+        //
+        // env 改写走 `TestEnvVar`（卡 `abb-env-lock-shape-20261029`）：从前这里是裸 `set_var` +
+        // 结尾**无条件** `remove_var`——(1) 没持 `ENV_LOCK`；(2) 会抹掉 ambient 值（外面本来就有的
+        // `AGENT_BRIDGE_SENDER_ROLE`）；(3) 断言红了就走不到结尾那行 ⇒ `SENDER_ROLE=owner` 泄漏给
+        // 同进程后续用例。现在锁、存旧值、还原都在类型里，`restore()` 提到断言之前：红了也不漏。
+        let mut env = crate::lark_user::TestEnvVar::set("AGENT_BRIDGE_SENDER_ROLE", "owner");
         let code = guard_check_main();
+        env.restore();
         assert_eq!(code, 0);
-        std::env::remove_var("AGENT_BRIDGE_SENDER_ROLE");
+    }
+
+    /// 判别力（卡 `abb-env-lock-shape-20261029` 第 5 条）：**ambient 值必须原样还在**。
+    ///
+    /// [`guard_check_owner_sessions_bypass`] 在 ambient 为空时新旧两种写法都绿（旧写法照样把它删成
+    /// 「没有」，而用例期望的就是「没有」），所以判别力只能由这一条提供：先在外层把
+    /// `AGENT_BRIDGE_SENDER_ROLE` 钉成 `granted`（真实存在的另一种角色，不是测试专属哨兵），再跑那条
+    /// 用例本体——它结束必须还回 `granted`。旧的「结尾无条件 `remove_var`」在这里读到 `None` ⇒ 必红。
+    #[test]
+    fn owner_bypass_check_restores_ambient_sender_role() {
+        const KEY: &str = "AGENT_BRIDGE_SENDER_ROLE";
+        // 造 ambient：模拟「进程跑起来时环境里就有值」——用 `forget()` 把值留在进程里。
+        // （std 的 `Mutex` 不可重入，所以这里不能再套一层还活着的 `TestEnvVar`。）
+        crate::lark_user::TestEnvVar::set(KEY, "granted").forget();
+        guard_check_owner_sessions_bypass();
+        let got = std::env::var(KEY).ok();
+        // 收尾先于断言：红了也不把本用例造的哨兵值留给同进程其它用例（`forget`：删掉并保持删掉）
+        crate::lark_user::TestEnvVar::unset(KEY).forget();
+        assert_eq!(
+            got.as_deref(),
+            Some("granted"),
+            "被测用例抹掉了 ambient 值（无条件 remove_var 会得到 None）"
+        );
     }
 
     #[test]

@@ -2495,12 +2495,12 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // 串行锁必须横跨「设 env → 投递」全程（env 是进程全局），与 src/service.rs 同款处理
     async fn router_user_identity_without_cli_fails_and_never_falls_back_to_bot() {
         let (router, msgr) = user_router("feishu");
-        let _g = crate::lark_user::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var(crate::lark_user::LARK_CLI_ENV, "/nonexistent/lark-cli");
+        let mut env = crate::lark_user::TestEnvVar::set(
+            crate::lark_user::LARK_CLI_ENV,
+            "/nonexistent/lark-cli",
+        );
         let out = router.deliver(&user_identity_item("正文")).await;
-        std::env::remove_var(crate::lark_user::LARK_CLI_ENV);
+        env.restore();
         let DeliveryOutcome::NotDelivered(why) = out else {
             panic!("缺 CLI 必须算未送达");
         };
@@ -2545,12 +2545,11 @@ mod tests {
         perm.set_mode(0o755);
         std::fs::set_permissions(&cli, perm).unwrap();
         let (router, msgr) = user_router("feishu");
-        let _g = crate::lark_user::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var(crate::lark_user::LARK_CLI_ENV, cli.to_str().unwrap());
+        let _env = crate::lark_user::TestEnvVar::set(
+            crate::lark_user::LARK_CLI_ENV,
+            cli.to_str().unwrap(),
+        );
         let out = router.deliver(&user_identity_item("本人发的正文")).await;
-        std::env::remove_var(crate::lark_user::LARK_CLI_ENV);
         assert!(out.is_delivered(), "假 CLI 成功应 Delivered: {out:?}");
         assert!(
             msgr.sent.lock().unwrap().is_empty(),

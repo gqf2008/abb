@@ -708,15 +708,12 @@ mod tests {
     fn resolve_chat_prefers_positional_over_env() {
         let args = vec!["oc_xxx".to_string()];
         assert_eq!(resolve_chat(&args).unwrap(), "oc_xxx");
-        // 无位置参数且无 env → 报错（测试内清 env，桥注入的场景由集成侧覆盖）
-        let saved = std::env::var("AGENT_BRIDGE_CHAT_ID").ok();
-        std::env::remove_var("AGENT_BRIDGE_CHAT_ID");
+        // 无位置参数且无 env → 报错（测试内清 env，桥注入的场景由集成侧覆盖）。
+        // 改写走 `TestEnvVar`：持 `ENV_LOCK` + 存旧值/还原（此前这里是裸 `set_var`/`remove_var`，
+        // 没持锁——卡 `abb-env-lock-shape-20261029` 验收第 1 条）。
+        let _env = crate::lark_user::TestEnvVar::unset("AGENT_BRIDGE_CHAT_ID");
         let empty: Vec<String> = Vec::new();
         let r = resolve_chat(&empty);
-        match saved {
-            Some(v) => std::env::set_var("AGENT_BRIDGE_CHAT_ID", v),
-            None => std::env::remove_var("AGENT_BRIDGE_CHAT_ID"),
-        }
         assert!(r.is_err());
     }
 }

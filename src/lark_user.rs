@@ -201,26 +201,126 @@ pub fn check_app_consistency(expected_app_id: &str) {
     }
 }
 
-/// 测试期串行化 `ABB_LARK_CLI` 的读写：`send_text_as_user` 内部读进程环境，
-/// 而 Rust 单测是**同进程多线程并行**的——两个用例同时设/删这个变量会互相串台。
-/// 两个测试模块（本文件与 `deliver.rs`）共用这把锁。
+/// 测试期**写侧**串行化：谁要改进程环境，先拿这把锁（一律经 [`TestEnvVar`]，见下）。
+///
+/// 为什么需要它：生产代码（`send_text_as_user`、`SenderRole::from_env`、`resolve_workspaces` …）
+/// 都从**进程全局**环境里读值，而 Rust 单测是**同进程多线程并行**的——两个用例同时设/删同一个
+/// 变量就会互相串台。
+///
+/// ## 读侧为什么不纳入这把锁（卡 `abb-env-lock-shape-20261029` 第 4 条，2026-10-29 定）
+///
+/// 生产读点全是裸 `env::var`：`guard.rs::resolve_workspaces`、`config.rs::SenderRole::from_env`、
+/// `session_manage.rs::resolve_chat`、`main.rs` 两处。**有意就这么留着**，理由三条：
+///
+/// 1. 这把锁是 `#[cfg(test)]`——只存在于测试构建里。「读侧纳锁」就得把它变成发布代码，并在
+///    guard-check / 消息解析这些**热路径**上加一把进程级互斥锁；为只在 `cargo test` 并行下
+///    才存在的危害付生产代价，不成立。
+/// 2. 锁能买到的是「两个写者不互踩」：每个写者用例都是 `设 → 经生产代码读回 → 断言 → 还原`，
+///    串行化让这一整段原子（这才是 flaky 的主来源）。它对「某个**只读**用例在别人写的窗口里
+///    读到瞬时值」提供**零保护**——那个缺口只能靠「不把值留在进程里」收（也就是
+///    [`TestEnvVar`] 的存旧值/还原），不靠读侧加锁，加了也收不住。
+/// 3. 真正的读者若是**测试代码**读**测试专用开关**（如 `ui_headless_render_test.rs` 的探针
+///    开关），它已经持这把锁（`probe_env_lock()`）——那是便宜的严格，不牵扯生产路径。
+/// 4. 更根本地说：`set_var` 与并发读本就**形式不安全**（Rust 文档：其它线程同时 `getenv` 时
+///    属未定义行为——本仓 `src/bridge/mod.rs` 的 LESSON、`crates/abb-agent/src/provider.rs`
+///    的 `EnvSource` 注入缝都是这条的产物）。这把锁**不消除**那种不安全：它只把「写者互踩」
+///    这个**可观测**的 flaky 源收掉。真正安全的形状是「别改进程环境，改成注入」
+///    （abb-agent 走的就是那条路），所以**别把「持了锁」当成「可以随便改 env 的许可证」**。
+///
+/// ⇒ 结论：**写侧持锁、生产读侧裸读**；每次改写都要「存旧值/还原」并**把窗口压到最小**。
+/// 这是确定并要长期保持的形状，别把它当成遗漏。
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 测试期 env 改写器：**持 [`ENV_LOCK`] + 「进来时的旧值」在结束（`restore()` 或 `Drop`）时还原**。
+///
+/// 为什么做成类型，而不是每个用例自己 `set_var` / `remove_var`（卡 `abb-env-lock-shape-20261029`）：
+/// 手写的那一对有三个缺口——(1) 容易忘了持锁；(2) 结尾无条件 `remove_var` 会抹掉**外面本来就有的值**
+/// （`ABB_LARK_CLI=/path cargo test`、或外层用例留下的 ambient 值）；(3) 断言写在还原之前 ⇒ 一旦红了
+/// 就走不到还原那行，值泄漏给同进程后续用例。
+/// 「先存旧值 → 再设 → 用完还原」把这三条变成结构保证；还原在 `Drop` 里，**panic 也照还原**。
+#[cfg(test)]
+pub(crate) struct TestEnvVar {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    key: &'static str,
+    saved: Option<std::ffi::OsString>,
+    pending: bool,
+}
+
+#[cfg(test)]
+impl TestEnvVar {
+    /// 取锁、记旧值（此前不改任何变量）。
+    fn begin(key: &'static str) -> Self {
+        Self {
+            _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+            key,
+            saved: std::env::var_os(key),
+            pending: true,
+        }
+    }
+
+    /// 取锁、记旧值，然后设成本值。
+    pub(crate) fn set(key: &'static str, value: &str) -> Self {
+        let g = Self::begin(key);
+        std::env::set_var(key, value);
+        g
+    }
+
+    /// 取锁、记旧值，然后摘掉（还原时可能回到「本来就没有」）。
+    pub(crate) fn unset(key: &'static str) -> Self {
+        let g = Self::begin(key);
+        std::env::remove_var(key);
+        g
+    }
+
+    /// 立刻还原（用例想在断言之前就恢复环境时用；`Drop` 是兜底）。
+    pub(crate) fn restore(&mut self) {
+        if !self.pending {
+            return;
+        }
+        self.pending = false;
+        match self.saved.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+
+    /// 放弃还原、把当前值留在进程里：给「用例自己要模拟『进程启动时就有的 ambient 值』」用。
+    pub(crate) fn forget(mut self) {
+        self.pending = false;
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestEnvVar {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 取锁（被 panic 毒化也照用：毒化只说明别的用例失败过，与本用例无关）。
-    ///
-    /// `#[cfg(unix)]` 是**cfg 对称**（2026-10-12，卡 abb-windows-ps1-exit-code-leak-20261012）：
-    /// 只有 `unix` 上那几条"假 CLI 脚本"用例用它；不加门控时 Windows 上它是 dead code，
-    /// 而 CI 的 `cargo clippy --all-targets -- -D warnings` 会把 `dead_code` 当 error
-    /// （实测：Windows job 在 `src/lark_user.rs:215` 报 `fn env_guard is never used`）。
-    /// 不要再"为了统一"把它放开：跨平台的并发用例用 `ENV_LOCK` 本身，不需要这个 helper。
-    #[cfg(unix)]
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// 判别力（卡 `abb-env-lock-shape-20261029`）：本类型是**所有**测试期 env 改写的唯一入口，
+    /// 所以它的还原语义在这里钉一次，其余调用点继承。
+    /// 变异：把 [`TestEnvVar::restore`] 的 `match` 换成无条件 `remove_var` ⇒ 第二条断言必红。
+    #[test]
+    fn test_env_var_restores_previous_value() {
+        const KEY: &str = "ABB_TEST_ENV_VAR_RESTORE_SENTINEL";
+        // 造一个「外面本来就有」的 ambient 值（forget：让值留在进程里，别被 Drop 还原掉）
+        TestEnvVar::set(KEY, "ambient").forget();
+        {
+            let mut inner = TestEnvVar::set(KEY, "temporary");
+            assert_eq!(std::env::var(KEY).as_deref(), Ok("temporary"));
+            inner.restore();
+        }
+        // 收尾：读回 ambient 再清掉哨兵，别把本用例的键留给后来者
+        let got = std::env::var(KEY).ok();
+        assert_eq!(got.as_deref(), Some("ambient"), "必须还原成进来时看到的值");
+        // 收尾：清掉哨兵（`forget`：要的就是“删掉并保持删掉”，别又还原回来）
+        TestEnvVar::unset(KEY).forget();
+        assert!(std::env::var_os(KEY).is_none(), "unset 后不该还在");
     }
 
     #[test]
@@ -332,7 +432,6 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // 同上：env 是进程全局，锁要横跨整个用例
     async fn fake_cli_receives_identity_and_target() {
-        let _g = env_guard(); // ABB_LARK_CLI 是本进程全局，串行化
         let dir = std::env::temp_dir().join(format!("abb-lark-fake-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let rec = dir.join("argv.txt");
@@ -343,9 +442,8 @@ mod tests {
                 rec.display()
             ),
         );
-        std::env::set_var(LARK_CLI_ENV, cli.to_str().unwrap());
+        let _env = TestEnvVar::set(LARK_CLI_ENV, cli.to_str().unwrap());
         let r = send_text_as_user("oc_t", "正文").await;
-        std::env::remove_var(LARK_CLI_ENV);
         assert!(r.is_ok(), "假 CLI 退出 0 应 Ok: {r:?}");
         let got = std::fs::read_to_string(&rec).unwrap();
         let lines: Vec<&str> = got.lines().collect();
@@ -366,16 +464,14 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // 同上：env 是进程全局，锁要横跨整个用例
     async fn failing_cli_surfaces_stderr() {
-        let _g = env_guard(); // ABB_LARK_CLI 是本进程全局，串行化
         let dir = std::env::temp_dir().join(format!("abb-lark-fail-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let cli = write_fake_cli(
             &dir,
             "#!/bin/sh\necho 'no user token, run auth login' >&2\nexit 3\n",
         );
-        std::env::set_var(LARK_CLI_ENV, cli.to_str().unwrap());
+        let _env = TestEnvVar::set(LARK_CLI_ENV, cli.to_str().unwrap());
         let r = send_text_as_user("oc_t", "x").await;
-        std::env::remove_var(LARK_CLI_ENV);
         let e = format!("{:#}", r.unwrap_err());
         assert!(e.contains("退出码 3"), "应带退出码: {e}");
         assert!(e.contains("no user token"), "应带 stderr 原文: {e}");
@@ -403,7 +499,6 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // 同上：env 是进程全局，锁要横跨整个用例
     async fn killed_cli_does_not_write_its_marker() {
-        let _g = env_guard();
         let dir = std::env::temp_dir().join(format!("abb-lark-kill-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("sent.txt");
@@ -411,9 +506,8 @@ mod tests {
             &dir,
             &format!("#!/bin/sh\nsleep 1\necho yes > {}\n", marker.display()),
         );
-        std::env::set_var(LARK_CLI_ENV, cli.to_str().unwrap());
+        let _env = TestEnvVar::set(LARK_CLI_ENV, cli.to_str().unwrap());
         let r = send_text_as_user_with_timeout("oc_t", "x", Duration::from_millis(100)).await;
-        std::env::remove_var(LARK_CLI_ENV);
         assert!(format!("{:#}", r.unwrap_err()).contains("超时"));
         // 观测窗 2s > 脚本自身 1s：这是判据成立的前提，别改短（改了就是恒真断言）。
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -439,17 +533,15 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // 同上：env 是进程全局，锁要横跨整个用例
     async fn hanging_cli_times_out_instead_of_blocking_delivery() {
-        let _g = env_guard(); // ABB_LARK_CLI 是本进程全局，串行化
         let dir = std::env::temp_dir().join(format!("abb-lark-hang-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         // 脚本自己跑完需要 3s；断言只看"我们没等它"。（不写"已启动"标记再断言它存在：
         // 那是个竞态——200ms 内 shell 未必已经执行到那里，且错误串含"超时"本身已证明子进程起过。）
         let cli = write_fake_cli(&dir, "#!/bin/sh\nsleep 3\n");
-        std::env::set_var(LARK_CLI_ENV, cli.to_str().unwrap());
+        let _env = TestEnvVar::set(LARK_CLI_ENV, cli.to_str().unwrap());
         let t0 = std::time::Instant::now();
         let r = send_text_as_user_with_timeout("oc_t", "x", Duration::from_millis(200)).await;
         let elapsed = t0.elapsed();
-        std::env::remove_var(LARK_CLI_ENV);
         let e = format!("{:#}", r.unwrap_err());
         assert!(e.contains("超时"), "应报超时: {e}");
         assert!(
