@@ -328,6 +328,70 @@ fn settle_w(window: &Rc<MinimalSoftwareWindow>, w: u32, h: u32) -> Frame {
 // macOS 全绿。修法不是给断言放水，而是**先问环境能不能画，再断言我们画了没有**——
 // 顺序照搬 `crates/abb-chart` 的逐字符覆盖校验（`docs/upstream-charton-raster-font-findings.md`）。
 
+/// 只读侧的锁：读一个探针开关之前取它。
+///
+/// 写侧用 [`EnvOverride`]，两者共用 `lark_user::ENV_LOCK`——否则「别的用例中途设了值」会被
+/// 这里读成「用户的设置」（libtest 是**同进程多线程并行**跑用例的）。
+fn probe_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::lark_user::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// 探针开关的环境变量改写器：**持 `ENV_LOCK` + 退出时还原旧值**。
+///
+/// 为什么必须这样（卡 `abb-glyph-probe-env-leak-20261029`）：libtest **按名字排序**跑用例，
+/// `glyph_*` / `missing_glyph_*` 排在 `v11_panels_*` 之前。从前那两条用例结尾无条件
+/// `remove_var("ABB_TEST_ASSUME_MISSING_GLYPH")`——于是用户按提示传进来的开关在跑到 v11 之前
+/// 就被自己人删掉了：`[skip]` 文案里印的那条复跑命令在**全量**跑法下失效，
+/// `ABB_TEST_NO_SKIP=1` 加该开关也静默全绿（实测 1391 passed）。
+/// 「先存旧值、结束还原」把「改动是局部的」从口头约定变成结构保证。
+///
+/// 顺带收口并发：同一 key 只在**第一次**被改时记旧值（以该次见到的为准），`Drop` 按反序还原。
+struct EnvOverride {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvOverride {
+    /// 取锁并开始记录（此时不改任何变量）。
+    fn begin() -> Self {
+        Self {
+            _lock: probe_env_lock(),
+            saved: Vec::new(),
+        }
+    }
+
+    /// 设值；旧值只记第一次。
+    fn set(&mut self, key: &'static str, value: &str) {
+        self.remember(key);
+        std::env::set_var(key, value);
+    }
+
+    /// 临时摘掉（`Drop` 时还原成原来的样子，可能是「本来就没有」）。
+    fn unset(&mut self, key: &'static str) {
+        self.remember(key);
+        std::env::remove_var(key);
+    }
+
+    fn remember(&mut self, key: &'static str) {
+        if !self.saved.iter().any(|(k, _)| *k == key) {
+            self.saved.push((key, std::env::var_os(key)));
+        }
+    }
+}
+
+impl Drop for EnvOverride {
+    fn drop(&mut self) {
+        for (key, old) in self.saved.drain(..).rev() {
+            match old {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// 变异自验开关：把列出的字形当作「本机画不出」。
 ///
 /// 为什么要有它：`glyph_ink_probe` 的负结果只出现在**真的缺该字形**的机器上，而本仓的
@@ -338,6 +402,11 @@ fn settle_w(window: &Rc<MinimalSoftwareWindow>, w: u32, h: u32) -> Frame {
 /// ABB_TEST_ASSUME_MISSING_GLYPH=2713            # 十六进制码位（可写 u+2713）
 /// ABB_TEST_ASSUME_MISSING_GLYPH=✓,2714          # 直接写字符也行；逗号分隔多个
 /// ```
+///
+/// **写法陷阱**：解析顺序是「先当十六进制读，读不了才按字面字符比」，所以**任何合法十六进制串
+/// 都不会退化成字面字符**——`=e` 是 U+000E（控制字符）而**不是**字符 `'e'`，`=abc` 是 U+0ABC
+/// 而**不是**字符串 `"abc"`。想按字面字符标记，该字符必须**读不成**十六进制（如 `✓`）；
+/// 想标记 `'e'`/`'E'`/`'d'` 这类恰好是十六进制数字的字符，请写码位（`65` / `45` / `64`）。
 fn forcibly_missing_glyph(ch: char) -> bool {
     let Ok(spec) = std::env::var("ABB_TEST_ASSUME_MISSING_GLYPH") else {
         return false;
@@ -412,6 +481,8 @@ fn glyph_drawable(ch: char) -> Result<(), String> {
 /// 根本看不到），所以「大声跳过」在本机其实只剩一句得靠人加参数才看得见的话。CI 是最不能
 /// 无声放水的地方（那里的字体是已知的：macOS 与 windows-latest 都能画 ✓），于是 CI 一律严格：
 /// 缺字形 ⇒ 红、逼人来看；本机（字体因人而异）才允许带明确理由跳过。
+///
+/// 这条接线本身有独立用例钉着（`strict_no_skip_reads_the_switches_from_the_environment`）。
 fn strict_no_skip() -> bool {
     std::env::var_os("CI").is_some() || std::env::var_os("ABB_TEST_NO_SKIP").is_some()
 }
@@ -428,7 +499,9 @@ fn glyph_skip_notice(what: &str, why: &str, strict: bool) -> String {
     format!(
         "[skip] {what} 的像素断言未执行（环境不满足）：{why}\n\
          [skip] 其余断言照跑；在这台机器上复跑这条跳过：\
-         ABB_TEST_ASSUME_MISSING_GLYPH=2713 cargo test -- --nocapture"
+         ABB_TEST_ASSUME_MISSING_GLYPH=2713 cargo test -- --nocapture\n\
+         [skip] 注：该开关先按十六进制码位解析（`2713` / `u+2713` 都是 U+2713），\
+         读不成十六进制才按字面字符比（如 `✓`）——所以 `=e` 是 U+000E，不是字符 `e`。"
     )
 }
 
@@ -2527,7 +2600,16 @@ fn v11_panels_anchor_and_usage_meter_match_design() {
     // 而红的样子与「布局/颜色坏了」**完全一样**（都没有墨迹）——下一个人会先查代码。
     // 所以先探针：画不出就**大声跳过这一条**（说明跳过了什么、如何复现），其余断言照跑；
     // 画得出则照原样断言，任何「我们的 UI 把 ✓ 画没了」的回归**照旧必红**。
-    match glyph_drawable('✓') {
+    //
+    // 两个开关的**读取**必须与写入方持同一把锁（卡 `abb-glyph-probe-env-leak-20261029` 第 3 条）：
+    // 否则并发的 `missing_glyph_*` / `strict_no_skip_*` 用例中途设的值会被这里当成「跑的人的设置」
+    // （它们自己结束会还原，但**读到的那一瞬间**可能是它们设的）。锁只包住读的两句，
+    // 渲染与断言不持锁，不给其它环境用例加串行化成本。
+    let (drawable, strict) = {
+        let _env = probe_env_lock();
+        (glyph_drawable('✓'), strict_no_skip())
+    };
+    match drawable {
         Ok(()) => {
             assert!(
                 bbox(
@@ -2545,7 +2627,7 @@ fn v11_panels_anchor_and_usage_meter_match_design() {
         Err(why) => {
             eprintln!(
                 "{}",
-                glyph_skip_notice("v11 面板的「当前项 ✓」", &why, strict_no_skip())
+                glyph_skip_notice("v11 面板的「当前项 ✓」", &why, strict)
             );
         }
     }
@@ -4374,6 +4456,39 @@ fn glyph_ink_classification_never_blames_font_when_renderer_is_dead() {
     let _ = classify_glyph_ink(0, 0, '✓');
 }
 
+/// 接线用例（卡 `abb-strict-no-skip-untested-20261029`）：**环境变量 → [`strict_no_skip`]**。
+///
+/// 为什么单独立一条：`glyph_skip_notice_refuses_to_weaken_the_gate_under_ci` 是把 `strict` 当
+/// **形参**传、测的是文案函数；把 `strict_no_skip()` 改成恒 `false`（评审实测：整包 1391 条 +
+/// 四条门禁全绿）它咬不住。这里钉的是「读环境」这一段本身——两个方向都钉：
+/// 恒 `false` ⇒ 前两半红；恒 `true` ⇒ 全部「未设 ⇒ 假」那几句红。
+///
+/// 关于 `CI`：卡上原本允许「`CI` 存在时跳过后半」，这里改成**持锁自己把 `CI` 摘掉再断言**
+/// （[`EnvOverride`] 保证结束时还原）。理由：跳过会让「恒 `true`」这个变异在 CI 里无人看着，
+/// 而 CI 恰恰是这条阀门最该被看住的地方；自己控制 `CI` 则两半在任何机器上都可跑，
+/// 也不引入「取决于跑的人有没有 export CI」的脆断言（验收 5）。
+#[test]
+fn strict_no_skip_reads_the_switches_from_the_environment() {
+    let mut env = EnvOverride::begin();
+
+    // 半 1：两个开关都不在 ⇒ 宽松（否则本机会因字体而异无理由红）。
+    env.unset("CI");
+    env.unset("ABB_TEST_NO_SKIP");
+    assert!(
+        !strict_no_skip(),
+        "`CI` 与 `ABB_TEST_NO_SKIP` 都不在时必须宽松"
+    );
+
+    // 半 2：`ABB_TEST_NO_SKIP` 存在（值不重要，只看存在性）⇒ 严格。
+    env.set("ABB_TEST_NO_SKIP", "1");
+    assert!(strict_no_skip(), "`ABB_TEST_NO_SKIP` 存在 ⇒ 严格模式");
+
+    // 半 3：摘掉前者、换上 `CI` ⇒ 仍然严格（两个分支各钉一次，别让一个接线假红掩盖另一个）。
+    env.unset("ABB_TEST_NO_SKIP");
+    env.set("CI", "1");
+    assert!(strict_no_skip(), "`CI` 存在 ⇒ 严格模式");
+}
+
 /// 宽松模式（本机）：缺字形 ⇒ 返回带 `[skip]` 与原因的说明（不 panic，其余断言照跑）。
 #[test]
 fn glyph_skip_notice_is_loud_and_actionable_when_lax() {
@@ -4396,21 +4511,32 @@ fn glyph_skip_notice_refuses_to_weaken_the_gate_under_ci() {
 /// 变异自验入口（验收 5）：`ABB_TEST_ASSUME_MISSING_GLYPH` 把 ✓ 标成缺字形后，`glyph_drawable`
 /// 必须返回 `Err`（调用方据此走「环境不满足」分支）——**不得**报成断言失败。
 /// 同时钉住三种写法（hex / `u+` 前缀 / 字面字符）与「不命中别的码位」。
+///
+/// 改写一律走 [`EnvOverride`]：**存旧值、结束还原**，不得无条件 `remove_var`（否则用户传进来的
+/// 开关会被这条用例吃掉，参卡 `abb-glyph-probe-env-leak-20261029`）。
 #[test]
 fn missing_glyph_overlay_marks_only_the_listed_glyph() {
-    let _g = crate::lark_user::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("ABB_TEST_ASSUME_MISSING_GLYPH", "2713");
+    let mut env = EnvOverride::begin();
+    env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "2713");
     let why = glyph_drawable('✓').expect_err("被标记为缺字形时必须走跳过分支");
     assert!(why.contains("ABB_TEST_ASSUME_MISSING_GLYPH"), "{why}");
     for spec in ["u+2713", "U+2713", "✓", "2714, 2713", " 2713 "] {
-        std::env::set_var("ABB_TEST_ASSUME_MISSING_GLYPH", spec);
+        env.set("ABB_TEST_ASSUME_MISSING_GLYPH", spec);
         assert!(forcibly_missing_glyph('✓'), "写法 `{spec}` 应命中");
     }
-    std::env::set_var("ABB_TEST_ASSUME_MISSING_GLYPH", "2714");
+    env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "2714");
     assert!(!forcibly_missing_glyph('✓'), "别的码位不该命中");
-    std::env::remove_var("ABB_TEST_ASSUME_MISSING_GLYPH");
+    // 钉住文档里那条「写法陷阱」：能当十六进制读的标签**不会**退化成字面字符。
+    env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "e");
+    assert!(forcibly_missing_glyph('\u{e}'), "`e` 应被读成码位 U+000E");
+    assert!(
+        !forcibly_missing_glyph('e'),
+        "`e` 不是字符 'e'（它是合法十六进制）——要标字符 `e` 请写码位 `65`"
+    );
+    // 读不成十六进制的标签才按字面字符比。
+    env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "zz");
+    assert!(!forcibly_missing_glyph('✓'), "`zz` 既读不成码位也不等于 ✓");
+    env.unset("ABB_TEST_ASSUME_MISSING_GLYPH");
     assert!(!forcibly_missing_glyph('✓'), "开关未设时不命中");
 }
 
@@ -4418,10 +4544,8 @@ fn missing_glyph_overlay_marks_only_the_listed_glyph() {
 /// 而「环境缺字形」的判定就永远走不到。这一条不依赖 ✓ 是否存在，所以在任何机器上都成立。
 #[test]
 fn glyph_probe_machinery_works_on_this_host() {
-    let _g = crate::lark_user::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("ABB_TEST_ASSUME_MISSING_GLYPH");
+    let mut env = EnvOverride::begin();
+    env.unset("ABB_TEST_ASSUME_MISSING_GLYPH");
     assert!(
         glyph_ink_probe('M') > 0,
         "ASCII `M` 在消息区应留下墨迹：探针（或渲染台）坏了，先修它再谈缺字形"
