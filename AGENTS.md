@@ -120,13 +120,16 @@ export TMPDIR=/e/tmp
 export CARGO_TARGET_DIR=/e/tmp/abb-target-$(basename "$PWD")   # 每 worktree 一个
 ```
 
-`tools/gates.sh` sets these two for the current platform and then runs the four gates below;
+`tools/gates.sh` sets these two for the current platform and then runs the gates below **in two
+groups**: the root package's four, plus the same four with `--manifest-path crates/abb-chart`
+(that package has its own manifest + lock + MSRV 1.85 and no `[workspace]` covers it, so the root
+commands cannot see it; its target dir is `…-chart` so cargo's file lock never shares with root);
 it **refuses a base inside the checkout** (`ABB_BUILD_TMP` overrides the platform default,
 `--print-env` shows what it resolved, `ABB_GATES_OS=darwin` reproduces the macOS values on any
 host). Prefer it over typing the exports by hand — that is what keeps the policy machine-checkable:
 
 ```sh
-bash tools/gates.sh            # 四条门禁，中间产物外置
+bash tools/gates.sh            # 八条门禁（root 四条 + crates/abb-chart 四条），中间产物外置
 bash tools/gates.sh --print-env
 ```
 
@@ -143,7 +146,8 @@ bash tools/gates.sh --print-env
 - `scripts/build.sh` — build the release macOS bundle into `~/Applications/ABB.app`.
 - `scripts/sign.sh` — re-sign with the `agent-bridge-dev` certificate so TCC privacy grants survive rebuilds.
 
-With the two exports above in the shell（或直接 `bash tools/gates.sh`）, the four gate commands are verbatim:
+With the two exports above in the shell（或直接 `bash tools/gates.sh`）, the root group's four gate commands are verbatim
+(`tools/gates.sh` then reruns the same set against `crates/abb-chart` via `--manifest-path`):
 
 ```sh
 cargo fmt --check

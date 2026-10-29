@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# 门禁一键入口：**先把构建中间产物赶到 checkout 之外**，再跑 AGENTS.md 定义的四条门禁。
+# 门禁一键入口：**先把构建中间产物赶到 checkout 之外**，再跑 AGENTS.md 定义的门禁——
+# **两组共八条**：root 包四条（fmt / clippy / build --locked / 隔离全量测试）+ `crates/abb-chart`
+# 四条（同形命令，但都带 `--manifest-path`）。
+#
+# 为什么 chart 要单独一组：`crates/abb-chart` 是**独立包**（自带 manifest + lock + MSRV 1.85），
+# 而 root 的 `Cargo.toml` **没有 `[workspace]`** ⇒ 不带 `--manifest-path` 的 root 命令
+# **语义上完全碰不到它**。补这一组之前实测：一次门禁日志 3654 行里 `Running tests/cli_e2e`
+# 出现 0 次——chart 的测试红了，本机合并门禁照样全绿。它此前的覆盖只有 GitHub Actions 的
+# `abb-chart-lint` / `abb-chart-windows`，而本仓合并门禁**不要求 CI run** ⇒ 缺口就在这里。
 #
 # 为什么存在：2026-09-17 的 macOS 政策（`/Volumes/DataExt/tmp`）只覆盖 macOS，
 # Windows 上照文档执行 = 裸 `cargo` = 中间产物全落 checkout（2026-10-11 实测把仓库撑到
@@ -8,7 +16,7 @@
 # 这样这条政策才有机器判据（`RULE_规则可执行性.md` 第 1 条）。
 #
 # 用法：
-#   tools/gates.sh                 # 跑四条门禁（fmt / clippy / build --locked / 隔离全量测试）
+#   tools/gates.sh                 # 跑两组门禁（root 四条 + crates/abb-chart 四条）
 #   tools/gates.sh --print-env     # 只打印解析结果（os、TMPDIR、TMP、TEMP、CARGO_TARGET_DIR、repo）
 #   ABB_BUILD_TMP=/e/tmp tools/gates.sh   # 覆盖 base（默认按平台取数据卷；**必须已存在**）
 #   ABB_GATES_OS=darwin tools/gates.sh --print-env   # 覆盖平台探测（用于在本机核 macOS 口径）
@@ -17,7 +25,8 @@
 #   1. base 落在 checkout 内 ⇒ 直接失败；
 #   2. base 不存在 ⇒ 直接失败（不代建，避免把产物静默写到启动卷/系统盘）。
 #
-# 退出码：0=门禁全绿；1=政策违规（base 在 checkout 内 / base 不存在）；其它=cargo/测试自身的失败码。
+# 退出码：0=门禁全绿；1=政策违规（base 在 checkout 内 / base 不存在）；其它=cargo/测试自身的失败码
+#   （两组任一条失败都会立刻以该条的状态码退出，后续门禁不再跑）。
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,7 +36,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --print-env | --dry-run) print_only=1 ;;
     -h | --help)
-      sed -n '2,20p' "$0"
+      # 头注自 `# 门禁一键入口` 起到 `set -euo pipefail` **之前**：不写死行号，改注释不会错位。
+      sed -n '/^# 门禁一键入口/,/^set -euo pipefail$/p' "$0" | sed -n '/^set -euo pipefail$/q;p'
       exit 0
       ;;
     *)
@@ -118,12 +128,33 @@ fi
 # 只在真跑门禁时建产物子目录：`--print-env`（含 macOS 口径探测）不写磁盘。
 mkdir -p "$CARGO_TARGET_DIR"
 
+# `crates/abb-chart` 的 target **另开一个子目录**：与 root 共用同一个目录会重演上面那段
+# 「cargo 文件锁互相饿等」（不同包、不同 feature 集，锁的粒度却是整目录）。
+chart_manifest="$repo_root/crates/abb-chart/Cargo.toml"
+chart_target="$CARGO_TARGET_DIR-chart"
+mkdir -p "$chart_target"
+
 cd "$repo_root"
-echo "== ABB 门禁（中间产物外置于 ${CARGO_TARGET_DIR}）=="
+echo "== ABB 门禁：root 包（中间产物外置于 ${CARGO_TARGET_DIR}）=="
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked
 tools/check_test_isolation.sh
 # 兜底：清掉 TMPDIR 里陈旧的测试夹具（见脚本头注；根因修复在 src/testtmp.rs 的 RAII 归属）。
 tools/clean_test_fixtures.sh
-echo "✅ 四条门禁全绿；checkout 内未产生 target/（中间产物在 ${CARGO_TARGET_DIR}）；测试夹具残留已清扫"
+
+# crates/abb-chart 是独立包，root 的四条碰不到它（见头注）⇒ 这里补一组 `--manifest-path` 门禁。
+# 测试不用 tools/check_test_isolation.sh：那个守卫查的是「测试不得写 ~/.agent-bridge」（root 包
+# 有大量运行数据落点），而 chart 只管出图、不碰运行目录；它要的是**离线可跑**（`--offline`）：
+# 随包分发的 CLI 不该为了跑单测去联网。cargo 跑测试二进制时 cwd 就是包根，manifest 仍用绝对
+# 路径（免得将来有人在这段前面 `cd` 到别处，静默跑错包）。
+echo "== ABB 门禁：crates/abb-chart（独立包，中间产物外置于 ${chart_target}）=="
+(
+  export CARGO_TARGET_DIR="$chart_target"
+  cargo fmt --manifest-path "$chart_manifest" --check
+  cargo clippy --manifest-path "$chart_manifest" --locked --all-targets -- -D warnings
+  cargo build --manifest-path "$chart_manifest" --locked
+  cargo test --manifest-path "$chart_manifest" --offline
+)
+
+echo "✅ 八条门禁全绿（root 四条 + crates/abb-chart 四条）；checkout 内未产生 target/（中间产物在 ${CARGO_TARGET_DIR} 与 ${chart_target}）；测试夹具残留已清扫"
