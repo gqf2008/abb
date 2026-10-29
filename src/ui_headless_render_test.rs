@@ -248,6 +248,53 @@ fn groups(v: &[u32]) -> Vec<(u32, u32)> {
     out
 }
 
+/// 控件格的**内框**矩形 `(x0, y0, x1, y1)`（右/下为开区间）：把**边框**的墨迹排掉。
+///
+/// 为什么要有它（卡 `abb-session-icon-glyph-and-blind-assert-20261029`）：护「标题栏图标没丢」
+/// 的断言从前写的是「这一格里有墨迹」，而 26×26 的图标格自带 2px `PixelTheme.edge` 描边
+///（#1c1a17，三通道和 77 < [`is_dark`] 的 300）—— **边框本身就把断言喂饱了**。
+/// 实测：②历史会话当年的 `Text { text: "🗂" }` 内框暗像素 0、整格有墨，断言依旧是绿的。
+///
+/// 口径 = **逐边内缩，直到四条边上都没有墨迹**（即边框不再出现在内框边界上）。
+/// 为什么不写死 `x0+2 .. x1-2`，也不只量中线：这四格是 `border-radius: 6px` 的圆角框，
+/// 角上的边框比中线上的厚得多，固定的 2px（或中线量出的 2px）内框在**圆角处仍落在边框上**。
+/// 本卡实测踩过这个坑：把图标整块删掉后，按「各去 2px」量出的内框仍有 4 个暗像素
+///（y=8 那行的圆角弧），断言照样绿。逐边看就能把圆角一并排掉，且对任何 `border-width` 成立。
+///
+/// 边框粗到把整格吃满时**大声红**（「量不出内框」），而不是退化成「看到边框墨迹就说过了」。
+fn cell_interior(f: &Frame, x0: u32, x1: u32, y0: u32, y1: u32) -> (u32, u32, u32, u32) {
+    let (mut ix0, mut iy0, mut ix1, mut iy1) = (x0, y0, x1, y1);
+    // 每次至少缩一条边，且缩到任一边 ≤ 7px 就停 ⇒ 一定终止。
+    while ix1 - ix0 > 7 && iy1 - iy0 > 7 {
+        let mut moved = false;
+        if (ix0..ix1).any(|x| is_dark(f.px(x, iy0))) {
+            iy0 += 1;
+            moved = true;
+        }
+        if (ix0..ix1).any(|x| is_dark(f.px(x, iy1 - 1))) {
+            iy1 -= 1;
+            moved = true;
+        }
+        if (iy0..iy1).any(|y| is_dark(f.px(ix0, y))) {
+            ix0 += 1;
+            moved = true;
+        }
+        if (iy0..iy1).any(|y| is_dark(f.px(ix1 - 1, y))) {
+            ix1 -= 1;
+            moved = true;
+        }
+        if !moved {
+            break;
+        }
+    }
+    assert!(
+        ix1 - ix0 > 7 && iy1 - iy0 > 7,
+        "格 {x0}..{x1} × {y0}..{y1} 的内框只剩 {ix0}..{ix1} × {iy0}..{iy1}：\
+         边框（或其它墨迹）把整格吃满了，无法判定里面有没有图标"
+    );
+    (ix0, iy0, ix1, iy1)
+}
+
 /// 主色（暖黄 `#ffc61a`）判据：发送按钮的 accent 底。
 /// 预乘后不透明像素 = 原色；只用于量 bbox 的**形状**（不比较精确色值）。
 fn is_accent(p: PremultipliedRgbaColor) -> bool {
@@ -1205,11 +1252,26 @@ fn titlebar_strip_does_not_overlap_title_or_buttons() {
         zone_left - 8
     );
     // 正面控制：**每一个画出来的**项都得有墨迹（少画一个就是空壳）。
+    //
+    // 判据只在**内框**里找墨迹，而内框的边界是**从像素上量出来的**（[`cell_interior`]），
+    // 不是写死的 2px。卡 `abb-session-icon-glyph-and-blind-assert-20261029` 的教训：
+    // 从前这里是「整格里有墨迹」，而这四格都自带 2px `PixelTheme.edge` 描边
+    //（#1c1a17 ⇒ 三通道和 77 < `is_dark` 阈值 300）⇒ 边框自己就把断言喂饱了。
+    // 实测：②历史会话当年的 `Text { text: "🗂" }` 内框里暗像素是 **0**（emoji-only 码位取不出
+    // 轮廓、一个像素也不画），这条断言依旧绿 —— 图标一直是隐形的，没人发现。
     let mut cursor = strip_x;
     for (w, name) in &items {
         let w = w.round() as u32;
-        let ink = (cursor..cursor + w).any(|x| (6..32).any(|y| is_dark(f.px(x, y))));
-        assert!(ink, "{name}（{w}px 格）里没有任何墨迹 ⇒ 空壳");
+        let (ix0, iy0, ix1, iy1) = cell_interior(&f, cursor, cursor + w, 6, 32);
+        let ink = (iy0..iy1)
+            .flat_map(|y| (ix0..ix1).map(move |x| (x, y)))
+            .filter(|&(x, y)| is_dark(f.px(x, y)))
+            .count();
+        assert!(
+            ink > 0,
+            "{name}（{w}px 格）的**内框**（{ix0}..{ix1} × {iy0}..{iy1}，已排除边框）\
+             里没有任何墨迹 ⇒ 空壳：图标没画出来"
+        );
         cursor += w + 6;
     }
 }
@@ -1255,9 +1317,14 @@ fn titlebar_gear_renders_when_it_fits() {
         + ui.get_titlebar_settings_w().round() as u32
         + 18;
     let gear_left = right - ui.get_titlebar_settings_w().round() as u32;
+    // 同样只能看**内框**：整格里一定有墨迹（2px 边框），那样断言对「齿轮没画出来」无判别力
+    // （同一条坑见 `titlebar_strip_does_not_overlap_title_or_buttons` 里的注释）。
+    let (gx0, gy0, gx1, gy1) = cell_interior(&f, gear_left, right, 6, 32);
     assert!(
-        (gear_left..right).any(|x| (6..32).any(|y| is_dark(f.px(x, y)))),
-        "④⚙ 那一格没有墨迹（齿轮没画出来）"
+        (gy0..gy1)
+            .flat_map(|y| (gx0..gx1).map(move |x| (x, y)))
+            .any(|(x, y)| is_dark(f.px(x, y))),
+        "④⚙ 那一格的**内框**（{gx0}..{gx1} × {gy0}..{gy1}，已排除边框）没有墨迹（齿轮没画出来）"
     );
 }
 
@@ -2915,11 +2982,11 @@ fn v11_menu_panels_open_and_close_on_outside_or_second_click() {
 
     // 会话面板：开 → 再点收起 → 再开 → 点面板外收起。
     press_release(&win, sx, sy);
-    assert!(ui.get_session_menu_open(), "点 🗂 应展开会话面板");
+    assert!(ui.get_session_menu_open(), "点②历史会话钮应展开会话面板");
     press_release(&win, sx, sy);
     assert!(
         !ui.get_session_menu_open(),
-        "再点 🗂 应收起面板（不是只重开）"
+        "再点②历史会话钮应收起面板（不是只重开）"
     );
     press_release(&win, sx, sy);
     assert!(ui.get_session_menu_open(), "第三次点应再次展开");
@@ -4951,4 +5018,137 @@ fn glyph_probe_machinery_works_on_this_host() {
         glyph_ink_probe('M') > 0,
         "ASCII `M` 在消息区应留下墨迹：探针（或渲染台）坏了，先修它再谈缺字形"
     );
+}
+
+/// [`cell_interior`] 的判据自测（**不依赖渲染**，合成帧）：把「边框多粗都排得掉」与「边框吃满
+/// 整格就大声红」两条钉住，并把当年那条零判别力断言当场复现一遍——**同一帧**上：整格有墨
+///（旧判据绿）、内框 0 墨（新判据红）。
+#[test]
+fn cell_interior_excludes_border_of_any_thickness() {
+    let white = PremultipliedRgbaColor {
+        red: 255,
+        green: 255,
+        blue: 255,
+        alpha: 255,
+    };
+    let ink = PremultipliedRgbaColor {
+        red: 28,
+        green: 26,
+        blue: 23,
+        alpha: 255,
+    };
+    // 26×26 的格：`t`px 的环状边框；`icon` 为真时再在正中画一块 8×8 的图标墨迹。
+    let synth = |t: u32, icon: bool| -> Frame {
+        let (w, h) = (26u32, 26u32);
+        let mut buf = vec![white; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let border = x < t || y < t || x + t >= w || y + t >= h;
+                let icon_px = icon && (9..17).contains(&x) && (9..17).contains(&y);
+                if border || icon_px {
+                    buf[(y * w + x) as usize] = ink;
+                }
+            }
+        }
+        Frame { buf, w, h }
+    };
+    let count = |f: &Frame, x0: u32, y0: u32, x1: u32, y1: u32| {
+        (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| is_dark(f.px(x, y)))
+            .count()
+    };
+    for t in [2u32, 5, 8] {
+        let f = synth(t, true);
+        let (ix0, iy0, ix1, iy1) = cell_interior(&f, 0, 26, 0, 26);
+        assert_eq!(
+            (ix0, iy0, ix1, iy1),
+            (t, t, 26 - t, 26 - t),
+            "边框 {t}px：内框应恰好从边框内沿开始（厚度是量出来的，不是写死的 2px）"
+        );
+        assert!(
+            count(&f, ix0, iy0, ix1, iy1) > 0,
+            "边框 {t}px：内框里应有图标墨迹"
+        );
+        // 把图标拿掉：内框归零，但**整格仍有墨**（边框）——这就是当年那条断言盲掉的样子。
+        let bare = synth(t, false);
+        let (bx0, by0, bx1, by1) = cell_interior(&bare, 0, 26, 0, 26);
+        assert_eq!(
+            count(&bare, bx0, by0, bx1, by1),
+            0,
+            "边框 {t}px：内框里只能反映图标，不能混进边框"
+        );
+        assert!(
+            count(&bare, 0, 0, 26, 26) > 0,
+            "边框 {t}px：整格仍有边框墨迹 ⇒ 「整格有墨」判据对图标零判别力（本卡要修的就是它）"
+        );
+    }
+
+    // 真实格子的样子：**圆角**边框（`border-width: 2px` + `border-radius: 6px`）。两条必须同时成立：
+    // ①固定的「各去 2px」内框在圆角处仍含边框墨迹 ⇒ 写死 inset / 只量中线都不够
+    // （本卡实改时去掉图标后断言仍绿，根因就在这里）；②[`cell_interior`] 逐边内缩后内框归零。
+    let in_round = |x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32| -> bool {
+        if x < x0 || x > x1 || y < y0 || y > y1 {
+            return false;
+        }
+        let (dx, dy) = (x - x.clamp(x0 + r, x1 - r), y - y.clamp(y0 + r, y1 - r));
+        dx * dx + dy * dy <= r * r
+    };
+    let rounded = |icon: bool| -> Frame {
+        let (w, h) = (26u32, 26u32);
+        let mut buf = vec![white; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                // 外框 r=6，内沿 = 外框内缩 2px（r=4）⇒ 两者之间就是 2px 圆角边框。
+                let border = in_round(px, py, 0.0, 0.0, 26.0, 26.0, 6.0)
+                    && !in_round(px, py, 2.0, 2.0, 24.0, 24.0, 4.0);
+                let icon_px = icon && (10..16).contains(&x) && (10..16).contains(&y);
+                if border || icon_px {
+                    buf[(y * w + x) as usize] = ink;
+                }
+            }
+        }
+        Frame { buf, w, h }
+    };
+    let bare = rounded(false);
+    assert!(
+        count(&bare, 2, 2, 24, 24) > 0,
+        "圆角边框：固定的「各去 2px」内框里仍有边框墨迹（角上的弧）⇒ 写死 inset / 只量中线都不够"
+    );
+    let (bx0, by0, bx1, by1) = cell_interior(&bare, 0, 26, 0, 26);
+    assert_eq!(
+        count(&bare, bx0, by0, bx1, by1),
+        0,
+        "圆角边框 + 无图标：内框必须 0 墨（逐边内缩要把圆角一并排掉）"
+    );
+    assert!(
+        count(&bare, 0, 0, 26, 26) > 0,
+        "圆角边框 + 无图标：整格有墨 ⇒ 旧判据在这种情况下是绿的"
+    );
+    let with_icon = rounded(true);
+    let (ix0, iy0, ix1, iy1) = cell_interior(&with_icon, 0, 26, 0, 26);
+    assert!(
+        count(&with_icon, ix0, iy0, ix1, iy1) > 0,
+        "圆角边框 + 有图标：内框里应看到图标墨迹"
+    );
+}
+
+/// 边框粗到把整格吃满时不许静默变绿 —— 那种帧里根本没有「内框」可以判定，必须响亮地红。
+#[test]
+#[should_panic(expected = "把整格吃满")]
+fn cell_interior_refuses_to_judge_when_border_fills_the_cell() {
+    let ink = PremultipliedRgbaColor {
+        red: 28,
+        green: 26,
+        blue: 23,
+        alpha: 255,
+    };
+    let (w, h) = (26u32, 26u32);
+    let f = Frame {
+        buf: vec![ink; (w * h) as usize],
+        w,
+        h,
+    };
+    let _ = cell_interior(&f, 0, 26, 0, 26);
 }

@@ -3291,6 +3291,34 @@ component BubbleGlyph inherits Rectangle {
     }
 }
 
+// 历史会话字形（稿 `.tb-btn[data-m="2"]` 的 🗂 = 装了索引卡的盒子）：手绘 Path 描边。
+//
+// 为什么不是 `Text { text: "🗂" }`（卡 `abb-session-icon-glyph-and-blind-assert-20261029` 实测）：
+// U+1F5C2 是 **emoji-only** 码位，字形只由彩色位图字体提供（`Apple Color Emoji` /
+// `Segoe UI Emoji`），而 Slint 的文字栈（parley 排版 + swash 光栅）取的是**轮廓**——彩色位图
+// 取不出轮廓，于是一个像素都不画。本机（macOS）实测：`Apple Color Emoji` 的 cmap 里**有**
+// U+1F5C2（查字形表为真），但渲染出来该字符的墨迹数是 **0**、②历史会话格的内框**全白**——
+// 图标一直是隐形的（护它的断言当时被 2px 边框喂饱，所以没人发现）。
+// 而真缺字形时链会落到 `.LastResort`，画出**空心方框**（= 排版审计 4656a34 那次
+// 「⚠️ 渲染成空心方框」）。两条都不是能接受的结局 ⇒ 与 ⚙/气泡同口径，改 Path
+// （理由见 `TitlebarIconButton` 的注释；Path 也与渲染器无关）。
+component SessionGlyph inherits Rectangle {
+    in property <brush> tint: PixelTheme.text;
+    width: 16px;
+    height: 16px;
+    Path {
+        width: 100%;
+        height: 100%;
+        stroke: root.tint;
+        stroke-width: 1.4px;
+        fill: transparent;
+        // 单个圆角盒（1..15 × 2.5..13.5，圆角 1.6）+ 盒盖分隔线（y=6.4，与两侧描边接上）
+        // + 中间的拉手槽（5.6..10.4 @ y=9.8）。即「装档案的盒子」这一个物件，
+        // 不用两层叠盒：16px 下两层会挤成三条挨着的横线（实渲染过，糊成一片）。
+        commands: "M 2.6 2.5 L 13.4 2.5 A 1.6 1.6 0 0 1 15 4.1 L 15 11.9 A 1.6 1.6 0 0 1 13.4 13.5 L 2.6 13.5 A 1.6 1.6 0 0 1 1 11.9 L 1 4.1 A 1.6 1.6 0 0 1 2.6 2.5 Z M 1 6.4 L 15 6.4 M 5.6 9.8 L 10.4 9.8";
+    }
+}
+
 // 标题栏图标钮（稿 `.tb-btn`）：26×26、2px 墨黑描边、hover 暖底。
 // 图标为什么是 **Path** 而不是 `ImageIcon` + SVG：① 字形（`icon: string`）在本机字体对 ⚙ 这类
 // 符号覆盖不可靠（排版审计 4656a34 踩过「⚠️ 渲染成空心方框」）；② SVG 靠图片解码器，
@@ -3351,15 +3379,11 @@ component SessionIconButton inherits Rectangle {
     border-width: 2px;
     border-color: PixelTheme.edge;
     border-radius: 6px;
-    // 🗂 是唯一依赖本机字形的图标（其余图标都是 Path）；它与输入区的 emoji 图标同风险档：
-    // 系统字体有、无头软件渲染的测试字体可能画成 tofu（不影响布局与命中）。
-    Text {
-        width: 100%;
-        height: 100%;
-        text: "🗂";
-        font-size: 12px;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+    // 图标 = `SessionGlyph`（Path）。从前的 `Text { text: "🗂" }` 是**唯一**依赖本机字形的图标，
+    // 实测在 macOS 上根本画不出来（见 `SessionGlyph` 的注释）：emoji-only 码位取不出轮廓。
+    SessionGlyph {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
     }
     Tooltip { text: @markdown("历史会话（历史保留，可随时切回）"); }
     hit := TouchArea {
