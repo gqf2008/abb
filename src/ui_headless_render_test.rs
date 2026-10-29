@@ -392,43 +392,107 @@ impl Drop for EnvOverride {
     }
 }
 
-/// 变异自验开关：把列出的字形当作「本机画不出」。
+/// 被守护元素（`ui/app.slint` 里 `MenuChoiceRow` 的 `right-item`，`tick` 档）实际用的字体栈。
+///
+/// 为什么把它抽成常量（卡 `abb-glyph-probe-font-chain-mismatch-20261029`）：探针问的字体链必须
+/// 与**被守护元素**一致。从前探针只走 `row("p", …)` 的默认族/默认字重，而被守护的 `Text` 显式
+/// 写了下面这三样——于是「默认链有/没有」与「它画得出/画不出」可以是相反的两件事。
+///
+/// 与 `.slint` 的一致性由 `probe_font_stack_matches_the_guarded_text_element` 钉着（改 UI 忘了
+/// 改这里 ⇒ 红），因为不一致的后果是**静默跳过**，不是红。
+const GUARDED_FAMILY: &str = "Segoe UI Symbol";
+const GUARDED_SIZE: f32 = 13.0;
+const GUARDED_WEIGHT: f32 = 800.0;
+
+/// 探针会问的两条字体链。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GlyphChain {
+    /// **默认链**：消息区 `p` 行的 `Text` 没写字族/字重 ⇒ 系统 UI 默认族 + 默认字重（400）。
+    /// 这是 [`glyph_ink_probe`] 真正渲染的那条链。
+    Default,
+    /// **指名族**：被守护元素指名的 `GUARDED_FAMILY` + `GUARDED_SIZE` / `GUARDED_WEIGHT`。
+    /// 它不走像素渲染，走 fontique 的字形表查询（[`named_family_has_glyph`]）。
+    Named,
+}
+
+impl GlyphChain {
+    /// 文案里怎么称呼这条链（`[skip]` 里必须让人一眼看清问的是**哪条**链）。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => "默认字体链",
+            Self::Named => "指名族",
+        }
+    }
+}
+
+/// 变异自验开关：把列出的字形当作「本机画不出」，可**按字体链**指定。
 ///
 /// 为什么要有它：`glyph_ink_probe` 的负结果只出现在**真的缺该字形**的机器上，而本仓的
 /// 开发机（macOS）与 CI（windows-latest）默认都能画 ✓——那条分支于是就没人跑过，等于把
 /// 一条门禁交给没人验证的逻辑。开关让它在任何机器上可复跑（也方便复现「用户报红」）：
 ///
 /// ```text
-/// ABB_TEST_ASSUME_MISSING_GLYPH=2713            # 十六进制码位（可写 u+2713）
+/// ABB_TEST_ASSUME_MISSING_GLYPH=2713            # 两条链都缺：十六进制码位（可写 u+2713）
 /// ABB_TEST_ASSUME_MISSING_GLYPH=✓,2714          # 直接写字符也行；逗号分隔多个
+/// ABB_TEST_ASSUME_MISSING_GLYPH=default:2713    # 只把**默认链**标成缺（指名族照旧可画）
+/// ABB_TEST_ASSUME_MISSING_GLYPH=named:2713      # 只把**指名族**标成缺（默认链照旧可画）
 /// ```
+///
+/// 前缀选的是**哪条链**缺（见 [`GlyphChain`]）。为什么需要它：评审指出的那台 Windows 机器是
+/// 「默认链没有 U+2713、但 `Segoe UI Symbol` 有」——只有 `default:` 才能在本机模拟这个**组合**，
+/// 而省略前缀（或写 `both:`）= 两条链都缺 = 真的缺字形。
 ///
 /// **写法陷阱**：解析顺序是「先当十六进制读，读不了才按字面字符比」，所以**任何合法十六进制串
 /// 都不会退化成字面字符**——`=e` 是 U+000E（控制字符）而**不是**字符 `'e'`，`=abc` 是 U+0ABC
 /// 而**不是**字符串 `"abc"`。想按字面字符标记，该字符必须**读不成**十六进制（如 `✓`）；
 /// 想标记 `'e'`/`'E'`/`'d'` 这类恰好是十六进制数字的字符，请写码位（`65` / `45` / `64`）。
-fn forcibly_missing_glyph(ch: char) -> bool {
-    let Ok(spec) = std::env::var("ABB_TEST_ASSUME_MISSING_GLYPH") else {
-        return false;
-    };
+fn forcibly_missing_glyph(chain: GlyphChain, ch: char) -> bool {
+    missing_glyph_tag(chain, ch).is_some()
+}
+
+/// 命中的那条标签**原样**返回（`2713` / `default:2713` / `✓` …）：文案里要回显用户实际写的
+/// 那一条，而不是替怹猜一个前缀。
+fn missing_glyph_tag(chain: GlyphChain, ch: char) -> Option<String> {
+    let spec = std::env::var("ABB_TEST_ASSUME_MISSING_GLYPH").ok()?;
     spec.split(',')
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .any(|tag| {
-            let hex = tag
-                .strip_prefix("u+")
-                .or_else(|| tag.strip_prefix("U+"))
-                .unwrap_or(tag);
-            match u32::from_str_radix(hex, 16) {
-                // 能当十六进制读就按码位比（`2713`），读不了就按字面字符比（`✓`）。
-                Ok(cp) => cp == ch as u32,
-                Err(_) => tag == ch.to_string(),
-            }
+        .find(|tag| {
+            let (scope, glyph) = match tag.split_once(':') {
+                Some((scope, glyph)) => (Some(scope.trim()), glyph.trim()),
+                None => (None, *tag),
+            };
+            let chain_hit = match scope {
+                None | Some("both") => true,
+                Some("default") => chain == GlyphChain::Default,
+                Some("named") => chain == GlyphChain::Named,
+                Some(other) => panic!(
+                    "`ABB_TEST_ASSUME_MISSING_GLYPH` 里的 `{other}:` 不是字体链名：可写 \
+                     `default:`（只标默认链）/ `named:`（只标指名族）/ `both:`（两条，也可省略前缀）"
+                ),
+            };
+            chain_hit && glyph_tag_matches(glyph, ch)
         })
+        .map(str::to_owned)
 }
 
-/// 判据（纯函数，便于直接测）：对照字符有墨迹、目标字符 0 墨迹 ⇒ 缺字形；对照也没墨迹 ⇒
-/// 渲染通路坏了（**不许**记成「缺字形」，否则真正的渲染白屏会被这条探针掩盖）。
+/// 单个标签是否指这个字符：能当十六进制读就按码位比（`2713`），读不了就按字面字符比（`✓`）。
+fn glyph_tag_matches(tag: &str, ch: char) -> bool {
+    let hex = tag
+        .strip_prefix("u+")
+        .or_else(|| tag.strip_prefix("U+"))
+        .unwrap_or(tag);
+    match u32::from_str_radix(hex, 16) {
+        Ok(cp) => cp == ch as u32,
+        Err(_) => tag == ch.to_string(),
+    }
+}
+
+/// 判据（纯函数，便于直接测）：对照字符有墨迹、目标字符 0 墨迹 ⇒ **这条链**缺字形；对照也没
+/// 墨迹 ⇒ 渲染通路坏了（**不许**记成「缺字形」，否则真正的渲染白屏会被这条探针掩盖）。
+///
+/// 注意它回答的只是「默认链」这一条（问的族/字重见文案）：最终裁决要两条链合起来看，
+/// 见 [`glyph_drawable_in`]。
 fn classify_glyph_ink(control: usize, target: usize, ch: char) -> Result<(), String> {
     assert!(
         control > 0,
@@ -438,14 +502,19 @@ fn classify_glyph_ink(control: usize, target: usize, ch: char) -> Result<(), Str
         return Ok(());
     }
     Err(format!(
-        "默认字体链画不出 `{ch}`（U+{:04X}）：同一条文字栈里 ASCII `M` 有 {control} 像素墨迹、\
-         它 0 像素 ⇒ 环境缺这个字形，不是布局 bug",
+        "{}（消息区 `p` 行：系统 UI 默认族、默认字重 400）画不出 `{ch}`（U+{:04X}）：\
+         同一条文字栈里 ASCII `M` 有 {control} 像素墨迹、它 0 像素",
+        GlyphChain::Default.label(),
         ch as u32
     ))
 }
 
-/// 走**同一条文字栈**（Slint → parley/fontique → 系统字体）渲一个只含该字符的段落，数消息区
-/// 里的暗像素。`p` 行是纯文本块，默认字体族与 v11 面板的 ✓ 相同（都没指名字体）。
+/// 走**默认链**（Slint → parley/fontique → 系统字体，族与字重都是默认）渲一个只含该字符的
+/// 段落，数消息区里的暗像素。`p` 行是纯文本块，**没有**写字族/字重。
+///
+/// ⚠️ 被守护元素（v11 面板的 ✓）**不是**这条链：它显式指名了 `GUARDED_FAMILY` / 13px / 800。
+/// 这条探针只回答「默认链能不能画」，另一条链由 [`named_family_has_glyph`] 回答，
+/// 最终由 [`glyph_drawable_in`] 取或（见那里的口径说明）。
 fn glyph_ink_probe(ch: char) -> usize {
     let (ui, win, _m) = setup(vec![row("p", &ch.to_string())], SHORT_H);
     let _ = settle_w(&win, W, SHORT_H);
@@ -463,16 +532,127 @@ fn glyph_ink_probe(ch: char) -> usize {
     n
 }
 
+// 复用 `parley::FontContext`（= fontique 字体集合 + 源缓存）：`FontContext::new()` 要扫系统
+// 字体，**别每次查询都建一个**（与 `src/inlineflow.rs` 的 `CTX` 同理）。这条路径只在
+// 「默认链画不出」时才走到，但同一个用例里会问几次，扫一遍就够。
+thread_local! {
+    static GLYPH_FONT_CTX: std::cell::RefCell<Option<parley::FontContext>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// **指名族**这条链有没有这个字形：直接查 `family` 自己的字形表（`cmap`）。
+///
+/// 为什么不是渲染探针（卡 `abb-glyph-probe-font-chain-mismatch-20261029` 的口径选择）：被守护的
+/// `Text` 写了一个**具体的族名**，而要问的问题正是「这个族有 U+2713 吗」。Slint 1.18 的文字栈就是
+/// parley/fontique（`third_party/i-slint-core` 的 `shared-parley`），这里的 `Collection` 与渲染器
+/// 读的是同一套系统字体 ⇒ 字形表结论与「它能不能画出来」同源，而且不必为探针往 `ui/app.slint`
+/// 里加一个测试专用组件。
+///
+/// 刻意**不** `set_fallbacks`：族不存在时（macOS/Linux 没有 `Segoe UI Symbol`）fontique 会把
+/// `QueryFamily::Named` 丢掉，这里就如实回 `false`，由默认链那条裁决兜底——而不是悄悄换成通用
+/// 回退族、把「指名族画得出」这条结论用别的字体冒充出来。
+fn named_family_has_glyph(family: &str, weight: f32, ch: char) -> bool {
+    use parley::fontique;
+    GLYPH_FONT_CTX.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let fcx = slot.get_or_insert_with(parley::FontContext::new);
+        let parley::FontContext {
+            collection,
+            source_cache,
+        } = fcx;
+        let mut query = collection.query(source_cache);
+        query.set_families([fontique::QueryFamily::from(family)]);
+        query.set_attributes(fontique::Attributes {
+            weight: fontique::FontWeight::new(weight),
+            ..Default::default()
+        });
+        let mut has = false;
+        query.matches_with(|font| {
+            // 一个族里可能有多个字面（Regular/Bold/…），fontique 已按字重挑过；命中任一即算画得出。
+            if font
+                .charmap()
+                .and_then(|cmap| cmap.map(ch as u32))
+                .is_some_and(|gid| gid != 0)
+            {
+                has = true;
+                return fontique::QueryStatus::Stop;
+            }
+            fontique::QueryStatus::Continue
+        });
+        has
+    })
+}
+
 /// 这个字形在本机能画吗？能 ⇒ `Ok(())`（调用方的像素断言照跑）；不能 ⇒ `Err(原因)`（调用方
 /// **大声跳过那一条**断言，其余照跑）。
+///
+/// 口径 = 「**默认链 OR 指名族**，任一可画即算可画」（卡 `abb-glyph-probe-font-chain-mismatch-20261029`
+/// 的选项 b）。选保守口径而不是「只看指名族」的理由：
+///
+/// 1. 两条链都**是**真实存在的渲染路径。被守护的 `Text` 在 Windows 上走指名族（族存在），在
+///    macOS/Linux 上族名不存在 ⇒ Slint 落回通用回退（与默认链同一条路）——所以两条都可能让
+///    那个 ✓ 真的画出来，只问一条就等于赌平台。
+/// 2. 误判的方向要选**会响**的那边：错判成「可画」⇔ 像素断言照跑 ⇔ 真画不出就**红**（人会来看）；
+///    错判成「不可画」⇔ 静默跳过（本卡要修的就是这个）。取或只会往「照跑断言」偏。
+/// 3. 还保住了 [`classify_glyph_ink`] 那条端到端渲染探针：默认链的画/不画仍是**画出来数墨迹**得到的，
+///    「渲染通路坏了」照样能报（见 `glyph_ink_probe`）。
+///
+/// 不得因此削弱真缺字形的检出：两条链都没有该字形时仍返回 `Err`（文案分别说明两条链），
+/// 严格模式下调用点照旧 `panics`（`both_chains_missing_still_refuses_to_go_green_under_strict_mode`
+/// 钉着）。
 fn glyph_drawable(ch: char) -> Result<(), String> {
-    if forcibly_missing_glyph(ch) {
-        return Err(format!(
-            "`{ch}`（U+{:04X}）被 `ABB_TEST_ASSUME_MISSING_GLYPH` 标记为缺字形（变异自验开关）",
+    glyph_drawable_in(ch, GUARDED_FAMILY, GUARDED_WEIGHT)
+}
+
+/// [`glyph_drawable`] 的本体；族名/字重现传是为了让用例能用**本机真有的族**造那个组合
+/// （macOS 没有 `Segoe UI Symbol`，不参数化就只能跳过，跳过就咬不住变异）。
+fn glyph_drawable_in(ch: char, family: &str, weight: f32) -> Result<(), String> {
+    let default_err = match missing_glyph_tag(GlyphChain::Default, ch) {
+        Some(tag) => Err(mutation_err(GlyphChain::Default, &tag, ch, family, weight)),
+        None => classify_glyph_ink(glyph_ink_probe('M'), glyph_ink_probe(ch), ch),
+    };
+    let Err(default_err) = default_err else {
+        return Ok(());
+    };
+
+    let named_err = match missing_glyph_tag(GlyphChain::Named, ch) {
+        Some(tag) => Err(mutation_err(GlyphChain::Named, &tag, ch, family, weight)),
+        None if named_family_has_glyph(family, weight, ch) => Ok(()),
+        None => Err(format!(
+            "{} `{family}`（{GUARDED_SIZE:.0}px / 字重 {weight:.0}）的字形表里没有 `{ch}`（U+{:04X}）",
+            GlyphChain::Named.label(),
             ch as u32
-        ));
-    }
-    classify_glyph_ink(glyph_ink_probe('M'), glyph_ink_probe(ch), ch)
+        )),
+    };
+    let Err(named_err) = named_err else {
+        return Ok(());
+    };
+
+    Err(format!(
+        "两条字体链都画不出 `{ch}`（U+{:04X}）⇒ 环境缺这个字形，不是布局 bug：\n  \
+         · {default_err}\n  \
+         · {named_err}",
+        ch as u32
+    ))
+}
+
+/// 变异开关命中时的原因：**无论**哪个结局都得写清问的是哪条链、哪个字重（`[skip]` 文案要能让人
+/// 直接看出探针问错了对象没有）。
+fn mutation_err(chain: GlyphChain, tag: &str, ch: char, family: &str, weight: f32) -> String {
+    let who = match chain {
+        GlyphChain::Default => format!(
+            "{}（消息区 `p` 行：系统 UI 默认族、默认字重 400）",
+            chain.label()
+        ),
+        GlyphChain::Named => format!(
+            "{} `{family}`（{GUARDED_SIZE:.0}px / 字重 {weight:.0}）",
+            chain.label()
+        ),
+    };
+    format!(
+        "{who}里的 `{ch}`（U+{:04X}）被 `ABB_TEST_ASSUME_MISSING_GLYPH={tag}` 标记为缺字形（变异自验开关）",
+        ch as u32
+    )
 }
 
 /// 严格模式（`CI` 或 `ABB_TEST_NO_SKIP` 存在）下「缺字形」不再跳过，而是**直接红**。
@@ -501,7 +681,9 @@ fn glyph_skip_notice(what: &str, why: &str, strict: bool) -> String {
          [skip] 其余断言照跑；在这台机器上复跑这条跳过：\
          ABB_TEST_ASSUME_MISSING_GLYPH=2713 cargo test -- --nocapture\n\
          [skip] 注：该开关先按十六进制码位解析（`2713` / `u+2713` 都是 U+2713），\
-         读不成十六进制才按字面字符比（如 `✓`）——所以 `=e` 是 U+000E，不是字符 `e`。"
+         读不成十六进制才按字面字符比（如 `✓`）——所以 `=e` 是 U+000E，不是字符 `e`。\n\
+         [skip] 注：可加链前缀只标某一条：`default:2713`（默认字体链缺）/ `named:2713`\
+         （指名族缺）；省略前缀 = 两条链都缺。上面的原因里已经写了问的是哪条链、哪个字重。"
     )
 }
 
@@ -2601,6 +2783,11 @@ fn v11_panels_anchor_and_usage_meter_match_design() {
     // 所以先探针：画不出就**大声跳过这一条**（说明跳过了什么、如何复现），其余断言照跑；
     // 画得出则照原样断言，任何「我们的 UI 把 ✓ 画没了」的回归**照旧必红**。
     //
+    // 探针问的是**两条**字体链（卡 `abb-glyph-probe-font-chain-mismatch-20261029`）：被守护的
+    // 这个 `✓` 在 `ui/app.slint` 里显式指名了 `Segoe UI Symbol` / 13px / 800，它**不走**默认链——
+    // 只看默认链就会在「默认链缺、指名族有」的机器上反向误报（跳过一条本来会过的断言，
+    // 且不响）。口径与被守护元素对齐的方式见 `glyph_drawable`。
+    //
     // 两个开关的**读取**必须与写入方持同一把锁（卡 `abb-glyph-probe-env-leak-20261029` 第 3 条）：
     // 否则并发的 `missing_glyph_*` / `strict_no_skip_*` 用例中途设的值会被这里当成「跑的人的设置」
     // （它们自己结束会还原，但**读到的那一瞬间**可能是它们设的）。锁只包住读的两句，
@@ -4432,8 +4619,8 @@ fn send_button_default_label_is_chinese() {
 // 没人验证的判官等于给门禁留了一扇隐形后门，所以三个结局（有墨迹 / 缺字形 / 渲染通路坏）
 // 各自钉一条。
 
-/// 判据三分：都有墨迹 ⇒ 可画；对照有、目标 0 ⇒ 缺字形（原因里要带码位，且必须说清是**环境
-/// 字体**而不是布局）；对照也没墨迹 ⇒ 不许记成缺字形（见下一条）。
+/// 判据三分：都有墨迹 ⇒ 可画；对照有、目标 0 ⇒ **默认链**缺字形（原因里要带码位、要说清是**环境
+/// 字体**而不是布局，并且要指明问的是哪条链/哪个字重）；对照也没墨迹 ⇒ 不许记成缺字形（见下一条）。
 #[test]
 fn glyph_ink_classification_separates_missing_glyph_from_broken_renderer() {
     assert!(
@@ -4443,8 +4630,26 @@ fn glyph_ink_classification_separates_missing_glyph_from_broken_renderer() {
     let why = classify_glyph_ink(34, 0, '✓').expect_err("目标 0 墨迹 ⇒ 缺字形");
     assert!(why.contains("U+2713"), "原因要带码位便于排查：{why}");
     assert!(
+        why.contains(GlyphChain::Default.label()) && why.contains("字重 400"),
+        "原因必须说清问的是**哪条**字体链、哪个字重（被守护元素不用默认链）：{why}"
+    );
+}
+
+/// 两条链都画不出时的**合并**文案：得分开列两条链各自的否决理由（含族名/字重），并把根限拍在
+/// 「环境缺字形」上——不能把两条链的细节搅成一句。
+#[test]
+fn both_chain_verdicts_are_reported_separately() {
+    let mut env = EnvOverride::begin();
+    env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "2713"); // 省略前缀 = 两条链都缺
+    let why = glyph_drawable('✓').expect_err("两条链都缺 ⇒ 缺字形");
+    assert!(
         why.contains("缺这个字形") && why.contains("不是布局"),
-        "原因必须把「字体缺字形」与「布局坏了」分开：{why}"
+        "{why}"
+    );
+    assert!(why.contains(GlyphChain::Default.label()), "{why}");
+    assert!(
+        why.contains(GUARDED_FAMILY) && why.contains("字重 800"),
+        "要写清指名族的族名与字重（被守护元素的实际字体栈）：{why}"
     );
 }
 
@@ -4508,9 +4713,10 @@ fn glyph_skip_notice_refuses_to_weaken_the_gate_under_ci() {
     let _ = glyph_skip_notice("v11 的 ✓", "字体链没有 U+2713", true);
 }
 
-/// 变异自验入口（验收 5）：`ABB_TEST_ASSUME_MISSING_GLYPH` 把 ✓ 标成缺字形后，`glyph_drawable`
+/// 变异自验入口：`ABB_TEST_ASSUME_MISSING_GLYPH` 把 ✓ 标成缺字形后，`glyph_drawable`
 /// 必须返回 `Err`（调用方据此走「环境不满足」分支）——**不得**报成断言失败。
-/// 同时钉住三种写法（hex / `u+` 前缀 / 字面字符）与「不命中别的码位」。
+/// 同时钉住三种写法（hex / `u+` 前缀 / 字面字符）、**链前缀的作用域**（验收 3 靠 `default:`
+/// 才能造出「默认链缺、指名族有」的组合）与「不命中别的码位」。
 ///
 /// 改写一律走 [`EnvOverride`]：**存旧值、结束还原**，不得无条件 `remove_var`（否则用户传进来的
 /// 开关会被这条用例吃掉，参卡 `abb-glyph-probe-env-leak-20261029`）。
@@ -4520,24 +4726,219 @@ fn missing_glyph_overlay_marks_only_the_listed_glyph() {
     env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "2713");
     let why = glyph_drawable('✓').expect_err("被标记为缺字形时必须走跳过分支");
     assert!(why.contains("ABB_TEST_ASSUME_MISSING_GLYPH"), "{why}");
-    for spec in ["u+2713", "U+2713", "✓", "2714, 2713", " 2713 "] {
+    // 省略前缀 = **两条链**都缺（= 真的缺字形）。
+    for spec in ["u+2713", "U+2713", "✓", "2714, 2713", " 2713 ", "both:2713"] {
         env.set("ABB_TEST_ASSUME_MISSING_GLYPH", spec);
-        assert!(forcibly_missing_glyph('✓'), "写法 `{spec}` 应命中");
+        assert!(
+            forcibly_missing_glyph(GlyphChain::Default, '✓'),
+            "写法 `{spec}` 应命中默认链"
+        );
+        assert!(
+            forcibly_missing_glyph(GlyphChain::Named, '✓'),
+            "写法 `{spec}` 应命中指名族"
+        );
     }
     env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "2714");
-    assert!(!forcibly_missing_glyph('✓'), "别的码位不该命中");
+    assert!(
+        !forcibly_missing_glyph(GlyphChain::Default, '✓'),
+        "别的码位不该命中"
+    );
+    // 链前缀：只标那一条（另一条必须照旧可画）。
+    env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "default:2713");
+    assert!(
+        forcibly_missing_glyph(GlyphChain::Default, '✓'),
+        "`default:` 应命中默认链"
+    );
+    assert!(
+        !forcibly_missing_glyph(GlyphChain::Named, '✓'),
+        "`default:` 不该动指名族"
+    );
+    env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "named:2713");
+    assert!(
+        forcibly_missing_glyph(GlyphChain::Named, '✓'),
+        "`named:` 应命中指名族"
+    );
+    assert!(
+        !forcibly_missing_glyph(GlyphChain::Default, '✓'),
+        "`named:` 不该动默认链"
+    );
     // 钉住文档里那条「写法陷阱」：能当十六进制读的标签**不会**退化成字面字符。
     env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "e");
-    assert!(forcibly_missing_glyph('\u{e}'), "`e` 应被读成码位 U+000E");
     assert!(
-        !forcibly_missing_glyph('e'),
+        forcibly_missing_glyph(GlyphChain::Default, '\u{e}'),
+        "`e` 应被读成码位 U+000E"
+    );
+    assert!(
+        !forcibly_missing_glyph(GlyphChain::Default, 'e'),
         "`e` 不是字符 'e'（它是合法十六进制）——要标字符 `e` 请写码位 `65`"
     );
     // 读不成十六进制的标签才按字面字符比。
     env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "zz");
-    assert!(!forcibly_missing_glyph('✓'), "`zz` 既读不成码位也不等于 ✓");
+    assert!(
+        !forcibly_missing_glyph(GlyphChain::Default, '✓'),
+        "`zz` 既读不成码位也不等于 ✓"
+    );
     env.unset("ABB_TEST_ASSUME_MISSING_GLYPH");
-    assert!(!forcibly_missing_glyph('✓'), "开关未设时不命中");
+    assert!(
+        !forcibly_missing_glyph(GlyphChain::Default, '✓'),
+        "开关未设时不命中"
+    );
+}
+
+/// 验收 3（+ 验收 4 的扭曲面）：**默认链缺 U+2713、但指名族有** 这个组合下，探针**不得**报缺
+/// 字形——否则它会跳过一条本来会过的断言（反向误报，而且不响）。
+///
+/// 诚实性：本机（macOS）没有 Windows 那个组合，也用不了 `Segoe UI Symbol`（本机没这个族名）。
+/// 所以这里**用变异开关模拟**「默认链缺」（`default:2713`，如实是模拟，不是真的字体环境），
+/// 并把「指名族」换成**本机真有的**、确实带 U+2713 的族（[`host_family_with_glyph`]，运行时查出）。
+/// 这样用例在任何机器上都可跑；把口径改回「只看默认链」（验收 4 的变异）时它必红。
+#[test]
+fn named_family_rescues_a_glyph_the_default_chain_lacks() {
+    let mut env = EnvOverride::begin();
+    let family =
+        host_family_with_glyph('✓').expect("本机应至少有一个字体族带 U+2713（macOS/Windows 都有）");
+    let named_ok = named_family_has_glyph(&family, GUARDED_WEIGHT, '✓');
+    assert!(named_ok, "前提：`{family}` 的字形表里有 U+2713");
+    eprintln!(
+        "[glyph] 本机（macOS 没有 `{GUARDED_FAMILY}`）用族 `{family}` 充当「指名族有 U+2713」；\
+         默认链的「缺」是 `ABB_TEST_ASSUME_MISSING_GLYPH=default:2713` 模拟的"
+    );
+
+    env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "default:2713");
+    assert!(
+        forcibly_missing_glyph(GlyphChain::Default, '✓'),
+        "前提：默认链被标成缺字形（模拟评审那台机器）"
+    );
+    assert!(
+        !forcibly_missing_glyph(GlyphChain::Named, '✓'),
+        "前提：指名族没被标"
+    );
+
+    assert!(
+        glyph_drawable_in('✓', &family, GUARDED_WEIGHT).is_ok(),
+        "指名族 `{family}` 能画 U+2713 ⇒ 探针不得报缺字形（报了就静默跳过一条本会过的断言）"
+    );
+}
+
+/// 验收 5（宽松侧）：**两条链都没有**该字形时仍必须报缺字形——「任一链可画即可画」不得退化成
+/// 「总有链兜底 ⇒ 永远绿」。
+#[test]
+fn both_chains_missing_still_reports_missing_glyph() {
+    let mut env = EnvOverride::begin();
+    let family =
+        host_family_with_glyph('✓').expect("本机应至少有一个字体族带 U+2713（macOS/Windows 都有）");
+    // 真缺字形的环境造不出来 ⇒ 用变异开关把两条链都标成缺（如实是模拟）。
+    env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "2713");
+    let why = glyph_drawable_in('✓', &family, GUARDED_WEIGHT)
+        .expect_err("两条链都缺时必须报缺字形（不得因为另一条链理论上可画就变绿）");
+    assert!(
+        why.contains("缺这个字形") && why.contains("不是布局"),
+        "{why}"
+    );
+    assert!(
+        why.contains(GlyphChain::Default.label()) && why.contains(GlyphChain::Named.label()),
+        "合并文案要把两条链各自的否决理由都列出来：{why}"
+    );
+}
+
+/// 验收 5（严格侧）：真缺字形时**严格模式照旧拒绿**——把调用点那两行原样跑一遍。
+///
+/// 这里不重复取 `probe_env_lock()`：[`EnvOverride`] 已持同一把锁（std 的 `Mutex` 不可重入）。
+#[test]
+#[should_panic(expected = "严格模式")]
+fn both_chains_missing_still_refuses_to_go_green_under_strict_mode() {
+    let mut env = EnvOverride::begin();
+    env.set("ABB_TEST_ASSUME_MISSING_GLYPH", "2713");
+    env.set("ABB_TEST_NO_SKIP", "1");
+    assert!(strict_no_skip(), "前提：`ABB_TEST_NO_SKIP` ⇒ 严格模式");
+    let why = glyph_drawable('✓').expect_err("前提：两条链都缺 ⇒ 报缺字形");
+    // 与 v11 调用点同一个组合（缺字形 + 严格 ⇒ 必须 panic，而不是绿灯跳过）。
+    panic!(
+        "{}",
+        glyph_skip_notice("v11 面板的「当前项 ✓」", &why, strict_no_skip())
+    );
+}
+
+/// 从 `.slint` 片段里取 `key: root.tick ? <值> : <另一档>` 的 `<值>`（去掉引号）。
+fn tick_value<'a>(block: &'a str, key: &str) -> &'a str {
+    let pat = format!("{key}: root.tick ? ");
+    let at = block
+        .find(&pat)
+        .unwrap_or_else(|| panic!("v11 行里 `{key}` 的 `root.tick ?` 两档不见了"))
+        + pat.len();
+    let rest = &block[at..];
+    match rest.strip_prefix('"') {
+        Some(quoted) => &quoted[..quoted.find('"').expect("族名的引号没闭合")],
+        None => {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+                .unwrap_or(rest.len());
+            &rest[..end]
+        }
+    }
+}
+
+/// 探针的字体栈必须**就是**被守护元素那一条（验收 1 的接线）：`ui/app.slint` 里改了 ✓ 的族名/
+/// 字号/字重却忘了改 `GUARDED_*` ⇒ 反向误报会以「静默跳过」的方式回来，所以用源码守卫钉住。
+#[test]
+fn probe_font_stack_matches_the_guarded_text_element() {
+    let src = crate::platform::src_lf(include_str!("../ui/app.slint"));
+    let at = src
+        .find("right-item := Text {")
+        .expect("v11 行的右侧文本格（`✓` 的唯一载体）不见了");
+    let rest = &src[at..];
+    let block = &rest[..rest
+        .find("hit := TouchArea {")
+        .expect("`right-item` 后面应是该行的 `hit` 触摸区")];
+    assert_eq!(
+        tick_value(block, "font-family"),
+        GUARDED_FAMILY,
+        "探针问的族名必须与被守护元素一致（`ui/app.slint` 的 `right-item` tick 档）"
+    );
+    assert_eq!(
+        tick_value(block, "font-size"),
+        format!("{GUARDED_SIZE:.0}px"),
+        "探针问的字号必须与被守护元素一致"
+    );
+    assert_eq!(
+        tick_value(block, "font-weight"),
+        format!("{GUARDED_WEIGHT:.0}"),
+        "探针问的字重必须与被守护元素一致"
+    );
+}
+
+/// 本机上真带 `ch` 的某个族名。
+///
+/// 为什么需要它：验收 3 要造「默认链缺、指名族有」的组合，而 macOS 没有 `Segoe UI Symbol`
+/// ⇒ 直接拿被守护的族名在本机永远是「指名族也没有」，那条用例就只能跳过（跳过就咬不住变异）。
+/// 先试一批已知带符号的族（快），再扫系统族名兜底。
+fn host_family_with_glyph(ch: char) -> Option<String> {
+    const CANDIDATES: &[&str] = &[
+        "Segoe UI Symbol", // Windows（真机上的被守护族）
+        "Apple Symbols",   // macOS
+        "Arial Unicode MS",
+        "DejaVu Sans", // Linux
+        "Noto Sans Symbols 2",
+        "Noto Sans Symbols",
+        "Menlo",
+    ];
+    for name in CANDIDATES {
+        if named_family_has_glyph(name, GUARDED_WEIGHT, ch) {
+            return Some((*name).to_string());
+        }
+    }
+    let names: Vec<String> = GLYPH_FONT_CTX.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let fcx = slot.get_or_insert_with(parley::FontContext::new);
+        fcx.collection
+            .clone()
+            .family_names()
+            .map(str::to_owned)
+            .collect()
+    });
+    names
+        .into_iter()
+        .find(|name| named_family_has_glyph(name, GUARDED_WEIGHT, ch))
 }
 
 /// 探针机构本身要能在本机跑通（对照字符 `M` 必须有墨迹）：否则每条探针都会 panic，
