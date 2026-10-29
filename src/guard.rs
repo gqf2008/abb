@@ -2210,6 +2210,92 @@ mod tests {
         let _ = root;
     }
 
+    /// `.git` 分量的**真判别力**覆盖（此前为零）。
+    ///
+    /// `file_paths_deny_history_and_git_components` 里那几条 `.git/*` 样本只断言 `!= Allow`、
+    /// 且**没有在盘上建出**：`canonical_in_workspace` 在目标与其父目录都不存在时判「工作区外」
+    /// 抢先拒绝，于是把 `is_bridge_state_path` 的 `.git` 分支整支删掉，`guard::tests`
+    /// **35 passed 仍全绿**（实测）。也就是说那几条断言测的是目录闸，不是名单——`.git`
+    /// 因此是**真实的安全盲区**：受限会话可写 `.git/hooks/pre-commit`（下次 owner 提权
+    /// 提交即执行任意代码）、`.git/config`（改 remote/alias/core.hooksPath）。
+    ///
+    /// 本测试**逐个在盘上建出 .git 内的文件**，并断言拒绝理由含「桥状态」：只有名单生效
+    /// 才成立，删掉 `.git` 分量后必红。
+    #[test]
+    fn file_paths_deny_git_component_on_disk() {
+        let (root, ws, _guard) = temp_guard_env();
+        let ws = workspace_canon(&ws);
+        for p in [
+            // 写它 = 下一次 tidy/owner 提交即以用户权限执行任意代码（沙箱逃逸）
+            ".git/hooks/pre-commit",
+            // 写它 = 改 remote / alias / core.hooksPath，把后续提交导向攻击者
+            ".git/config",
+            // 大小写变体：macOS 文件系统不区分大小写，`.GIT` 落盘即 `.git`
+            // （生产代码用 eq_ignore_ascii_case，判定必须同口径）
+            ".GIT/config",
+            ".git/hooks/POST-CHECKOUT",
+            // 深层对象路径：钉住「任意层级组件都判」，不只第一层
+            ".git/objects/ab/cdef0123",
+            "sub/.git/config",
+        ] {
+            // 建出文件：否则「工作区外」那道闸抢先拒绝，测到的是目录闸而不是名单
+            // （与 file_paths_deny_bridge_state_files 同款讲究：变异自验不能假绿）。
+            let abs = Path::new(&ws).join(p);
+            std::fs::create_dir_all(abs.parent().expect("有父目录")).expect("建目录");
+            std::fs::write(&abs, "x").expect("建文件");
+            for tool in ["Write", "Edit"] {
+                match check_file_paths(tool, &serde_json::json!({"file_path": p}), &ws) {
+                    Decision::Deny(reason) => assert!(
+                        reason.contains("桥状态"),
+                        "{tool} {p} 应被桥状态名单拒，实际被别的闸拒了：{reason}"
+                    ),
+                    Decision::Allow => panic!(
+                        "{tool} {p} 必须拒写（否则受限会话可写 .git/hooks 在下次提交时执行代码）"
+                    ),
+                }
+            }
+            // 只禁写不禁读（与 jobs.json 同口径）：.git/objects 是压缩二进制，
+            // git 读动词另有白名单约束
+            assert_eq!(
+                check_file_paths("Read", &serde_json::json!({"file_path": p}), &ws),
+                Decision::Allow,
+                "读应放行：{p}"
+            );
+        }
+        // 名单本身直判：不经路径闸 ⇒ 结果不可能被「盘上是否存在」解释
+        for denied in [
+            ".git",
+            ".git/config",
+            ".GIT/hooks/pre-commit",
+            "sub/.git/objects/ab/cd",
+            ".git/",
+        ] {
+            assert!(is_bridge_state_path(denied), "{denied} 应命中桥状态名单");
+        }
+        // 负向对照：形近但不是 `.git` 组件，不得误伤（与 file_paths_deny_history_and_git_components
+        // 的 .gitignore 对照同口径，这里补子目录与同名前缀形态）
+        for ok in [
+            ".gitignore",
+            "sub/.gitignore",
+            "git/config",
+            "notes/.gitkeep",
+        ] {
+            let abs = Path::new(&ws).join(ok);
+            std::fs::create_dir_all(abs.parent().expect("有父目录")).expect("建目录");
+            std::fs::write(&abs, "x").expect("建文件");
+            assert!(
+                !is_bridge_state_path(ok),
+                "{ok} 不是 .git 组件，名单不得命中"
+            );
+            assert_eq!(
+                check_file_paths("Write", &serde_json::json!({"file_path": ok}), &ws),
+                Decision::Allow,
+                "{ok} 不是 .git 组件，不得误伤"
+            );
+        }
+        let _ = root;
+    }
+
     #[test]
     fn file_paths_deny_instruction_files() {
         // H1 持久化提权：这些文件影响之后更高权限会话的执行行为，禁写
