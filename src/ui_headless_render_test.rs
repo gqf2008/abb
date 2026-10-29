@@ -231,6 +231,82 @@ impl Frame {
     }
 }
 
+/// 叠加层开关的类型别名：`(名字, 置开/置关)` 表里放它。
+///
+/// 单独起名不只是好读：clippy 的 `type_complexity` 会把内联的
+/// `fn(&SystemChatWindow, bool)`（尤其成表出现时）判为「过复杂」而红掉门禁。
+type OverlayToggle = fn(&SystemChatWindow, bool);
+
+/// 两帧的差异包围盒 `(x0, y0, x1, y1)`，**含端点**（与 [`bbox`] 同口径）；两帧一样则 `None`。
+///
+/// 这是「叠加层解剖图」的判据来源（卡 `abb-overlay-anatomy-dump-20261029`）：单帧图只能
+/// 回答「打开之后长什么样」，**两帧差异**才能回答「它到底盖住了画面哪一块」。
+/// 出图（[`overlay_diff_image`]）与断言（`overlay_panels_do_not_cover_button_row`）共用它，
+/// 免得「图上看的是这个区域、断言量的是另一个区域」。
+fn overlay_diff_bbox(a: &Frame, b: &Frame) -> Option<(u32, u32, u32, u32)> {
+    assert_eq!((a.w, a.h), (b.w, b.h), "两帧尺寸必须一致");
+    let mut acc: Option<(u32, u32, u32, u32)> = None;
+    for y in 0..a.h {
+        for x in 0..a.w {
+            let (p, q) = (a.px(x, y), b.px(x, y));
+            if (p.red, p.green, p.blue, p.alpha) != (q.red, q.green, q.blue, q.alpha) {
+                acc = Some(match acc {
+                    None => (x, y, x, y),
+                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                });
+            }
+        }
+    }
+    acc
+}
+
+/// 差异图：改动像素涂品红 `(255,0,128)`，未改动像素**淡化**（往白里掺），供肉眼判读。
+///
+/// 两个必须注意的点：
+/// 1. **淡化只能全程走 `u32` 再 `.min(255)`**。`u8` 上的「亮度增强」会回绕：
+///    `200u8 + 80` ⇒ 24，一张本该「淡化到近白」的图会变成满屏黑底（本卡实现时踩过一次，
+///    现场表现是「整窗都像被选中了」）。所以这里先按 `write_png` 的口径把预乘色合成到白
+///    底（同样用 `u32` 累加），再做掺白。
+/// 2. 先合成再淡化：直接对**预乘**色做掺白，半透明像素会变成「更透明」，写出来的图与
+///    屏幕上的观感不是一回事。
+fn overlay_diff_image(a: &Frame, b: &Frame) -> Frame {
+    /// 品红：改动像素（`.slint` 里没有这个色 ⇒ 不会与任何主题色混淆）。
+    const MAGENTA: (u8, u8, u8) = (255, 0, 128);
+    /// 未改动像素保留原色的百分比（其余掺白）。
+    const KEEP: u32 = 45;
+    assert_eq!((a.w, a.h), (b.w, b.h), "两帧尺寸必须一致");
+    // 预乘色 + `(255 - alpha)` = 合成到白底（与 [`write_png`] 同一口径），全程 `u32`。
+    fn over_white(c: u8, alpha: u8) -> u32 {
+        (c as u32 + 255 - alpha as u32).min(255)
+    }
+    let mut buf = vec![PremultipliedRgbaColor::default(); (a.w * a.h) as usize];
+    for y in 0..a.h {
+        for x in 0..a.w {
+            let (p, q) = (a.px(x, y), b.px(x, y));
+            let changed = (p.red, p.green, p.blue, p.alpha) != (q.red, q.green, q.blue, q.alpha);
+            let fade = |c: u8| -> u8 {
+                ((over_white(c, p.alpha) * KEEP + 255 * (100 - KEEP)) / 100).min(255) as u8
+            };
+            let (red, green, blue) = if changed {
+                MAGENTA
+            } else {
+                (fade(p.red), fade(p.green), fade(p.blue))
+            };
+            buf[(y * a.w + x) as usize] = PremultipliedRgbaColor {
+                red,
+                green,
+                blue,
+                alpha: 255,
+            };
+        }
+    }
+    Frame {
+        buf,
+        w: a.w,
+        h: a.h,
+    }
+}
+
 /// 单列上的暗行（墨迹）行号（升序）——量控件边框盒用。
 fn dark_rows(f: &Frame, x: u32, y0: u32, y1: u32) -> Vec<u32> {
     (y0..y1).filter(|&y| is_dark(f.px(x, y))).collect()
@@ -3291,23 +3367,8 @@ fn v11_split_draggable_between_convo_and_composer() {
 /// 判别力（负向）：把 `pop_anchor` 的 x 改成左对齐、或 y 改回「输入框顶边 − h − 6」⇒ 1/2 红。
 #[test]
 fn v11_pop_panels_anchor_above_their_buttons() {
-    // 差异包围盒（x0,y0,x1,y1），`None` = 两帧一样。宽高取**帧自己的**（本用例按窗宽渲两档：
-    // 520 / 340，不能拿模块常量 `W`）。
-    fn diff_bbox(a: &Frame, b: &Frame) -> Option<(u32, u32, u32, u32)> {
-        let mut acc: Option<(u32, u32, u32, u32)> = None;
-        for y in 0..a.h {
-            for x in 0..a.w {
-                let (p, q) = (a.px(x, y), b.px(x, y));
-                if (p.red, p.green, p.blue, p.alpha) != (q.red, q.green, q.blue, q.alpha) {
-                    acc = Some(match acc {
-                        None => (x, y, x, y),
-                        Some((a, b2, c, d)) => (a.min(x), b2.min(y), c.max(x), d.max(y)),
-                    });
-                }
-            }
-        }
-        acc
-    }
+    // 差异包围盒口径见 [`overlay_diff_bbox`]（本卡把它提到了模块级：出图与断言共用一份）。
+    use overlay_diff_bbox as diff_bbox;
 
     for (window_w, tag) in [(520_u32, "520"), (340_u32, "340")] {
         let (ui, win, _m) = setup(vec![role_row("怹", true), row("p", "面板锚点")], SHORT_H);
@@ -3928,6 +3989,188 @@ fn dump_v11_panels_for_review() {
         ui.get_model_menu_x(),
         ui.get_model_menu_y()
     );
+}
+
+/// 叠加层解剖图（卡 `abb-overlay-anatomy-dump-20261029`；默认不跑）：对五个叠加层各出
+/// **关闭态 / 打开态 / 差异图 / 锚点放大** 四张图，并打印改动区包围盒。
+///
+/// 为什么单帧不够：`dump_*` 家族现有成员只回答「打开之后长什么样」。
+/// 而「它盖住了画面哪一块、顺手盖掉没盖掉别的东西」是**两帧之间**的事——
+/// 逐像素差异 + 包围盒把它变成可读、可断言（见 `overlay_panels_do_not_cover_button_row`）的数字。
+///
+/// 五种叠加层各自由 Rust 的开关驱动（与生产同一个属性）：
+/// 历史会话 / 模型列表 / 划词工具条（锚在标题栏或选区）/ 表情 / 「更多」。
+#[test]
+#[ignore = "出图用；默认不跑"]
+fn dump_overlay_anatomy_for_review() {
+    const W520: u32 = 520;
+    const H: u32 = 820;
+    /// 放大窗口在包围盒外的留白（px）。
+    const PAD: u32 = 16;
+    let dir = std::path::Path::new(SHOTS);
+    std::fs::create_dir_all(dir).expect("建出图目录失败");
+    let (ui, win, _m) = setup(fixture(), H);
+    let _split = wire_split(&ui);
+    // 灌满内容：不灌也能拿到包围盒（面板尺寸由 `.slint`/`more_pop_h` 定），但图上就只是
+    // 一块空面板——排障时恰恰要看「内容有没有被裁掉」，所以按 `dump_v11_split_and_pops_for_review`
+    // 的口径把 emoji / 定时数据也灌进去。
+    seed_panels(&ui);
+    ui.set_emoji_cats(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("常用"),
+        slint::SharedString::from("手势"),
+    ]))));
+    ui.set_emoji_cells(slint::ModelRc::from(Rc::new(slint::VecModel::from(
+        crate::emoji::page_cells(0, 0)
+            .into_iter()
+            .map(slint::SharedString::from)
+            .collect::<Vec<_>>(),
+    ))));
+    ui.set_emoji_page_label("1/2".into());
+    ui.set_sched_preset_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("5 分钟后"),
+        slint::SharedString::from("30 分钟后"),
+        slint::SharedString::from("今天 18:00"),
+    ]))));
+    ui.set_sched_count(1);
+    ui.set_sched_items(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("10-14 18:00 · 待发测试"),
+    ]))));
+    ui.set_draft("就按这三份素材做，说明放第二节…".into());
+    ui.window().set_size(slint::PhysicalSize::new(W520, H));
+    apply_syschat_layout(&ui, W520 as f32);
+    // 划词工具条：**必须先给锚点再置可见**。坐标停在默认 `(0,0)` 时条形贴在窗左上角，
+    // 图上看不出「它挨着选区」这件本该被判读的事。锚点取正文中段（y=320）。
+    ui.set_sel_toolbar_x(120.0);
+    ui.set_sel_toolbar_y(320.0);
+    let _ = settle_w(&win, W520, H);
+    // 底部功能钮行的顶边（窗口坐标）：两个 24×24 图标钮在 30px 行里居中。
+    let btn_row = ui.get_dbg_emoji_btn_y().min(ui.get_dbg_more_btn_y());
+
+    // 名字 + 置开/置关：五种叠加层的开关都在生产同一属性上。
+    let cases: [(&str, OverlayToggle); 5] = [
+        ("history", |ui, on| ui.set_session_menu_open(on)),
+        ("model", |ui, on| ui.set_model_menu_open(on)),
+        ("sel-toolbar", |ui, on| ui.set_sel_toolbar_visible(on)),
+        ("emoji", |ui, on| ui.set_emoji_open(on)),
+        ("more", |ui, on| ui.set_more_open(on)),
+    ];
+    for (name, toggle) in cases {
+        toggle(&ui, false);
+        let closed = settle_w(&win, W520, H);
+        toggle(&ui, true);
+        let open = settle_w(&win, W520, H);
+        let (x0, y0, x1, y1) = overlay_diff_bbox(&closed, &open)
+            .unwrap_or_else(|| panic!("{name}：开关两帧一模一样 —— 这个叠加层没画出来"));
+        let changed = closed.diff_px(&open);
+        write_png(&closed, &dir.join(format!("ovl-{name}-closed.png")));
+        write_png(&open, &dir.join(format!("ovl-{name}-open.png")));
+        write_png(
+            &overlay_diff_image(&closed, &open),
+            &dir.join(format!("ovl-{name}-diff.png")),
+        );
+        // 锚点放大：向下展开的面板看**顶边与 chip 的关系**，向上展开的看**底边与功能钮的关系**
+        //（后两个多往下框一截，把功能钮那一行也带进图里）。
+        let pad_down = if matches!(name, "emoji" | "more") {
+            44
+        } else {
+            PAD
+        };
+        let (cx0, cy0) = (x0.saturating_sub(PAD), y0.saturating_sub(PAD));
+        let (cx1, cy1) = ((x1 + PAD).min(W520 - 1), (y1 + pad_down).min(H - 1));
+        let zoom = crop(&open, cx0, cy0, cx1 - cx0 + 1, cy1 - cy0 + 1);
+        write_png(&zoom, &dir.join(format!("ovl-{name}-anchor-zoom.png")));
+        println!(
+            "ovl/{name}: bbox=({x0},{y0})..({x1},{y1}) 宽 {} 高 {} | y {:.1}%..{:.1}% | \
+             改动 {changed} px | 功能钮行顶 y={btn_row} | 下边界距按钮行 {:.0}px",
+            x1 - x0 + 1,
+            y1 - y0 + 1,
+            y0 as f32 * 100.0 / H as f32,
+            (y1 + 1) as f32 * 100.0 / H as f32,
+            btn_row - y1 as f32,
+        );
+        toggle(&ui, false);
+        let _ = settle_w(&win, W520, H);
+    }
+    println!(
+        "叠加层解剖图完成：ovl-{{history,model,sel-toolbar,emoji,more}}-{{closed,open,diff,anchor-zoom}}.png \
+         （共 20 张，目录 {SHOTS}）"
+    );
+}
+
+/// 叠加层几何回归（卡 `abb-overlay-anatomy-dump-20261029`）：**表情 /「更多」面板的改动区
+/// 下边界不得进入底部功能钮所在行**（即不得盖住功能钮与发送键）。
+///
+/// 这条为什么必须常跑：面板落位由 `syschat::pop_anchor` 按**按钮矩形**算出、面板高又随内容
+/// 变（`more_pop_h(sched-count)`）。任何一边改动都可能让面板**默默盖上去**——界面不报错，
+/// 只是按钮点不着了。出图（`dump_overlay_anatomy_for_review`）能看出来，但出图不进 CI；
+/// 这条断言才是防护。
+///
+/// 判据口径：**像素事实**（开关两帧的差异包围盒）对**自报值**（`dbg-emoji-btn-*` /
+/// `dbg-more-btn-*`，窗口坐标）。两条来源独立：包围盒来自渲染结果，按钮行来自 `.slint`
+/// 绝对位置 ⇒ 布局与渲染任一侧坏掉都会红。
+///
+/// 与 `v11_pop_panels_anchor_above_their_buttons` 的分工：那条盯「贴着按钮上方 6px」的
+/// **锚点算术**（两档窗宽 + 出窗夹取）；本条只盯「压不压到按钮行」这一条**安全边界**，
+/// 且**多扫一档窗高**（620 矮窗 / 820 常规窗 —— 面板高固定而上方面板空间随窗高变，
+/// 最危险的一档就是矮窗）。
+#[test]
+fn overlay_panels_do_not_cover_button_row() {
+    const W520: u32 = 520;
+    for h in [SHORT_H, 820] {
+        let (ui, win, _m) = setup(fixture(), h);
+        seed_panels(&ui);
+        // 发送键空闲时 `opacity: 0.5`（草稿为空⇒不可点），淡成半透明后就不再是 accent 色，
+        // 下面的「正面控制」会找不到它 ⇒ 给一句草稿让按钮满不透明。
+        ui.set_draft("占位草稿：让发送键可点（正面控制要用它的 accent 底）".into());
+        ui.window().set_size(slint::PhysicalSize::new(W520, h));
+        apply_syschat_layout(&ui, W520 as f32);
+        let _ = settle_w(&win, W520, h);
+        // 功能钮行顶边 = 两个 24×24 图标钮的窗口坐标 y（`crow` 里居中于 30px 行）。
+        let btn_row = ui.get_dbg_emoji_btn_y().min(ui.get_dbg_more_btn_y());
+        assert!(
+            btn_row > 0.0 && btn_row < h as f32,
+            "{h}：功能钮行自报 y 不合理：{btn_row}"
+        );
+
+        for (which, toggle) in [
+            (
+                "表情",
+                (|ui: &SystemChatWindow, on| ui.set_emoji_open(on)) as OverlayToggle,
+            ),
+            ("更多", |ui, on| ui.set_more_open(on)),
+        ] {
+            toggle(&ui, false);
+            let closed = settle_w(&win, W520, h);
+            toggle(&ui, true);
+            let open = settle_w(&win, W520, h);
+            let (x0, y0, x1, y1) = overlay_diff_bbox(&closed, &open)
+                .unwrap_or_else(|| panic!("{h}/{which}：面板没渲染出来（两帧一样）"));
+            // ① 正面控制：功能钮行**在像素上确实存在**——发送键的 accent 底落在这一行里。
+            //（否则「下边界 < 行顶」可以靠「整行根本没画」骗过去；本仓踩过「边框喂饱断言」
+            //  的同类坑，卡的验收要求防的正是这个。）
+            let row_top = btn_row.round() as u32;
+            let send = bbox(&open, W520 - 200, row_top, W520, h, is_accent).unwrap_or_else(|| {
+                panic!("{h}/{which}：功能钮行里找不到发送键的 accent 底（正面控制）")
+            });
+            assert!(
+                send.1 as f32 <= btn_row && send.3 as f32 >= btn_row + 20.0,
+                "{h}/{which}：发送键不在功能钮行上（accent 盒 {send:?}，行顶 y={btn_row}）"
+            );
+            // ② 判据：改动区不得进入功能钮所在行（`y1` 含端点 ⇒ 下边界 = `y1`）。
+            assert!(
+                (y1 as f32) < btn_row,
+                "{h}/{which}：面板改动区压到功能钮行（bbox x {x0}..{x1} / y {y0}..{y1}，\
+                 功能钮行顶 y={btn_row}）—— 面板会盖住功能钮与发送键"
+            );
+            // ③ 反面：改动区也得真的在**下半**（否则「在上面」这件事本身没被量到）。
+            assert!(
+                y0 > h / 2,
+                "{h}/{which}：下方面板的改动区跑到了画面上半（y0={y0}），这条量错了对象"
+            );
+            toggle(&ui, false);
+            let _ = settle_w(&win, W520, h);
+        }
+    }
 }
 
 /// 从一帧里裁一块（x,y 为左上角；供对稿放大用）。
