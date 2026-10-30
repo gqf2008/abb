@@ -2101,6 +2101,9 @@ pub const MORE_POP_W: i32 = 250;
 /// 这是刻意的：**面板高度与窗高解耦**，才能一劳永逸地消掉「缩窗后 K 不更新」那类 bug。
 pub const MAX_VISIBLE_SCHED_ROWS: i32 = 4;
 
+/// 「更多」面板的外边距总宽（`VerticalLayout` 的 `padding: 6px` × 上下）。
+pub const MORE_POP_PADDING: i32 = 12;
+
 pub fn more_pop_h(sched_count: i32) -> i32 {
     let n = sched_count.clamp(0, MAX_VISIBLE_SCHED_ROWS);
     // 条数超过上限时，多出来的那些由「还有 N 条」折叠行占位（高度与普通待发行同为 26）。
@@ -2109,7 +2112,30 @@ pub fn more_pop_h(sched_count: i32) -> i32 {
     } else {
         0
     };
-    122 + (n + folded) * 26 + if n > 0 { 20 } else { 0 } + if n > 1 { 26 } else { 0 }
+    // **逐项相加**，不再用拍平的常数（卡 `abb-more-pop-h-magic-20-20261030`）。
+    //
+    // 旧式 `122 + (n+folded)*26 + (n>0?20:0) + (n>1?26:0)` 把「待发行 18 + 一个间距 2」
+    // 拍成 `+20`，于是**漏算了行数变化带来的 spacing 总数变化**：实测 count=4 时低估 4px、
+    // count≥5 时低估 6px、count=0/1 时反而高估 4–6px。偏移本身不固定，靠「留余量」糊不过去。
+    //
+    // 下面每一项都对应 `ui/app.slint` 里一个真实构件（行号见各分支注释），改动那边时
+    // 这里的常量与 `more_pop_h_matches_the_slint_build_up` 会一起提醒你。
+    let header = 20; // 头「定时发送（到点自动发出）」
+    let preset = 26; // 三档预设（`MenuRow`，每档一条）
+    let preset_count = 3;
+    let pending_label = if n > 0 { 18 } else { 0 }; // 「待发（点 ✕ 取消）」
+    let pending_rows = (n + folded) * 26; // n 条待发 + 可能的 1 条折叠行
+    let cancel_all = if sched_count > 1 { 26 } else { 0 }; // 「取消全部定时」
+    let rows = 1 + preset_count + i32::from(n > 0) + n + folded + i32::from(sched_count > 1);
+    // 行间 spacing：项数 − 1（顶层 `VerticalLayout` 的 `spacing: 2px`）。
+    let gaps = (rows - 1) * 2;
+    MORE_POP_PADDING
+        + header
+        + preset * preset_count
+        + pending_label
+        + pending_rows
+        + cancel_all
+        + gaps
 }
 
 /// 面板落位（窗口坐标，逻辑像素；纯函数）。
@@ -6647,13 +6673,93 @@ mod tests {
 
     /// 「更多」面板高：搬自 `.slint` 原表达式（逐值对表；改任一分支必红）。
     #[test]
-    fn more_pop_h_is_the_slint_expression() {
-        assert_eq!(more_pop_h(0), 122);
-        assert_eq!(more_pop_h(1), 122 + 26 + 20);
-        assert_eq!(more_pop_h(2), 122 + 52 + 20 + 26);
-        assert_eq!(more_pop_h(5), 122 + 130 + 20 + 26);
-        assert_eq!(more_pop_h(-3), 122, "负数不该产生负高");
-        assert!(more_pop_h(3) > more_pop_h(0), "条目变多 ⇒ 面板变高");
+    /// 高度必须等于「按 `ui/app.slint` 逐项加起来」的值（卡 `abb-more-pop-h-magic-20-20261030`）。
+    ///
+    /// 为什么要**逐项重建**而不是断言 `more_pop_h(2) == 220` 这种拍平值：旧测试正是写死了
+    /// `122 + 52 + 20 + 26` 这串常数，于是「它的构成有没有漏项」永远测不出来——公式把
+    /// 「待发行 18 + 一个 spacing 2」拍成 `+20` 后，行数变化导致的 spacing 总数变化就漏了
+    /// （实测 count=4 低估 4px、count≥5 低估 6px、count=0/1 反而高估 4–6px）。
+    ///
+    /// 这里按 `.slint` 的真实构件重建一遍：
+    /// `padding 6×2` + 头 20 + 三档 26×3 + 「待发」18 + 待发条 26×n + 折叠行 26
+    /// + 「取消全部」26 + 行间 spacing 2×(行数−1)。
+    fn more_pop_h_matches_the_slint_build_up() {
+        // 与 `ui/app.slint` 的 `VerticalLayout` 一致的构件尺寸/间距。
+        const PADDING: i32 = 6;
+        const SPACING: i32 = 2;
+        const HEADER: i32 = 20;
+        const MENU_ROW: i32 = 26;
+        const PRESETS: i32 = 3;
+        const PENDING_LABEL: i32 = 18;
+
+        let rebuild = |count: i32| -> i32 {
+            let n = count.clamp(0, MAX_VISIBLE_SCHED_ROWS);
+            let folded = i32::from(count > MAX_VISIBLE_SCHED_ROWS);
+            let mut items = vec![HEADER];
+            items.extend(std::iter::repeat_n(MENU_ROW, PRESETS as usize));
+            if n > 0 {
+                items.push(PENDING_LABEL);
+            }
+            items.extend(std::iter::repeat_n(MENU_ROW, (n + folded) as usize));
+            if count > 1 {
+                items.push(MENU_ROW);
+            }
+            let content: i32 = items.iter().sum();
+            PADDING * 2 + content + SPACING * (items.len() as i32 - 1)
+        };
+
+        for count in [-3, 0, 1, 2, 3, 4, 5, 6, 7, 16, 40, 999] {
+            assert_eq!(
+                more_pop_h(count),
+                rebuild(count),
+                "count={count}：more_pop_h 与「按 .slint 构件逐项重建」不符\
+                 —— 说明公式漏项或多了项（改 .slint 布局时这里会一起红）"
+            );
+        }
+        assert_eq!(more_pop_h(-3), more_pop_h(0), "负数按 0 处理");
+        assert!(
+            more_pop_h(5) == more_pop_h(999),
+            "超过上限后高度必须封顶（否则又会长回「随条数无界增长」）"
+        );
+
+        // **真读 `.slint` 源码**校验上面那几个常量（本仓惯例，见 `src/ui.rs` 里的
+        // `include_str!("ui.rs")` 用法）。没有这一步，测试就只是「Rust 公式 vs Rust 重建」——
+        // 改 `.slint` 的布局不会红，暗耦合原封不动（本卡要修的正是这个）。
+        let slint = crate::platform::src_lf(include_str!("../ui/app.slint"));
+        // 只看「更多」面板那一段，避免撞上别处的同名尺寸。
+        let panel = slint
+            .split("if root.more-open: Rectangle {")
+            .nth(1)
+            .expect("app.slint 里找不到「更多」面板（`if root.more-open:`）");
+        let panel = &panel[..panel.find("\n    }\n").unwrap_or(panel.len())];
+
+        let must = |needle: &str, why: &str| {
+            assert!(
+                panel.contains(needle),
+                "「更多」面板的 slint 布局里找不到 {needle:?} —— {why}；\
+                 若确实改了布局，请同步 more_pop_h 里的常量与本断言"
+            );
+        };
+        must("padding: 6px;", "`more_pop_h` 假设 padding 6×2");
+        must("spacing: 2px;", "`more_pop_h` 按 spacing 2px 算行间距");
+        must("height: 20px;", "`more_pop_h` 假设标题行 20px");
+        must(
+            "height: 18px;",
+            "`more_pop_h` 假设「待发」行 18px（旧公式把它与 spacing 拍成 +20，正是本卡的病灶）",
+        );
+        // `MenuRow` 的高度在组件定义处，不在面板段里。
+        assert!(
+            slint.contains("component MenuRow inherits Rectangle {"),
+            "找不到 MenuRow 定义"
+        );
+        let mr = &slint[slint
+            .find("component MenuRow inherits Rectangle {")
+            .unwrap()..];
+        let mr = &mr[..mr.find("\n}").unwrap_or(mr.len())];
+        assert!(
+            mr.contains("height: 26px;"),
+            "MenuRow 应为 26px（`more_pop_h` 按 26 算预设/待发/取消全部）；当前定义里找不到"
+        );
     }
 
     // ── v11（卡 `abb-v11-resizable-split`）：分割条比例 ↔ 像素 ──
