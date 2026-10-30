@@ -5449,3 +5449,58 @@ fn more_pop_panel_never_overflows_at_any_count_or_window_height() {
         }
     }
 }
+
+/// 固定上限下的**内容完整性**：既要「不溢出」（见同名族用例），也不能「为不溢出把内容裁空」。
+///
+/// 断言两件事：
+/// 1. 面板区域内的墨迹行数要足够（说明三档预设 + 待发行 + 折叠提示 + 取消全部真的画了）；
+/// 2. 条数超上限时**折叠提示非空**（否则用户看到 4 条却不知道还有更多）。
+///
+/// 与 `more_pop_panel_never_overflows_at_any_count_or_window_height` 配对：那条防「画出去」，
+/// 这条防「不敢画」。只测一边都能被「什么都不画」骗过。
+#[test]
+fn more_pop_panel_content_is_complete_under_the_cap() {
+    const W: u32 = 520;
+    for (h, count) in [(380u32, 20i32), (620, 20), (820, 20), (380, 2), (380, 4)] {
+        let (ui, win, _m) = setup(fixture(), h);
+        seed_panels(&ui);
+        ui.set_draft("x".into());
+        ui.window().set_size(slint::PhysicalSize::new(W, h));
+        apply_syschat_layout(&ui, W as f32);
+        let _ = settle_w(&win, W, h);
+        let dir = crate::testtmp::TempPath::new("completeness");
+        let store = Rc::new(crate::syschat_sched::SchedStore::at(dir.join("s.json")));
+        for i in 0..count {
+            store.add(&format!("待发 {i}"), "2026-10-14 18:00").unwrap();
+        }
+        super::refresh_sched_menu(&ui, &store);
+        ui.set_more_open(true);
+        let f = settle_w(&win, W, h);
+        // 面板区域内：统计「墨迹行」（每一行有墨迹即说明有内容）
+        let py = ui.get_more_pop_y() as u32;
+        let ph = ui.get_more_pop_h() as u32;
+        let mut ink_rows = 0;
+        for y in py..(py + ph).min(h) {
+            if (160..409u32).any(|x| is_dark(f.px(x, y))) {
+                ink_rows += 1;
+            }
+        }
+        // 诊断信息（失败时能直接看出是哪一档）
+        eprintln!(
+            "h={h} n={count} K={} folded={:?} panel_h={ph} ink_rows={ink_rows}",
+            ui.get_sched_visible_rows(),
+            ui.get_sched_folded_label()
+        );
+        assert!(
+            ink_rows > 40,
+            "h={h} n={count}: 面板内容太少（{ink_rows} 行墨迹），可能被裁空"
+        );
+        if count > 4 {
+            assert!(
+                !ui.get_sched_folded_label().is_empty(),
+                "h={h}: 条数 {count} 超过上限但折叠提示为空"
+            );
+        }
+        ui.set_more_open(false);
+    }
+}
