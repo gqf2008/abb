@@ -104,6 +104,28 @@ entire runtime directory; empty means default); per-bot workspaces under
   把 `ref` 当分支/标签名 fetch，短 SHA 会直接红在 checkout），且**该 SHA 必须已推到 GitHub
   镜像**——只存在于 walgit 的提交在 CI 里不存在（2026-10-23 首次真跑两个 job 同时踩到）。
 
+## Decision Making（该做哪个选择，问 Jev）
+
+**需要做取舍时，先问 Jev，不要回头问人。** 本机 ki 会话装了 `jev` MCP server
+（`~/.agents/skills/jev-decision/scripts/jev_mcp.py`，配置在 `.ki/settings.json`），
+暴露 `jev_choice` / `jev_score` / `jev_noul` / `jev_ask` / `jev_health`。
+
+典型该问的场景：合不合 / 先做 A 还是 B / 这个风险大不大 / 优先级排序 / 两种修法选哪个。
+一次调用可以混问多个问题（`jev_ask`）——输入只计一次 token，比分开问省。
+
+**调用顺序**：决策失败时**先跑 `jev_health`**（不发模型请求），它能把「网络/钥匙坏了」
+和「模型拒了」分开；本机走代理，节点不可用时表现为 `UNREACHABLE` 而不是模型报错。
+
+**如实转述**：Jev 是概率决策器，返回 `choice` + 全部选项的概率分布 + `confidence`。
+转述时必须带上这三个数，**不要**把它的输出当确定性事实；`confidence` 偏低时（如 < 0.6）
+要说明「它自己也不确定」，不要替它包装成强结论。
+
+**什么时候仍然找人**（这几类 Jev 替代不了）：
+
+- 需要**授权**的动作：删文件/目录/分支、改外部系统、向他人发消息
+- 涉及**人的偏好或现实条件**：产品方向、真机验证、只有人能看到的现场
+- Jev **不可用**（`jev_health` 报 `UNREACHABLE` / key 缺失），网络恢复后补问
+
 ## Build, Test, and Development Commands
 
 Every cargo command below **must** carry the build-intermediate env prefix (user policy:
