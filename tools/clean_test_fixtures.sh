@@ -42,9 +42,16 @@ if [ ! -d "$base" ]; then
   exit 0
 fi
 
+# 前缀白名单。**新增测试夹具时记得把前缀加进来**——漏一个，那类夹具就永远清不掉
+# （2026-10-30 实测：白名单只有 11 个前缀，而 $TMPDIR 里积了 ~2500 个漏网目录，
+# `abb-msgstore-test-*` 一类 792 个、`abb-hist-*` 660 个）。
 fixture_prefixes=(
   abb-guard- abb-task- abb-migrate- abb-syschat- abb-hints- abb-read-
   abb-att- abb-cap- abb-trash- abb-sessions- abb-test-home.
+  # 2026-10-30 补：下面这些前缀此前一直在漏
+  abb-msgstore-test- abb-sched- abb-teambuilder- abb-sc-t abb-sc-att-
+  abb-hist- abb-ki-config- abb-oneshot- abb-roleprompt- abb-chart-
+  abb-teams- abb-logs- abb-acp- abb-mock- abb-lark-
 )
 
 found=0
