@@ -940,6 +940,43 @@ fn apply_pop_anchors(
     win.set_more_pop_h(mh as f32);
 }
 
+/// 把定时档位文案 + 待发列表写进「更多」菜单（每次打开/增删后调）。
+pub(super) fn refresh_sched_menu(
+    win: &SystemChatWindow,
+    store: &Rc<crate::syschat_sched::SchedStore>,
+) {
+    let now = crate::schedule::DateTime::now();
+    let labels: Vec<slint::SharedString> = crate::syschat_sched::preset_labels(now)
+        .into_iter()
+        .map(slint::SharedString::from)
+        .collect();
+    win.set_sched_preset_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(labels))));
+    let items = store.list();
+    let count = items.len() as i32;
+    // 逐条只画前 N 条（卡 `abb-sched-count-no-upper-bound-20261029`）。N 是**固定常量**，
+    // 不按窗高反解 —— 面板高度因此与窗高、与条数都解耦，几何上不可能再溢出。
+    // 超出部分由 `.slint` 的折叠行如实说明（`sched-folded-label`），取消走「取消全部」。
+    let n = crate::syschat::MAX_VISIBLE_SCHED_ROWS.max(0) as usize;
+    let rows: Vec<slint::SharedString> = items
+        .iter()
+        .take(n)
+        .map(|m| slint::SharedString::from(crate::syschat_sched::menu_row(m)))
+        .collect();
+    let shown = rows.len() as i32;
+    win.set_sched_items(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
+    win.set_sched_count(count);
+    win.set_sched_visible_rows(shown);
+    win.set_sched_folded_label(
+        if count > shown {
+            format!("还有 {} 条未显示", count - shown)
+        } else {
+            String::new()
+        }
+        .into(),
+    );
+    win.set_sched_cancel_all_label(format!("取消全部定时（{count}）").into());
+}
+
 /// v11（卡 `abb-v11-resizable-split`）：分割条的接线状态。
 ///
 /// 三个回调（带变化 / 拖动 / 松手）都只改这里，再统一把结果写进窗口。抽成结构体是为了让
@@ -4559,25 +4596,6 @@ pub fn run_gui() -> Result<()> {
         win.set_emoji_page_label(crate::emoji::page_label(c, p).into());
         win.set_emoji_prev_enabled(p > 0);
         win.set_emoji_next_enabled(p + 1 < crate::emoji::page_count(c));
-    }
-
-    /// 把定时档位文案 + 待发列表写进「更多」菜单（每次打开/增删后调）。
-    fn refresh_sched_menu(win: &SystemChatWindow, store: &Rc<crate::syschat_sched::SchedStore>) {
-        let now = crate::schedule::DateTime::now();
-        let labels: Vec<slint::SharedString> = crate::syschat_sched::preset_labels(now)
-            .into_iter()
-            .map(slint::SharedString::from)
-            .collect();
-        win.set_sched_preset_labels(slint::ModelRc::from(Rc::new(slint::VecModel::from(labels))));
-        let items = store.list();
-        let count = items.len() as i32;
-        let rows: Vec<slint::SharedString> = items
-            .iter()
-            .map(|m| slint::SharedString::from(crate::syschat_sched::menu_row(m)))
-            .collect();
-        win.set_sched_items(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
-        win.set_sched_count(count);
-        win.set_sched_cancel_all_label(format!("取消全部定时（{count}）").into());
     }
 
     // 分类 tab 是常量，初始化就写一次（之后面板打开不必重设）。

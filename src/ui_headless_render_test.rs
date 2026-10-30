@@ -5395,3 +5395,57 @@ fn cell_interior_refuses_to_judge_when_border_fills_the_cell() {
     };
     let _ = cell_interior(&f, 0, 26, 0, 26);
 }
+
+/// 固定上限方案：**任意条数 × 任意窗高都不溢出**（卡 `abb-sched-count-no-upper-bound-20261029`）。
+///
+/// 这张卡先后被两版动态方案拖进三轮评审：v1 把 K 算在只在内容变化时调的函数里（缩窗不重算）、
+/// v2 用 `.slint` 反解（`visible:false` 不释放布局槽位 + 公式与 Rust 不等价）。两版都栽在
+/// 「面板几何依赖窗高/条数 ⇒ 有某个时刻没重算」这个模式上。
+///
+/// 现方案把「能放几条」变成**固定常量**（`syschat::MAX_VISIBLE_SCHED_ROWS`）：面板高度只取决于
+/// `min(条数, N)`，与窗高**无关** ⇒ 不存在重算时机问题，几何上不可能再溢出。代价是窗更高时
+/// 也只逐条显示 N 条（其余折叠成「还有 N 条」）。
+///
+/// 这条用例扫 3 窗高 × 8 条数，断言**整块面板墨迹**都落在 `[面板顶, 按钮行顶)` 内——
+/// 比只查下沿严（上一轮的失效形态恰恰是「动作行被挤出后下沿反而更小」）。
+#[test]
+fn more_pop_panel_never_overflows_at_any_count_or_window_height() {
+    const W: u32 = 520;
+    for h in [380u32, 620, 820] {
+        for count in [0i32, 1, 2, 4, 5, 6, 16, 40] {
+            let (ui, win, _m) = setup(fixture(), h);
+            seed_panels(&ui);
+            ui.set_draft("占位草稿".into());
+            ui.window().set_size(slint::PhysicalSize::new(W, h));
+            apply_syschat_layout(&ui, W as f32);
+            let _ = settle_w(&win, W, h);
+            let dir = crate::testtmp::TempPath::new("cap-probe");
+            let store = Rc::new(crate::syschat_sched::SchedStore::at(dir.join("s.json")));
+            for i in 0..count {
+                store.add(&format!("待发 {i}"), "2026-10-14 18:00").unwrap();
+            }
+            super::refresh_sched_menu(&ui, &store);
+            ui.set_more_open(true);
+            let a = settle_w(&win, W, h);
+            let k = ui.get_sched_visible_rows();
+            let py = ui.get_more_pop_y();
+            let ph = ui.get_more_pop_h();
+            let btn = ui.get_dbg_emoji_btn_y();
+            // 整个面板的墨迹范围（开/关两帧差异）
+            ui.set_more_open(false);
+            let closed = settle_w(&win, W, h);
+            let bb = overlay_diff_bbox(&closed, &a);
+            println!(
+                "h={h} n={count:2} K={k} panel={:?} btn={btn:.0} bbox={bb:?}",
+                (py, py + ph)
+            );
+            if let Some((_, y0, _, y1)) = bb {
+                assert!(
+                    (y0 as f32) >= py && (y1 as f32) < btn,
+                    "h={h} n={count}: 面板墨迹 y {y0}..{y1} 越界（面板 {py}..{} 按钮行 {btn}）",
+                    py + ph
+                );
+            }
+        }
+    }
+}

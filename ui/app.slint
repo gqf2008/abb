@@ -3997,6 +3997,10 @@ export component SystemChatWindow inherits Window {
     in property <[string]> sched-items: [];
     in property <int> sched-count: 0;
     in property <string> sched-cancel-all-label: "";
+    // 逐条显示的待发条数上限（= `syschat::MAX_VISIBLE_SCHED_ROWS`，由 Rust 写）。
+    in property <int> sched-visible-rows: 0;
+    // 超出上限时的折叠行文案（由 Rust 拼：「还有 N 条，点「取消全部」清掉」）。
+    in property <string> sched-folded-label: "";
     callback more-opened();
     callback sched-preset(int);
     callback sched-cancel(int);
@@ -5797,6 +5801,17 @@ export component SystemChatWindow inherits Window {
                             clicked => { root.sched-cancel(idx); }
                         }
                     }
+                }
+                // 折叠行（卡 `abb-sched-count-no-upper-bound-20261029`）：条数超过上限时，
+                // 不逐条画剩下的（面板高度与条数解耦 ⇒ 几何上不可能再溢出），而是给一行
+                // 如实说明还剩多少条。取消它们走下面的「取消全部」。
+                if root.sched-count > root.sched-visible-rows: Text {
+                    height: 26px;
+                    text: root.sched-folded-label;
+                    font-size: 11px;
+                    color: PixelTheme.dim;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
                 }
                 if root.sched-count > 1: MenuRow {
                     text: root.sched-cancel-all-label;
