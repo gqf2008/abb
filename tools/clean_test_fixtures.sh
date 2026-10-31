@@ -51,7 +51,10 @@ fixture_prefixes=(
   # 2026-10-30 补：下面这些前缀此前一直在漏
   abb-msgstore-test- abb-sched- abb-teambuilder- abb-sc-t abb-sc-att-
   abb-hist- abb-ki-config- abb-oneshot- abb-roleprompt- abb-chart-
-  abb-teams- abb-logs- abb-acp- abb-mock- abb-lark-
+  abb-acp- abb-lark-
+  # 2026-10-31 补：`src/session_gc.rs` 的 mock 夹具（`abb-gc-mock-{uuid}.jsonl`）。
+  # 这个前缀漏了一整轮：清扫脚本仍报「✅ 已清扫」，而 `$TMPDIR` 里躺着 46 个。
+  abb-gc-mock-
 )
 
 found=0
@@ -70,6 +73,28 @@ for prefix in "${fixture_prefixes[@]}"; do
     fi
   done < <(find "$base" -maxdepth 1 -name "${prefix}*" -mmin "+$((hours * 60))" -print0 2>/dev/null)
 done
+
+# 白名单会烂：漏一个前缀，那类夹具就永远清不掉，而脚本仍然报「✅ 已清扫」。
+# 所以把**实际存在又匹配不上**的 `abb-*` 逐个报出来（`abb-gc-mock-` 就是这么发现的），让
+# 「名单该加了」在跑门禁时就能看见。退出码不变：清扫失败要不要算门禁失败是另一件事。
+unmatched=0
+while IFS= read -r -d '' entry; do
+  name="$(basename "$entry")"
+  case "$name" in *target*) continue ;; esac
+  matched=0
+  for prefix in "${fixture_prefixes[@]}"; do
+    case "$name" in "$prefix"*) matched=1; break ;; esac
+  done
+  if [ "$matched" = 1 ]; then continue; fi
+  if [ "$unmatched" = 0 ]; then
+    echo "⚠️ 下面这些 abb-* 条目不在白名单里（本次不会被清扫）："
+  fi
+  unmatched=$((unmatched + 1))
+  echo "  $entry"
+done < <(find "$base" -maxdepth 1 -name 'abb-*' -mmin "+$((hours * 60))" -print0 2>/dev/null)
+if [ "$unmatched" -gt 0 ]; then
+  echo "   ⇒ 若那是测试夹具，把它的前缀加进 fixture_prefixes；本段防的就是名单悄悄烂掉。"
+fi
 
 if [ "$dry_run" = 1 ]; then
   echo "ℹ️ 干跑：$base 下有 $found 个超过 ${hours} 小时的测试夹具（未删除）"

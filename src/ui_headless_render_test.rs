@@ -5419,7 +5419,7 @@ fn more_pop_panel_never_overflows_at_any_count_or_window_height() {
             ui.window().set_size(slint::PhysicalSize::new(W, h));
             apply_syschat_layout(&ui, W as f32);
             let _ = settle_w(&win, W, h);
-            let dir = crate::testtmp::TempPath::new("cap-probe");
+            let dir = crate::testtmp::TempPath::new("abb-syschat-cap-probe");
             let store = Rc::new(crate::syschat_sched::SchedStore::at(dir.join("s.json")));
             for i in 0..count {
                 store.add(&format!("待发 {i}"), "2026-10-14 18:00").unwrap();
@@ -5427,75 +5427,157 @@ fn more_pop_panel_never_overflows_at_any_count_or_window_height() {
             super::refresh_sched_menu(&ui, &store);
             ui.set_more_open(true);
             let a = settle_w(&win, W, h);
-            let k = ui.get_sched_visible_rows();
+            let k = ui.get_sched_items().row_count();
             let py = ui.get_more_pop_y();
             let ph = ui.get_more_pop_h();
             let btn = ui.get_dbg_emoji_btn_y();
             // 整个面板的墨迹范围（开/关两帧差异）
             ui.set_more_open(false);
             let closed = settle_w(&win, W, h);
-            let bb = overlay_diff_bbox(&closed, &a);
+            let (_, y0, _, y1) = overlay_diff_bbox(&closed, &a).unwrap_or_else(|| {
+                panic!(
+                    "h={h} n={count}: 面板打开前后两帧没有差异像素 ⇒ 面板根本没画出来\
+                     （K={k} panel={py}..{}）",
+                    py + ph
+                )
+            });
             println!(
-                "h={h} n={count:2} K={k} panel={:?} btn={btn:.0} bbox={bb:?}",
+                "h={h} n={count:2} K={k} panel={:?} btn={btn:.0} ink={y0}..{y1}",
                 (py, py + ph)
             );
-            if let Some((_, y0, _, y1)) = bb {
-                assert!(
-                    (y0 as f32) >= py && (y1 as f32) < btn,
-                    "h={h} n={count}: 面板墨迹 y {y0}..{y1} 越界（面板 {py}..{} 按钮行 {btn}）",
-                    py + ph
-                );
+            // ① 不许越过按钮行顶。
+            assert!(
+                (y1 as f32) < btn,
+                "h={h} n={count}: 面板墨迹到 y={y1}，压到按钮行（{btn}）了"
+            );
+            // ② 墨迹必须留在**面板矩形内**。只断下沿（①）会被「内容被挤出面板」骗过——
+            //    v2 那版失效形态恰恰是「动作行被挤出后面板下沿反而更小」，① 照样绿。
+            assert!(
+                (y0 as f32) >= py && (y1 as f32) < py + ph,
+                "h={h} n={count}: 面板墨迹 y {y0}..{y1} 出了面板矩形 {py}..{}（K={k}）",
+                py + ph
+            );
+        }
+    }
+}
+
+/// 面板内框里有多少段连续「非底色」行（= 真的画出了几行内容），返回各段的 `[起, 止]` 行号。
+///
+/// 两个必需的口径：
+/// 1. **拿底色做基准**，不用 [`is_dark`]。面板里三种字色：`PixelTheme.text`（深）、
+///    `PixelTheme.dim`（标题/「待发」/折叠行，**亮于** `is_dark` 的阈值）——用 `is_dark` 扫会
+///    把三行 dim 文案当成没画（第一版实测：count=0 只数到 3 段，标题行凭空消失）。
+/// 2. **扫内框**（跳过 2px 边框与圆角）：边框本身就是连续墨迹，按整段扫的话每一行都有墨迹，
+///    「一行都没画」也会绿（更早的第一版：`ink_rows == panel_h` 恒成立）。
+fn more_pop_ink_bands(
+    f: &Frame,
+    bg: PremultipliedRgbaColor,
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+) -> Vec<(u32, u32)> {
+    let was = (bg.red, bg.green, bg.blue, bg.alpha);
+    let mut bands: Vec<(u32, u32)> = Vec::new();
+    for y in y0..y1 {
+        let painted = (x0..x1).any(|x| {
+            let p = f.px(x, y);
+            (p.red, p.green, p.blue, p.alpha) != was
+        });
+        if painted {
+            match bands.last_mut() {
+                Some(last) if y == last.1 + 1 => last.1 = y,
+                _ => bands.push((y, y)),
             }
         }
     }
+    bands
 }
 
 /// 固定上限下的**内容完整性**：既要「不溢出」（见同名族用例），也不能「为不溢出把内容裁空」。
 ///
 /// 断言两件事：
-/// 1. 面板区域内的墨迹行数要足够（说明三档预设 + 待发行 + 折叠提示 + 取消全部真的画了）；
+/// 1. 面板内框里**画出来的行数**等于构件表算出来的行数（头 + 三档 + 「待发」+ n + 折叠 + 取消全部）；
 /// 2. 条数超上限时**折叠提示非空**（否则用户看到 4 条却不知道还有更多）。
 ///
 /// 与 `more_pop_panel_never_overflows_at_any_count_or_window_height` 配对：那条防「画出去」，
 /// 这条防「不敢画」。只测一边都能被「什么都不画」骗过。
+/// 「行数」与 `more_pop_h` 的 `rows` 是同一张构件表的两面：那边断**高度算术**，这边断
+/// **这一行真的画出来了**——否则删掉整个 `for it[idx] in root.sched-items` 循环，高度断言照样绿。
 #[test]
 fn more_pop_panel_content_is_complete_under_the_cap() {
     const W: u32 = 520;
-    for (h, count) in [(380u32, 20i32), (620, 20), (820, 20), (380, 2), (380, 4)] {
+    /// 面板边框宽度（`app.slint` 的 `border-width: 2px`）：扫内框时左右上下各让开。
+    const BORDER: u32 = 2;
+    /// 面板内边距（`app.slint` 的 `padding: 6px`）。纵向额外让开它：
+    /// 边框是圆角（`border-radius: 8px`），紧贴顶边的那几行里仍有弧线墨迹——不让开就会多算一行。
+    const PADDING: u32 = 6;
+    let expected_rows = |count: i32| -> usize {
+        let cap = crate::syschat::MAX_VISIBLE_SCHED_ROWS;
+        let n = count.clamp(0, cap) as usize;
+        let folded = usize::from(count > cap);
+        1 + 3 + usize::from(count > 0) + n + folded + usize::from(count > 1)
+    };
+    // 380 是最小窗高（预算最紧），620/820 覆盖正常窗；条数 0/2/4 是折叠边界两侧，5/20 是折叠后。
+    for (h, count) in [
+        (380u32, 0i32),
+        (380, 2),
+        (380, 4),
+        (380, 5),
+        (380, 20),
+        (620, 20),
+        (820, 20),
+    ] {
         let (ui, win, _m) = setup(fixture(), h);
         seed_panels(&ui);
         ui.set_draft("x".into());
         ui.window().set_size(slint::PhysicalSize::new(W, h));
         apply_syschat_layout(&ui, W as f32);
         let _ = settle_w(&win, W, h);
-        let dir = crate::testtmp::TempPath::new("completeness");
+        let dir = crate::testtmp::TempPath::new("abb-syschat-completeness");
         let store = Rc::new(crate::syschat_sched::SchedStore::at(dir.join("s.json")));
         for i in 0..count {
             store.add(&format!("待发 {i}"), "2026-10-14 18:00").unwrap();
         }
         super::refresh_sched_menu(&ui, &store);
+        // 逐条只装上限条（折叠由 `.slint` 拿 `sched-count > sched-items.length` 判）。
+        assert_eq!(
+            ui.get_sched_items().row_count() as i32,
+            count.min(crate::syschat::MAX_VISIBLE_SCHED_ROWS),
+            "h={h} n={count}: `sched-items` 应只装上限条"
+        );
         ui.set_more_open(true);
         let f = settle_w(&win, W, h);
-        // 面板区域内：统计「墨迹行」（每一行有墨迹即说明有内容）
+        let px = ui.get_more_pop_x() as u32;
         let py = ui.get_more_pop_y() as u32;
+        let pw = ui.get_more_pop_w() as u32;
         let ph = ui.get_more_pop_h() as u32;
-        let mut ink_rows = 0;
-        for y in py..(py + ph).min(h) {
-            if (160..409u32).any(|x| is_dark(f.px(x, y))) {
-                ink_rows += 1;
-            }
-        }
+        // 底色基准：边框(2) + padding 里 2px ⇒ 这一带肯定是面板底色。
+        let bg = f.px(px + BORDER + 2, py + BORDER + 2);
+        // 横向取整条内框（含 padding）：行内文案都从左上开始，不会漏；纵向让开上下边框与圆角。
+        let bands = more_pop_ink_bands(
+            &f,
+            bg,
+            px + BORDER,
+            px + pw - BORDER,
+            py + BORDER + PADDING,
+            (py + ph - BORDER - PADDING).min(h),
+        );
         // 诊断信息（失败时能直接看出是哪一档）
         eprintln!(
-            "h={h} n={count} K={} folded={:?} panel_h={ph} ink_rows={ink_rows}",
-            ui.get_sched_visible_rows(),
+            "h={h} n={count} panel={pw}x{ph} at=({px},{py}) rows={} bands={bands:?} folded={:?}",
+            expected_rows(count),
             ui.get_sched_folded_label()
         );
-        assert!(
-            ink_rows > 40,
-            "h={h} n={count}: 面板内容太少（{ink_rows} 行墨迹），可能被裁空"
+        assert_eq!(
+            bands.len(),
+            expected_rows(count),
+            "h={h} n={count}: 面板里画出 {} 行墨迹，应为 {} 行（少了=被裁空，多了=多画）\n\
+             面板 {pw}x{ph} at=({px},{py})，墨迹段 {bands:?}",
+            bands.len(),
+            expected_rows(count)
         );
-        if count > 4 {
+        if count > crate::syschat::MAX_VISIBLE_SCHED_ROWS {
             assert!(
                 !ui.get_sched_folded_label().is_empty(),
                 "h={h}: 条数 {count} 超过上限但折叠提示为空"

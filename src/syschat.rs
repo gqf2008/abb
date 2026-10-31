@@ -2075,12 +2075,6 @@ pub const EMOJI_POP_H: i32 = 220;
 /// 「更多（定时）」面板宽（原 `.slint` 里的 250px 字面量）。
 pub const MORE_POP_W: i32 = 250;
 
-/// 「更多」面板的高度：**逐字搬自** `ui/app.slint` 原来的表达式
-/// `122 + N×26 + (N>0 ? 20 : 0) + (N>1 ? 26 : 0)`（padding 6×2 + 头 20 + 三档 3×26 + 档间距 + 待发行）。
-///
-/// 搬进 Rust 的理由：`y = 按钮顶 − 6 − 面板高`，面板高必须与锚点**同源**；也让「待发条目多 ⇒
-/// 面板变高 ⇒ 仍不出窗」能被单测钉住。搬的是原表达式（含原式对条目间距的**富余**，见
-/// `more_pop_h_is_the_slint_expression` 的注释），不改观感。
 /// 「更多」面板里**最多逐条显示**多少条待发（卡 `abb-sched-count-no-upper-bound-20261029`）。
 ///
 /// 为什么是固定常量而不是按窗高反解：这张卡先后试过两版动态方案——Rust 侧 `take(K)`
@@ -2092,10 +2086,10 @@ pub const MORE_POP_W: i32 = 250;
 /// 与窗高无关 ⇒ 不存在「缩窗后 K 不更新」这类时序问题，几何上不可能再溢出。
 ///
 /// 取值理由（按**最坏的窗**定）：产品允许的最小窗高是 380（`app.slint` 的 `min-height`），
-/// 那时按钮行顶在 331 ⇒ 面板可用高度 = 331 − 6(POP_MARGIN) = **325px**。代入
-/// `122 + (N+1)×26 + 20 + 26`（N 条待发 + 1 条折叠行）：
-/// N=5 ⇒ 324（刚好）、N=6 ⇒ 350（超）。
-/// 而 [`more_pop_h`] 的基数已知低估实际布局约 8–12px，所以留一条余量取 **4**（298px）。
+/// 那时按钮行顶在 331 ⇒ 面板可用高度 = 331 − 6([`POP_MARGIN`]) = **325px**。
+/// 按 [`more_pop_h`] 逐项算（条数一直加到封顶）：上限 4 ⇒ 封顶 **304px**（余 21px），
+/// 上限 5 ⇒ 封顶 **332px**（超 7px）⇒ 这条预算下能取的最大值就是 4。
+/// `more_pop_h_matches_the_slint_build_up` 钉住这三组数（封顶值、上限 +1 的封顶值、预算）。
 ///
 /// 代价：380 窗高下最多逐条看到 4 条，其余折叠成「还有 N 条」。窗更高时也仍是 4 条——
 /// 这是刻意的：**面板高度与窗高解耦**，才能一劳永逸地消掉「缩窗后 K 不更新」那类 bug。
@@ -2104,14 +2098,21 @@ pub const MAX_VISIBLE_SCHED_ROWS: i32 = 4;
 /// 「更多」面板的外边距总宽（`VerticalLayout` 的 `padding: 6px` × 上下）。
 pub const MORE_POP_PADDING: i32 = 12;
 
+/// 「更多」面板的高度（逻辑像素；纯函数）。
+///
+/// 逐项对应 `ui/app.slint` 里那块面板的真实构件（卡 `abb-more-pop-h-magic-20-20261030`）：
+/// `padding 6×2` + 头 20 + 三档预设 26×3 + 「待发」18（有条目时）+ 待发条 26×(n+折叠行)
+/// + 「取消全部」26（≥2 条时）+ 行间 `spacing 2px`×(行数−1)。
+///
+/// 搬进 Rust 的理由：`y = 按钮顶 − POP_MARGIN − 面板高`，面板高必须与锚点**同源**，否则
+/// 面板高只能靠 Slint 反向回报，多一条反馈。当前值：`more_pop_h(0) = 116`、
+/// `more_pop_h(4) = 276`、`more_pop_h(5) = more_pop_h(999) = 304`。
 pub fn more_pop_h(sched_count: i32) -> i32 {
-    let n = sched_count.clamp(0, MAX_VISIBLE_SCHED_ROWS);
+    // 上限先夹到非负：`clamp(0, cap)` 在 cap < 0 时会 panic（常量当前是 4，但别让它成为隐藏前提）。
+    let cap = MAX_VISIBLE_SCHED_ROWS.max(0);
+    let n = sched_count.clamp(0, cap);
     // 条数超过上限时，多出来的那些由「还有 N 条」折叠行占位（高度与普通待发行同为 26）。
-    let folded = if sched_count > MAX_VISIBLE_SCHED_ROWS {
-        1
-    } else {
-        0
-    };
+    let folded = i32::from(sched_count > cap);
     // **逐项相加**，不再用拍平的常数（卡 `abb-more-pop-h-magic-20-20261030`）。
     //
     // 旧式 `122 + (n+folded)*26 + (n>0?20:0) + (n>1?26:0)` 把「待发行 18 + 一个间距 2」
@@ -2121,7 +2122,7 @@ pub fn more_pop_h(sched_count: i32) -> i32 {
     // 下面每一项都对应 `ui/app.slint` 里一个真实构件（行号见各分支注释），改动那边时
     // 这里的常量与 `more_pop_h_matches_the_slint_build_up` 会一起提醒你。
     let header = 20; // 头「定时发送（到点自动发出）」
-    let preset = 26; // 三档预设（`MenuRow`，每档一条）
+    let menu_row = 26; // `MenuRow` 行高：三档预设与「取消全部」共用
     let preset_count = 3;
     let pending_label = if n > 0 { 18 } else { 0 }; // 「待发（点 ✕ 取消）」
     let pending_rows = (n + folded) * 26; // n 条待发 + 可能的 1 条折叠行
@@ -2131,7 +2132,7 @@ pub fn more_pop_h(sched_count: i32) -> i32 {
     let gaps = (rows - 1) * 2;
     MORE_POP_PADDING
         + header
-        + preset * preset_count
+        + menu_row * preset_count
         + pending_label
         + pending_rows
         + cancel_all
@@ -6671,9 +6672,8 @@ mod tests {
         }
     }
 
-    /// 「更多」面板高：搬自 `.slint` 原表达式（逐值对表；改任一分支必红）。
-    #[test]
     /// 高度必须等于「按 `ui/app.slint` 逐项加起来」的值（卡 `abb-more-pop-h-magic-20-20261030`）。
+    #[test]
     ///
     /// 为什么要**逐项重建**而不是断言 `more_pop_h(2) == 220` 这种拍平值：旧测试正是写死了
     /// `122 + 52 + 20 + 26` 这串常数，于是「它的构成有没有漏项」永远测不出来——公式把
@@ -6692,9 +6692,9 @@ mod tests {
         const PRESETS: i32 = 3;
         const PENDING_LABEL: i32 = 18;
 
-        let rebuild = |count: i32| -> i32 {
-            let n = count.clamp(0, MAX_VISIBLE_SCHED_ROWS);
-            let folded = i32::from(count > MAX_VISIBLE_SCHED_ROWS);
+        let rebuild_with = |count: i32, cap: i32| -> i32 {
+            let n = count.clamp(0, cap);
+            let folded = i32::from(count > cap);
             let mut items = vec![HEADER];
             items.extend(std::iter::repeat_n(MENU_ROW, PRESETS as usize));
             if n > 0 {
@@ -6707,6 +6707,7 @@ mod tests {
             let content: i32 = items.iter().sum();
             PADDING * 2 + content + SPACING * (items.len() as i32 - 1)
         };
+        let rebuild = |count: i32| rebuild_with(count, MAX_VISIBLE_SCHED_ROWS);
 
         for count in [-3, 0, 1, 2, 3, 4, 5, 6, 7, 16, 40, 999] {
             assert_eq!(
@@ -6720,6 +6721,26 @@ mod tests {
         assert!(
             more_pop_h(5) == more_pop_h(999),
             "超过上限后高度必须封顶（否则又会长回「随条数无界增长」）"
+        );
+
+        // `MAX_VISIBLE_SCHED_ROWS` 文档里的算术：最小窗高 380 ⇒ 按钮行顶 331 − POP_MARGIN。
+        // 上限取 4 时封顶 304（余 21px）；若把上限抬到 5，封顶会跳到 332（超 7px）⇒ 4 就是能取的最大值。
+        // 这一组断言不做的话，文档里的「取值理由」和常量本身可以各说各话。
+        let budget = 331 - POP_MARGIN;
+        assert_eq!(budget, 325, "最小窗高下的面板预算变了 ⇒ 上限要不要改得重算");
+        assert_eq!(more_pop_h(0), 116, "只有头 + 三档预设");
+        assert_eq!(more_pop_h(4), 276, "上限内 4 条（含「取消全部」）");
+        assert_eq!(more_pop_h(5), 304, "封顶高度 = 4 条 + 折叠行");
+        assert!(
+            more_pop_h(5) <= budget,
+            "封顶高度 {} 超出最小窗的预算 {budget}",
+            more_pop_h(5)
+        );
+        let peak_with_cap = |cap: i32| (0..=64).map(|c| rebuild_with(c, cap)).max().unwrap();
+        assert_eq!(peak_with_cap(5), 332, "上限 5 的封顶高度");
+        assert!(
+            peak_with_cap(5) > budget,
+            "上限 5 必须真的超预算（否则「只能取 4」的理由不成立）"
         );
 
         // **真读 `.slint` 源码**校验上面那几个常量（本仓惯例，见 `src/ui.rs` 里的
@@ -6742,10 +6763,29 @@ mod tests {
         };
         must("padding: 6px;", "`more_pop_h` 假设 padding 6×2");
         must("spacing: 2px;", "`more_pop_h` 按 spacing 2px 算行间距");
-        must("height: 20px;", "`more_pop_h` 假设标题行 20px");
+        // 下面五条**连构件一起钉**，不用 `height: 20px;` 这种裸常量：面板内 `20px` 出现两次
+        // （标题行 + ✕ 角标）、`26px` 也出现两次（待发行 + 折叠行），裸串断言谁都能顶替谁
+        // ——折叠行那 26px 正是本卡新加的项，被裸串顶替就等于没钉。
+        // 顺带把三个 `if` 条件也钉住：`.slint` 折叠与 Rust 公式若各用一套判据，这里会红。
         must(
-            "height: 18px;",
-            "`more_pop_h` 假设「待发」行 18px（旧公式把它与 spacing 拍成 +20，正是本卡的病灶）",
+            "Text {\n                    height: 20px;\n                    text: \"定时发送（到点自动发出）\";",
+            "`more_pop_h` 的 `header` 对应这个 20px 行",
+        );
+        must(
+            "if root.sched-count > 0: Text {\n                    height: 18px;",
+            "`more_pop_h` 的 `pending_label` 对应「待发」行 18px（旧公式把它与 spacing 拍成 +20，正是本卡的病灶）",
+        );
+        must(
+            "for it[idx] in root.sched-items: Rectangle {\n                    height: 26px;",
+            "`more_pop_h` 按 26 算每条待发行",
+        );
+        must(
+            "if root.sched-count > root.sched-items.length: Text {\n                    height: 26px;",
+            "折叠行：高度 26，且判据必须是「条数 > 已画条数」（`sched-items` 本身就只画上限条，别再加第二个真相）",
+        );
+        must(
+            "if root.sched-count > 1: MenuRow {",
+            "`more_pop_h` 的 `cancel_all` 对应「取消全部」行（≥2 条才出现）",
         );
         // `MenuRow` 的高度在组件定义处，不在面板段里。
         assert!(

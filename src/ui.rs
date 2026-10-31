@@ -941,10 +941,7 @@ fn apply_pop_anchors(
 }
 
 /// 把定时档位文案 + 待发列表写进「更多」菜单（每次打开/增删后调）。
-pub(super) fn refresh_sched_menu(
-    win: &SystemChatWindow,
-    store: &Rc<crate::syschat_sched::SchedStore>,
-) {
+fn refresh_sched_menu(win: &SystemChatWindow, store: &Rc<crate::syschat_sched::SchedStore>) {
     let now = crate::schedule::DateTime::now();
     let labels: Vec<slint::SharedString> = crate::syschat_sched::preset_labels(now)
         .into_iter()
@@ -955,7 +952,8 @@ pub(super) fn refresh_sched_menu(
     let count = items.len() as i32;
     // 逐条只画前 N 条（卡 `abb-sched-count-no-upper-bound-20261029`）。N 是**固定常量**，
     // 不按窗高反解 —— 面板高度因此与窗高、与条数都解耦，几何上不可能再溢出。
-    // 超出部分由 `.slint` 的折叠行如实说明（`sched-folded-label`），取消走「取消全部」。
+    // 折不折叠由 `.slint` 拿 `sched-count > sched-items.length` 自己判：`sched-items` 只装上限条，
+    // 所以「已画条数」不需要再单独下发一个属性（那会变成第二份真相，且已经漂移过）。
     let n = crate::syschat::MAX_VISIBLE_SCHED_ROWS.max(0) as usize;
     let rows: Vec<slint::SharedString> = items
         .iter()
@@ -965,7 +963,6 @@ pub(super) fn refresh_sched_menu(
     let shown = rows.len() as i32;
     win.set_sched_items(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
     win.set_sched_count(count);
-    win.set_sched_visible_rows(shown);
     win.set_sched_folded_label(
         if count > shown {
             format!("还有 {} 条未显示", count - shown)
