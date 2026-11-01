@@ -81,6 +81,21 @@ def final_judged:
 # 空数组的 `[]` 迭代是**零次** ⇒ 天然不产生违规，不需要额外判空。**别改成显式
 # `if length > 0` 分支**——那样平局组为空与组内多条两个边界都得各写一遍，容易写漏。
 
+# 从某条目的 parent 起沿父链走到 root，返回「祖先 oid 集合」（不含自身）。
+# 为什么用父链而不是数组位置（idx）：`walgit_wal::collab::thread()` 的聚合顺序是
+# **先按 (ts, actor, oid) 排序，再对 parent 尚未 emit 的条目延后**——它只延后、不提前。
+# 所以数组位置主要由**可伪造的 ts** 决定，不是写入顺序。实测攻击（真二进制+真签名）：
+#   issue ← patch ← { review(ts 更早, parent=patch),  merge(parent=patch) }
+# 聚合后数组是 issue,patch,review,merge ⇒ review 的 idx 小于 merge ⇒ 被判「合并前已评审」。
+# 父链则不可伪造：条目 oid 覆盖自身 ts/parent 的规范字节，merge 要引用 review 的 oid，
+# 就必须在 review 存在之后才签名 ⇒ 「谁在谁的因果链上」由密码学保证，不由客户端字段决定。
+def ancestor_oids($by_oid; $oid):
+  { seen: {}, cur: (($by_oid[$oid].parent) // "") }
+  | until(.cur == "" or .seen[.cur] == true;
+      .seen[.cur] = true
+      | .cur = (($by_oid[.cur].parent) // ""))
+  | (.seen | keys);
+
 def label_counts:
   (. // "")
   | split("\n")
@@ -103,6 +118,9 @@ def label_counts:
 | [range(0; ($raw | length))
    | {idx: ., oid: $raw[.].oid, e: $raw[.].entry,
       verified: (if ($raw[.] | has("verified")) then $raw[.].verified else true end)}] as $items
+# oid → 条目，用于沿 parent 链回溯（判据 (g) 的「合并前评审」必须落在合并的祖先链上）。
+| ( reduce $items[] as $it ({}; .[$it.oid] = $it.e) ) as $by_oid
+
 | [ $items[]
     | select(.e.kind == "review")
     | { idx: .idx,
@@ -311,12 +329,13 @@ def label_counts:
       ( $merge_items[]
         | select(.ts >= $no_review_ts)
         | . as $m
+        | ( ancestor_oids($by_oid; $m.oid) ) as $anc
         | ( [ $reviews[]
-              | select(.ts >= $contract_ts and .idx < $m.idx
+              | select(.ts >= $contract_ts and (. as $r | ($anc | index($r.oid)) != null)
                        and (.decision == "approve" or .decision == "request_changes")) ]
             | length ) as $judged_n
         | ( [ $reviews[]
-              | select(.ts >= $contract_ts and .idx < $m.idx
+              | select(.ts >= $contract_ts and (. as $r | ($anc | index($r.oid)) != null)
                        and (.decision == "approve" or .decision == "request_changes")) ]
             | last ) as $last_before
         | if ($judged_n > 0
@@ -335,8 +354,8 @@ def label_counts:
                           (if $w.ts < $no_review_ts then
                              "ts=\($w.ts) 早于无评审新规 ts=\($no_review_ts)"
                            else empty end),
-                          (if $w.idx > $m.idx then
-                             "在账本里位于本次合并之后（idx=\($w.idx) > \($m.idx)）⇒ 不得事后补签"
+                          (if ($anc | index($w.oid)) == null then
+                             "不在本次合并的父链上（未在账本因果链上先于该合并）⇒ 不得事后补签"
                            else empty end),
                           (if $w.verified == false then
                              "签名验不过（verified=false）"

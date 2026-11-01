@@ -39,7 +39,7 @@
 #       ts ≥ no_review_ts 的 merge_result{merged:true} 各判一次，多条违规各报一条。
 #       降档豁免：由**独立第三方**签一条 comment，其 `body.waiver` 字段等于字符串
 #       "no-independent-review"（**散文里提到该词不算**）；该 comment 还必须
-#        ① ts ≥ no_review_ts ② ts ≤ 该次合并的 ts（不得事后补签）③ verified ≠ false
+#        ① ts ≥ no_review_ts ② 在该次合并的父链上（因果先于合并）（不得事后补签）③ verified ≠ false
 #        ④ actor 既不是本 thread 任何一份 patch 的作者、也不是该次合并的执行者。
 #   `decision=="comment"` 的 review 不参与判定（不要求契约行、不计 blocking 轮）。
 #

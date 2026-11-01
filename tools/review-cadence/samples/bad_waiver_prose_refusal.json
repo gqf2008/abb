@@ -1,6 +1,60 @@
 [
- {"entry":{"kind":"issue","id":"t","actor":"W","ts":1000000,"body":{}},"oid":"i1","principal":"W","verified":true},
- {"entry":{"kind":"patch","id":"t","actor":"W","ts":1000100,"body":{}},"oid":"p1","principal":"W","verified":true},
- {"entry":{"kind":"comment","id":"t","actor":"X","ts":1000150,"body":{"author":"X","body":"不接受用 review-waiver: no-independent-review 跳过本轮评审。"}},"oid":"c1","principal":"X","verified":true},
- {"entry":{"kind":"merge_result","id":"t","actor":"M","ts":1000200,"body":{"merged":true,"oid":"abc"}},"oid":"m1","principal":"M","verified":true}
+ {
+  "entry": {
+   "kind": "issue",
+   "id": "t",
+   "actor": "W",
+   "ts": 1000000,
+   "body": {},
+   "parent": ""
+  },
+  "oid": "i1",
+  "principal": "W",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "patch",
+   "id": "t",
+   "actor": "W",
+   "ts": 1000100,
+   "body": {},
+   "parent": "i1"
+  },
+  "oid": "p1",
+  "principal": "W",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "comment",
+   "id": "t",
+   "actor": "X",
+   "ts": 1000150,
+   "body": {
+    "author": "X",
+    "body": "不接受用 review-waiver: no-independent-review 跳过本轮评审。"
+   },
+   "parent": "p1"
+  },
+  "oid": "c1",
+  "principal": "X",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "merge_result",
+   "id": "t",
+   "actor": "M",
+   "ts": 1000200,
+   "body": {
+    "merged": true,
+    "oid": "abc"
+   },
+   "parent": "c1"
+  },
+  "oid": "m1",
+  "principal": "M",
+  "verified": true
+ }
 ]

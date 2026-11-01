@@ -107,7 +107,8 @@ for s in ok_basic ok_comment_exempt ok_comment_exempt_blocking ok_no_reviews ok_
          ok_unknown_decision_historical ok_same_reviewer_multi_round ok_unverified_comment \
          ok_historical_contract_mismatch ok_merged_with_independent_waiver ok_merged_before_no_review_ts \
          ok_merged_historical_review_by_merger ok_merged_multi_merge_not_by_reviewer \
-         ok_merged_reviewed_before_merge ok_merged_blocking_then_fixed; do
+         ok_merged_reviewed_before_merge ok_merged_blocking_then_fixed \
+         ok_merged_review_on_ancestor_chain; do
   expect_rc "合规：$s" 0 "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 
@@ -125,7 +126,9 @@ for s in bad_missing_after_threshold bad_missing_at_threshold bad_label_mismatch
          bad_merged_grandfathered_then_violation bad_merged_two_violations \
          bad_merged_only_comment_decision_review bad_merged_approved_after_merge \
          bad_merged_review_at_merge_ts bad_merged_while_blocking \
-         bad_waiver_backdated_by_ts \
+         bad_waiver_backdated_by_ts bad_merged_review_forked_off_chain \
+         bad_merged_review_second_root bad_waiver_forked_off_chain \
+         bad_merged_before_uncontracted_blocking bad_merged_before_approved_with_blocking \
          bad_waiver_prose_mention bad_waiver_prose_refusal \
          bad_merged_with_merger_waiver bad_waiver_after_merge \
          bad_waiver_by_earlier_patch_author bad_waiver_unverified \
