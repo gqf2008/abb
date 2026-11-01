@@ -90,6 +90,14 @@ def label_counts:
       else . end);
 
 . as $raw
+# 无评审新规生效时间。**调用方必须传** `--argjson no_review_ts <epoch>`（`tools/check_review_cadence.sh`
+# 恒定传，缺省取常量 NO_REVIEW_TS_DEFAULT）。这里的 `// 0` **兜不住漏传**：jq 对未定义变量是
+# **编译期错误**（实测 `jq -f check.jq --argjson contract_ts …` ⇒ `$no_review_ts is not defined` rc=3），
+# 不是运行期 null。`//` 只处理显式传 `--argjson no_review_ts null` 的情形。
+# 取到 0 的语义 = 全量生效（不豁免任何合并）。
+# (g) 判据只对**此时间之后**的合并生效，更早的历史合并豁免——与「契约前条目豁免」同口径，
+# 否则会把 owner 明确授权降档的那批历史卡追溯判红。
+| ($no_review_ts // 0) as $no_review_ts
 # 注意：不能用 `verified // true` —— jq 的 `//` 把 false 也当“缺失”，
 # 会把 verified=false 悄悄翻成 true，让 (f) 判据永远不触发（selftest 逮到过）。
 | [range(0; ($raw | length))
@@ -208,16 +216,28 @@ def label_counts:
       # (e) 终审不得与合并者同人（§4）：已合并的 thread，最后一条判决类 review 与 merge_result 的 actor 必须不同。
       #     注意：同一个人多轮评审（request_changes → approve）是**合法**的，不在这里拦；只有
       #     “评审者又去合并”才是违规——这两件事极易混，样本里各有对应用例。
-      ( if ($merge_items | length) > 0 then
-          ( $reviews
-            | map(select(.ts >= $contract_ts
-                         and (.decision == "approve" or .decision == "request_changes"))) ) as $post2
-          | ($merge_items[-1]) as $m
-          | ( $post2 | final_judged )[] | . as $last
-          | if ($m.actor != null and $last.actor != null and $m.actor == $last.actor) then
-              "\($last.oid): 终审 review 与 merge_result(\($m.oid)) 同为 \($m.actor) ⇒ 终审不得与合并者同人（§4）"
-            else empty end
-        else empty end ),
+      #
+      #     **对每一条 merge_result{merged:true} 各判一次，不是只判某一条**（与 (g) 的 blocking-3
+      #     属同一类洞；本卡实现者在上一轮报告里自行指出，经协调者决定并入同卡）：`ts` 由客户端
+      #     在签名时写入、不是服务端盖章 ⇒ 只要判据挑定**数组里的某一条** merge，构造一条 ts
+      #     回溯的 merge（它排在数组末尾，`$merge_items[-1]` 恰好取到它）就能把整个 (e) 关掉。
+      #     实测（旧实现）：
+      #       approve(M) → merge(M, ts=1000200) → merge(X, ts=999000)，阈值 1000000
+      #       ⇒ 旧实现 rc=0（取到末尾那条 X，X ≠ M 故“不同人”），尽管终审 M 就是第一次合并的
+      #         执行者。删掉尾部那条则 rc=1。
+      #     样本 bad_merged_backdated_merge_tail_hides_final_reviewer 钉住这一条；每一条 merge
+      #     都与终审成对判定 ⇒ 多条同人 merge 各报一条违规（多报只更严，不更松）。
+      #     历史豁免口径不变：只有 ts ≥ $contract_ts 的 review 参与（与 (a) 同口径），样本
+      #     ok_merged_historical_review_by_merger 钉住「契约前的 review 与合并同人不追溯」。
+      #     空 $merge_items 的 `[]` 迭代是**零次** ⇒ 不需要 `if length > 0` 守卫（同 final_judged 的注释）。
+      ( ( $reviews
+          | map(select(.ts >= $contract_ts
+                       and (.decision == "approve" or .decision == "request_changes"))) ) as $post2
+        | $merge_items[] | . as $m
+        | ( $post2 | final_judged )[] | . as $last
+        | if ($m.actor != null and $last.actor != null and $m.actor == $last.actor) then
+            "\($last.oid): 终审 review 与 merge_result(\($m.oid)) 同为 \($m.actor) ⇒ 终审不得与合并者同人（§4）"
+          else empty end ),
 
       # (f) 签名未验签的**判决性**条目不得参与合并：patch / review / merge_result。
       #     为什么只算判决性条目：`comment` 上的未验签往往只是“写错身份重签”的记录，
@@ -233,10 +253,100 @@ def label_counts:
                  and (.e.kind == "patch" or .e.kind == "review"
                       or .e.kind == "merge_result")
                  and (.e.ts // 0) >= $contract_ts)
-        | "\(.oid): \(.e.kind) 条目签名验不过（verified=false）⇒ 不得据它合并" )
+        | "\(.oid): \(.e.kind) 条目签名验不过（verified=false）⇒ 不得据它合并" ),
+
+      # (g) 「合并于本判据之后，却一条判决类 review 都没有」⇒ 判红。
+      #
+      # 为什么需要：判据 (c) 的实现是 `( $post | final_judged )[]`，jq 对空数组的 `[]`
+      # 迭代是**零次** ⇒ 零 review 天然不产生违规。于是「从未被评审过的卡」与
+      # 「评审通过的卡」在 (c) 眼里一样（2026-11-01 实测：有 patch + 有 merge_result、
+      # 零 review 的样本判 ✅ 通过）。这不是笔误——`final_judged` 为简化「平局组为空」
+      # 与「组内多条」两个边界而刻意这么写，`ok_no_reviews` 样本（只含一条 issue、
+      # 还没开工的活卡）期望 rc=0 也是对的。真盲区只在「已合并」这个组合上。
+      #
+      # 为什么用**独立阈值**而不是复用 $contract_ts：本判据落地前的历史合并（含 owner
+      # 明确授权降档的那批）不该被追溯判红。与既有「契约前条目豁免」同口径。
+      #
+      # **逐条判，不是只看一条**（评审 abb-reviewer-171 的 blocking-3）：`ts` 由客户端在
+      # 签名时写入、不是服务端盖章 ⇒ 只要判据只挑**数组里的某一条** merge，构造一条 ts
+      # 回溯的 merge 就能把整条判据关掉。实测（旧实现取 `$merge_items[-1]`）：
+      #   issue → patch(A) → merge(ts=1000300, 零 review) → merge(ts=999000)，阈值 1000000
+      #   ⇒ 旧实现 rc=0（只看末尾那条 999000，判据整条跳过），尽管 1000300 那次合并明确在
+      #     新规之后且零 review。
+      # 所以这里对**每一条** `ts >= $no_review_ts` 的 merge_result 各判一次：同一 thread 里
+      # 多条违规各报一条，谁也遮不住谁。
+      #
+      # 豁免（降档）机制：必须由**独立第三方**签一条 `comment`，其 `body.waiver` 字段
+      # **等于字符串** `"no-independent-review"`。约定与理由：
+      #   · **只看结构化字段，不看散文**（评审 abb-reviewer-171 的 blocking-1）：早先实现在
+      #     `body.body + "\n" + body.note` 全文里匹配 `review-waiver: no-independent-review`，
+      #     没有行锚定 ⇒ 任何**提到**这句话的普通评论都成了豁免，连「不接受用
+      #     review-waiver: no-independent-review 跳过评审」这种**明确拒绝豁免**的评论也能
+      #     把红卡刷绿（两条均实测 rc=0）。豁免是授权动作，必须显式编码，不能靠引用。
+      #   · 为什么是 comment 而不是补一条 approve review：补 approve 会被判据 (d)
+      #     「最后一条判决类 review 的 actor 不得是它所审 patch 的作者」当自审拦下——
+      #     实验证实（patch(作者) → review(作者, approve) → merge ⇒ (d) 判红）。
+      #     所以豁免只能用不参与判决的 comment 载体。
+      #   · 效力约束（评审 abb-reviewer-171 的 blocking-2 + non-blocking-4，每条都有实测
+      #     绕过用例，见 samples/bad_waiver_*.json）：
+      #     1. actor **不得是本 thread 任何一份 patch 的作者**（集合判定；早先只比「merge 前
+      #        最后一份 patch」⇒ 双 patch 时更早那位作者 A 可自签豁免，实测 rc=0）；
+      #     2. actor **不得是本次合并的执行者**（合并者不得自签豁免）；
+      #     3. `ts <= merge.ts`（不得事后补签）；
+      #     4. `ts >= $no_review_ts`（新规之前写的评论不构成对本次降档的授权）；
+      #     5. `verified != false`（未验签的豁免不算数）；
+      #     6. actor 不得缺失（无主体的豁免无法追责）。
+      #     豁免是**一次一议**：每条 merge 各自校验，A 次合并的豁免不外溢到 B 次。
+      ( $merge_items[]
+        | select(.ts >= $no_review_ts)
+        | . as $m
+        | ( [ $reviews[]
+              | select(.ts >= $contract_ts
+                       and (.decision == "approve" or .decision == "request_changes")) ]
+            | length ) as $judged_n
+        | if $judged_n > 0 then empty
+          else
+            ( [ $items[]
+                | select(.e.kind == "comment"
+                         and ((.e.body.waiver // null) == "no-independent-review"))
+                | { oid, actor: (.e.actor // null), ts: (.e.ts // 0), verified } ]
+              | map(. as $w
+                    | { oid: $w.oid,
+                        reasons: [
+                          (if $w.ts < $no_review_ts then
+                             "ts=\($w.ts) 早于无评审新规 ts=\($no_review_ts)"
+                           else empty end),
+                          (if $w.ts > $m.ts then
+                             "ts=\($w.ts) 晚于本次合并 ts=\($m.ts)（不得事后补签）"
+                           else empty end),
+                          (if $w.verified == false then
+                             "签名验不过（verified=false）"
+                           else empty end),
+                          (if $w.actor == null then
+                             "缺 actor（无法确认豁免主体）"
+                           elif ([ $patches[] | .actor ] | index($w.actor)) != null then
+                             "actor=\($w.actor) 是本 thread 某份 patch 的作者"
+                           elif $w.actor == $m.actor then
+                             "actor=\($w.actor) 就是本次合并的执行者"
+                           else empty end)
+                        ] } ) ) as $waivers
+            | ( [ $waivers[] | select((.reasons | length) == 0) ] | length ) as $good_n
+            | if $good_n > 0 then empty
+              elif ($waivers | length) > 0 then
+                "\($m.oid): 合并（ts=\($m.ts)）时该 thread 无任何判决类 review，且 review-waiver 条目不成立 ⇒ "
+                + ([ $waivers[] | "\(.oid): \(.reasons | join("；"))" ] | join(" / "))
+                + "（豁免须由独立第三方在 comment.body.waiver 显式声明）"
+              else
+                "\($m.oid): 合并（ts=\($m.ts)）发生在无评审新规之后，但该 thread 没有任何判决类 review，"
+                + "也没有 review-waiver 条目（comment.body.waiver == \"no-independent-review\"）"
+                + " ⇒ 未经独立评审即合并"
+              end
+          end )
     ]
   ) as $violations| { violations: $violations,
     summary: { reviews: ($reviews | length),
+               judged_reviews: ([ $reviews[] | select(.ts >= $contract_ts
+                                    and (.decision == "approve" or .decision == "request_changes")) ] | length),
                blocking_rounds: $blocking_rounds,
                skipped_historical: $skipped,
                merges: ($merges | length),

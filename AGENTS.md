@@ -47,9 +47,15 @@ entire runtime directory; empty means default); per-bot workspaces under
   `origin`, records **one** `merge_result {"merged":true,"oid":"<sha>","result":"merged"}` (that entry
   moves the card to `merged`), then `status: closed`; afterwards remove the card's worktree and branch
   and verify with `git worktree list`. **Before writing `merge_result`, run
-  `tools/check_review_cadence.sh <thread-id>` — red means do not merge** (contract + blocking-round
-  guard, see `docs/review-findings-contract.md`; its sample self-test runs in `.walgit/ci.toml` as
-  `review-cadence-selftest`).
+  `tools/check_review_cadence.sh <thread-id>` — red means do not merge** (契约行 / blocking 轮数 /
+  终审一致性 / 未验签 / **零评审合并** 判据 (a)–(g)，见 `docs/review-findings-contract.md`；
+  样本自测在 `.walgit/ci.toml` 里以 `review-cadence-selftest` 执行)。两个时间阈值可用
+  `--contract-ts <epoch>` / `--no-review-ts <epoch>`（或 env `ABB_REVIEW_CONTRACT_TS` /
+  `ABB_NO_REVIEW_TS`）覆盖，缺省取脚本内常量——**判据 (g) 只对 `ts >= no_review_ts` 的每一条
+  `merge_result{merged:true}` 生效**，所以往新规前回溯 `ts` 不能绕过它。零评审合并的降档只认
+  结构化字段：由**独立第三方**（不是该 thread 任何 patch 的作者、也不是该次合并的执行者）
+  签一条 `comment`，其 `body.waiver` 等于字符串 `"no-independent-review"`，且该 comment 的
+  `ts` 在 `no_review_ts` 与该次合并之间、`verified` 不为 false；**正文里提到这句话不算数**。
 - **Board/CI declarations**: `.walgit/board.toml` and `.walgit/ci.toml` are part of
   the tested tree. Move cards only by appending a signed `status` entry; never edit
   the board to represent a state change.
