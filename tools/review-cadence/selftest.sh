@@ -129,6 +129,7 @@ for s in bad_missing_after_threshold bad_missing_at_threshold bad_label_mismatch
          bad_waiver_backdated_by_ts bad_merged_review_forked_off_chain \
          bad_merged_review_second_root bad_waiver_forked_off_chain \
          bad_merged_before_uncontracted_blocking bad_merged_before_approved_with_blocking \
+         bad_merged_parent_skips_review bad_merged_parent_skips_head_review \
          bad_waiver_prose_mention bad_waiver_prose_refusal \
          bad_merged_with_merger_waiver bad_waiver_after_merge \
          bad_waiver_by_earlier_patch_author bad_waiver_unverified \

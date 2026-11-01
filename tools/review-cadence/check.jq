@@ -89,6 +89,10 @@ def final_judged:
 # 聚合后数组是 issue,patch,review,merge ⇒ review 的 idx 小于 merge ⇒ 被判「合并前已评审」。
 # 父链则不可伪造：条目 oid 覆盖自身 ts/parent 的规范字节，merge 要引用 review 的 oid，
 # 就必须在 review 存在之后才签名 ⇒ 「谁在谁的因果链上」由密码学保证，不由客户端字段决定。
+# **环保护是承重的，不是防御性装饰**（第三轮评审 NB-4）：去掉 `.seen[.cur] == true`
+# 这一支后，喂一份自环/两元环输入会让 jq **永久挂起**（实测 4s 仍在跑），而门禁脚本
+# 本身没有超时 ⇒ 一次误改会把「红」变成「CI 无限挂」。变异 M-C 实测 83 例全绿（零覆盖，
+# 因为真路径上 oid 由 blob 内容派生、环不可构造），故单列注释说明它守的是什么。
 def ancestor_oids($by_oid; $oid):
   { seen: {}, cur: (($by_oid[$oid].parent) // "") }
   | until(.cur == "" or .seen[.cur] == true;
@@ -338,7 +342,24 @@ def label_counts:
               | select(.ts >= $contract_ts and (. as $r | ($anc | index($r.oid)) != null)
                        and (.decision == "approve" or .decision == "request_changes")) ]
             | last ) as $last_before
-        | if ($judged_n > 0
+        # **完备性**，不只是存在性（第三轮评审 blocking-1）：`merge.parent` 由签名者**任选**、
+        # walgit 不校验（本仓 tools/check_collab_parents.sh 头注释即写明 `--parent` 不校验）。
+        # 所以「merge 选中的那条链上有没有干净 approve」仍是攻击者可以挑的 —— 只要把
+        # parent 指向前一个 approve、跳过真正的末条 review 即可。
+        # 实测 S1（只用合并者密钥，零伪造）：(g) 判绿，唯一挡路的是 ts 序的 (c)；
+        # 叠加 reviewer 侧 ts 伪造（S2：approve 前推 + rc 回溯）⇒ **整条门禁 rc=0**。
+        # 改成完备性：thread 里**每一条**判决类 review 都必须是该次 merge 的祖先
+        # （等价于「merge.parent 必须指向该 thread 当时的最新条目」）。这条不可挑 ——
+        # 想跳过任何一条 review，就得让它挂在别的分支上或成为第二个 root，而那样仍然判红。
+        | ( [ $reviews[]
+              | select(.ts >= $contract_ts
+                       and (.decision == "approve" or .decision == "request_changes")
+                       and (. as $r | ($anc | index($r.oid)) == null)) ] ) as $offchain
+        | if ($offchain | length) > 0 then
+            "\($m.oid): 合并（ts=\($m.ts)）的父链没有涵盖这些判决类 review："
+            + ([ $offchain[] | .oid ] | join(", "))
+            + " ⇒ merge.parent 必须指向该 thread 当时的最新条目（不得跳过前驱）"
+          elif ($judged_n > 0
               and $last_before != null
               and $last_before.decision == "approve"
               and ($last_before.contract == null or $last_before.contract.blocking == 0))
