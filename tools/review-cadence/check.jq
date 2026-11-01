@@ -297,11 +297,22 @@ def label_counts:
       #     5. `verified != false`（未验签的豁免不算数）；
       #     6. actor 不得缺失（无主体的豁免无法追责）。
       #     豁免是**一次一议**：每条 merge 各自校验，A 次合并的豁免不外溢到 B 次。
+      #
+      # **`$judged_n` 只数合并之前的 review**（2026-11-01 补，评审 non-blocking 2）：
+      # 早先它数的是「thread 内任意（ts >= 契约阈值的）判决类 review」，**不看时序**。
+      # 配上 (c) 也只问「最后一条是不是 approve」，两条叠起来让「先上车后补票」完全
+      # 绕开门禁 —— 实测：
+      #   patch → merge(零评审) → approve(晚 500s)
+      #   ⇒ (c) 看到最后一条是 approve、(g) 看到 $judged_n>0  ⇒  **rc=0 全绿**
+      # 即「先合并、事后补一条 approve」与「先评审、后合并」在账本上无法区分。
+      # 收紧后：合并之前一条判决类 review 都没有 ⇒ 判红（走豁免分支的除外）。
+      # 不改 (c) 的原因：(c) 的设计前提是「在写 merge_result **之前**就能判」（活卡也要能用），
+      # 让它去看 merge 时序会把这个前提拧反。
       ( $merge_items[]
         | select(.ts >= $no_review_ts)
         | . as $m
         | ( [ $reviews[]
-              | select(.ts >= $contract_ts
+              | select(.ts >= $contract_ts and .ts <= $m.ts
                        and (.decision == "approve" or .decision == "request_changes")) ]
             | length ) as $judged_n
         | if $judged_n > 0 then empty

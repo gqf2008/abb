@@ -85,7 +85,8 @@ echo "── check_review_cadence 自测（contract-ts=${ts}；no-review-ts=${ts
 for s in ok_basic ok_comment_exempt ok_comment_exempt_blocking ok_no_reviews ok_merge_resolved ok_historical_missing \
          ok_unknown_decision_historical ok_same_reviewer_multi_round ok_unverified_comment \
          ok_historical_contract_mismatch ok_merged_with_independent_waiver ok_merged_before_no_review_ts \
-         ok_merged_historical_review_by_merger ok_merged_multi_merge_not_by_reviewer; do
+         ok_merged_historical_review_by_merger ok_merged_multi_merge_not_by_reviewer \
+         ok_merged_reviewed_before_merge; do
   expect_rc "合规：$s" 0 "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 
@@ -101,7 +102,7 @@ for s in bad_missing_after_threshold bad_missing_at_threshold bad_label_mismatch
          bad_merged_without_any_review bad_merged_with_self_waiver \
          bad_merged_at_no_review_ts bad_merged_backdated_merge_tail \
          bad_merged_grandfathered_then_violation bad_merged_two_violations \
-         bad_merged_only_comment_decision_review \
+         bad_merged_only_comment_decision_review bad_merged_approved_after_merge \
          bad_waiver_prose_mention bad_waiver_prose_refusal \
          bad_merged_with_merger_waiver bad_waiver_after_merge \
          bad_waiver_by_earlier_patch_author bad_waiver_unverified \
