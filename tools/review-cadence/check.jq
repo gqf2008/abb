@@ -356,8 +356,13 @@ def label_counts:
         # 后者让「把 request_changes 的 ts 写到契约阈值之前」绕过整套判据 —— (a)~(g)
         # 每一条的视野都钉在 ts>=契约 这个客户端自选的比较上，所以这条 rc 对全部判据
         # 隐形（实测：skipped=0 judged=1）。换成 `ts < $m.ts` 后方向 fail-closed：
-        # 回溯 ts ⇒ 它声称早于合并 ⇒ 必须在链上 ⇒ 上链后按链序它是末条 ⇒ (g) 红；
-        # 前推 ts ⇒ (c) 的 final_judged 立刻逮住。
+        # 回溯 ts ⇒ 它声称早于合并 ⇒ **必须上链**（这是本判据实际堵住的）；**但仅此而已**：
+        # 上链之后它是否被 (g) 认成"合并前最后一条"，取决于 `$last_before`，而后者取的是
+        # 数组 `last`——数组序是 `thread()` 按 (ts,actor,oid) 排序的结果，回溯后它反而排到
+        # 前面，于是 `last` 取到的是那条 approve ⇒ **仍然判绿**（实测 D4 形状：
+        # `approve(ts=1000900) ← rc(ts=999999) ← merge(parent=rc)` ⇒ rc=0）。
+        # 所以本行只关掉 off-chain 那一半；**上链回溯是已知未修洞 D4**，登记在架构卡
+        # `abb-cadence-timing-axes-20261101`。前推 ts 则由 (c) 的 final_judged 逮住。
         # 同时这个限定给「当时还不存在」的 review 留了豁免（第四轮评审 blocking-2，
         # 真实账本 8 个多合并 thread 里 5 个含合并之后的 review，否则会大面积误红）。
         | ( [ $reviews[]
@@ -401,7 +406,9 @@ def label_counts:
             | ( [ $waivers[] | select((.reasons | length) == 0) ] | length ) as $good_n
             | if $good_n > 0 then empty
               elif ($waivers | length) > 0 then
-                "\($m.oid): 合并（ts=\($m.ts)）时该 thread 无任何判决类 review，且 review-waiver 条目不成立 ⇒ "
+                # 与 else 分支同口径（第四轮评审 NB-1 的另一半）：thread **可能**有判决类
+                # review，不能一律说「无任何」。
+                "\($m.oid): 合并（ts=\($m.ts)）时该 thread 有 \([ $reviews[] | select(.ts >= $contract_ts and (.decision == "approve" or .decision == "request_changes")) ] | length) 条判决类 review（其中在本次合并之前 \($judged_n) 条），但 review-waiver 条目不成立 ⇒ "
                 + ([ $waivers[] | "\(.oid): \(.reasons | join("；"))" ] | join(" / "))
                 + "（豁免须由独立第三方在 comment.body.waiver 显式声明）"
               else
