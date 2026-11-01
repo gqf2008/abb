@@ -12,6 +12,9 @@
 #   --contract-ts <epoch>   契约落地时间阈值（秒）。缺省取 env ABB_REVIEW_CONTRACT_TS，
 #                           再缺省取本脚本内常量（见下）。ts 小于该值的 review 视为**契约前**
 #                           历史条目，缺契约行时跳过并计数、不判红。
+#   --no-review-ts <epoch>  无评审新规生效时间（秒）。缺省取 env ABB_NO_REVIEW_TS，再缺省
+#                           取本脚本常量 NO_REVIEW_TS_DEFAULT。判据 (g) 只对**此时间之后**
+#                           的 merge_result 生效（更早的历史合并豁免，不追溯判红）。
 #   -h | --help
 #
 # 判据（与 docs/review-findings-contract.md 一致；核心实现见 tools/review-cadence/check.jq）
@@ -22,6 +25,10 @@
 #         契约前（ts < 阈值）缺契约行 ⇒ 跳过计数；契约后缺 ⇒ 判红。
 #   (b) 同一 thread 的 blocking 轮数（契约行 blocking>0 的 review 条数）≤ 2。
 #   (c) 存在 merge_result{merged:true} 时，其前最后一次 blocking 轮之后必须有 blocking=0 的 approve。
+#   (g) 合并于**无评审新规之后**却没有任何判决类 review ⇒ 判红（判据 (c) 对空 review
+#       数组零次迭代，天然不报——这是它的盲区，见 docs/review-findings-contract.md）。
+#       豁免：由**作者以外**的 principal 签一条 comment，正文含
+#       `review-waiver: no-independent-review`（含这句的 comment 不得由该作者本人签）。
 #   `decision=="comment"` 的 review 不参与判定（不要求契约行、不计 blocking 轮）。
 #
 # 退出码
@@ -37,6 +44,11 @@ set -euo pipefail
 # 否则会把契约前的历史条目当成契约后而误红。改动本常量须重跑自测的时间阈值邻域用例。
 CONTRACT_TS_DEFAULT=1791876192
 
+# 无评审新规生效时间（epoch 秒）：判据 (g) 只对**此时间之后**的 merge_result 生效。
+# = 本判据落地的当刻，保证不追溯判红此前的历史合并（包括 owner 明确授权降档的那批）。
+# 改动本常量须重跑自测里 (g) 的时间阈值邻域用例。
+NO_REVIEW_TS_DEFAULT=1793524600
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 jq_program="$script_dir/review-cadence/check.jq"
 
@@ -45,11 +57,13 @@ usage() { sed -n '2,40p' "${BASH_SOURCE[0]}"; }
 thread_id=""
 json_input=""
 contract_ts="${ABB_REVIEW_CONTRACT_TS:-$CONTRACT_TS_DEFAULT}"
+no_review_ts="${ABB_NO_REVIEW_TS:-$NO_REVIEW_TS_DEFAULT}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --json) [ $# -ge 2 ] || { echo "❌ --json 需要参数" >&2; exit 2; }; json_input="$2"; shift 2 ;;
     --contract-ts) [ $# -ge 2 ] || { echo "❌ --contract-ts 需要参数" >&2; exit 2; }; contract_ts="$2"; shift 2 ;;
+    --no-review-ts) [ $# -ge 2 ] || { echo "❌ --no-review-ts 需要参数" >&2; exit 2; }; no_review_ts="$2"; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     --*) echo "❌ 未知参数：$1" >&2; exit 2 ;;
     *) thread_id="$1"; shift ;;
@@ -60,6 +74,9 @@ command -v jq >/dev/null 2>&1 || { echo "❌ 需要 jq（本仓随包工具）" 
 [ -f "$jq_program" ] || { echo "❌ 缺 jq 程序：$jq_program" >&2; exit 2; }
 case "$contract_ts" in
   '' | *[!0-9]*) echo "❌ --contract-ts 必须是整数秒：$contract_ts" >&2; exit 2 ;;
+esac
+case "$no_review_ts" in
+  '' | *[!0-9]*) echo "❌ --no-review-ts 必须是整数秒：$no_review_ts" >&2; exit 2 ;;
 esac
 
 if [ -n "$json_input" ] && [ -n "$thread_id" ]; then
@@ -101,14 +118,15 @@ if ! jq -e 'type == "array"' "$tmp" >/dev/null 2>&1; then
   exit 2
 fi
 
-if ! result="$(jq -f "$jq_program" --argjson contract_ts "$contract_ts" "$tmp")"; then
+if ! result="$(jq -f "$jq_program" --argjson contract_ts "$contract_ts" --argjson no_review_ts "$no_review_ts" "$tmp")"; then
   echo "❌ jq 守卫执行失败（见上方错误）" >&2
   exit 2
 fi
 
-echo "── review cadence：${thread_id:-<json>}（契约阈值 ts=${contract_ts}）"
+echo "── review cadence：${thread_id:-<json>}（契约阈值 ts=${contract_ts}；无评审新规 ts=${no_review_ts}）"
 echo "$result" | jq -r '
-  "review 条目 \(.summary.reviews) 条；blocking 轮数 \(.summary.blocking_rounds)；"
+  "review 条目 \(.summary.reviews) 条（其中判决类 \(.summary.judged_reviews) 条）；"
+  + "blocking 轮数 \(.summary.blocking_rounds)；"
   + "历史跳过 \(.summary.skipped_historical) 条；merge_result(merged) \(.summary.merges) 条"'
 violations="$(echo "$result" | jq -r '.violations[]')"
 if [ -n "$violations" ]; then

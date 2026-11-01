@@ -90,6 +90,10 @@ def label_counts:
       else . end);
 
 . as $raw
+# 无评审新规生效时间（`--no-review-ts` / `--argjson no_review_ts` 注入；缺省 0 = 全量生效）。
+# (g) 判据只对**此时间之后**的合并生效，更早的历史合并豁免——与「契约前条目豁免」同口径，
+# 否则会把 owner 明确授权降档的那批历史卡追溯判红。
+| ($no_review_ts // 0) as $no_review_ts
 # 注意：不能用 `verified // true` —— jq 的 `//` 把 false 也当“缺失”，
 # 会把 verified=false 悄悄翻成 true，让 (f) 判据永远不触发（selftest 逮到过）。
 | [range(0; ($raw | length))
@@ -233,10 +237,56 @@ def label_counts:
                  and (.e.kind == "patch" or .e.kind == "review"
                       or .e.kind == "merge_result")
                  and (.e.ts // 0) >= $contract_ts)
-        | "\(.oid): \(.e.kind) 条目签名验不过（verified=false）⇒ 不得据它合并" )
+        | "\(.oid): \(.e.kind) 条目签名验不过（verified=false）⇒ 不得据它合并" ),
+
+      # (g) 「合并于本判据之后，却一条判决类 review 都没有」⇒ 判红。
+      #
+      # 为什么需要：判据 (c) 的实现是 `( $post | final_judged )[]`，jq 对空数组的 `[]`
+      # 迭代是**零次** ⇒ 零 review 天然不产生违规。于是「从未被评审过的卡」与
+      # 「评审通过的卡」在 (c) 眼里一样（2026-11-01 实测：有 patch + 有 merge_result、
+      # 零 review 的样本判 ✅ 通过）。这不是笔误——`final_judged` 为简化「平局组为空」
+      # 与「组内多条」两个边界而刻意这么写，`ok_no_reviews` 样本（只含一条 issue、
+      # 还没开工的活卡）期望 rc=0 也是对的。真盲区只在「已合并」这个组合上。
+      #
+      # 为什么用**独立阈值**而不是复用 $contract_ts：本判据落地前的历史合并（含 owner
+      # 明确授权降档的那批）不该被追溯判红。与既有「契约前条目豁免」同口径。
+      #
+      # 豁免（降档）机制：必须由**作者以外的 principal** 签一条 `comment`，正文含
+      #   `review-waiver: no-independent-review`
+      # 为什么是 comment 而不是补一条 approve review：补 approve 会被判据 (d)
+      # 「最后一条判决类 review 的 actor 不得是它所审 patch 的作者」当自审拦下——
+      # 实验证实（patch(作者) → review(作者, approve) → merge ⇒ (d) 判红）。
+      # 所以豁免只能用不参与判决的 comment 载体，且其 actor 必须不同于该合并前
+      # 最新 patch 的 actor，否则不算独立留痕。
+      ( if ($merge_items | length) > 0 then
+          ($merge_items[-1]) as $m
+          | if ($m.ts >= $no_review_ts) then
+              ( [ $reviews[]
+                  | select(.ts >= $contract_ts
+                           and (.decision == "approve" or .decision == "request_changes")) ]
+                | length ) as $judged_n
+              | ( [ $items[]
+                    | select(.e.kind == "comment"
+                             and (.e.ts // 0) >= $no_review_ts
+                             and (((.e.body.body // "") + "\n" + (.e.body.note // ""))
+                                  | test("review-waiver:[ \\t]*no-independent-review"))) ] ) as $waivers
+              | ( $patches | sort_by(.ts) | map(select(.ts < $m.ts)) | last ) as $p
+              | ( [ $waivers[]
+                    | select($p == null or .e.actor == null or .e.actor != $p.actor) ] ) as $good
+              | if $judged_n > 0 then empty
+                elif ($good | length) > 0 then empty
+                elif ($waivers | length) > 0 then
+                  "\($m.oid): 合并无任何判决类 review，且唯一的 review-waiver 由 patch 作者本人签署 ⇒ 豁免不算独立留痕（§0b）"
+                else
+                  "\($m.oid): 合并发生在无评审新规之后，但该 thread 没有任何判决类 review，也没有 review-waiver 条目 ⇒ 未经独立评审即合并"
+                end
+            else empty end
+        else empty end )
     ]
   ) as $violations| { violations: $violations,
     summary: { reviews: ($reviews | length),
+               judged_reviews: ([ $reviews[] | select(.ts >= $contract_ts
+                                    and (.decision == "approve" or .decision == "request_changes")) ] | length),
                blocking_rounds: $blocking_rounds,
                skipped_historical: $skipped,
                merges: ($merges | length),

@@ -43,8 +43,8 @@ echo "── check_review_cadence 自测（contract-ts=${ts}）"
 # ── 合规样本（rc=0）─────────────────────────────────────────────────────────
 for s in ok_basic ok_comment_exempt ok_comment_exempt_blocking ok_no_reviews ok_merge_resolved ok_historical_missing \
          ok_unknown_decision_historical ok_same_reviewer_multi_round ok_unverified_comment \
-         ok_historical_contract_mismatch; do
-  expect_rc "合规：$s" 0 "$check" --json "$samples/$s.json" --contract-ts "$ts"
+         ok_historical_contract_mismatch ok_merged_with_independent_waiver; do
+  expect_rc "合规：$s" 0 "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 
 # ── 违规样本（rc=1）─────────────────────────────────────────────────────────
@@ -55,8 +55,9 @@ for s in bad_missing_after_threshold bad_missing_at_threshold bad_label_mismatch
          bad_decoy_patch_after_self_review bad_review_array_order_bypass \
          bad_last_review_contract_mismatch bad_last_review_blocks_but_approves \
          bad_tie_blocking_hidden_first bad_tie_blocking_hidden_last \
-         bad_tie_self_review_first bad_tie_self_review_last; do
-  expect_rc "违规：$s" 1 "$check" --json "$samples/$s.json" --contract-ts "$ts"
+         bad_tie_self_review_first bad_tie_self_review_last \
+         bad_merged_without_any_review bad_merged_with_self_waiver; do
+  expect_rc "违规：$s" 1 "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 
 # ── 守卫自身失效模式 / 用法错误（rc=2）───────────────────────────────────────

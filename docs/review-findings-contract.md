@@ -45,8 +45,52 @@ findings: blocking=1 non-blocking=2
 3. **可合并**：thread 内最后一条（`ts` ≥ 契约阈值）判决类 review 必须是 `blocking=0` 的
    `approve`；否则判红。该判据在**写 `merge_result` 之前**就能跑（不依赖是否已有
    `merge_result`）——这正是「不得带未决 blocking 合并」的机器判据。
+4. **不得零评审合并**：合并于无评审新规之后、却没有任何判决类 review ⇒ 判红。
+   降档必须由**作者以外**的 principal 写一条含 `review-waiver: no-independent-review`
+   的 `comment`（细则与实测依据见下文「判据 4」一节）。
 
 `decision=="comment"` 的 review 不参与上述判定（既不要求契约行，也不计 blocking 轮）。
+
+### 判据 4（2026-11-01 新增）：合并于新规之后却零判决类 review ⇒ 红
+
+判据 3 的实现是 `( $post | final_judged )[]`——jq 对空数组的 `[]` 迭代是**零次**，
+不产生违规，于是**「从没被评审过的卡」与「评审通过的卡」在判据 3 眼里一样**。
+
+这不是笔误：`final_judged` 为简化「平局组为空」与「组内多条」两个边界而刻意这么写，
+`ok_no_reviews` 样本期望 `rc=0` 也**是对的**——它只含一条 `issue`，是「还没开工的活卡」。
+真盲区只在**已合并**这个组合上：**有 `patch` + 有 `merge_result(merged=true)`，却零 `review`**
+（2026-11-01 实测：该形状的样本曾判 `✅ 通过`）。
+
+**判据 4**：`merge_result.ts >= NO_REVIEW_TS` 且该 thread 没有任何（`ts >= 契约阈值` 的）
+`approve` / `request_changes` ⇒ 判红。
+
+**为什么不复用契约阈值**：本判据落地前的历史合并（含 owner 明确授权降档的那批）
+不该被追溯判红，故单列 `NO_REVIEW_TS_DEFAULT`（= 本判据落地当刻），与「契约前条目豁免」同口径。
+回归实测：20 张历史零评审合并卡在默认阈值下**全部仍绿**（不追溯）。
+
+**降档（豁免）机制**：必须由**作者以外**的 principal 签一条 `comment`，正文含：
+
+```
+review-waiver: no-independent-review
+```
+
+两个硬约束，都来自实测：
+
+1. **不能用「补一条 approve review」当豁免**——会被判据 2（自审）当自审拦下：
+   `patch(作者) → review(作者, approve) → merge` 实测判红「自审不算独立评审」。
+   所以豁免只能用不参与判决的 `comment` 载体。
+2. **豁免的 actor 必须不同于该合并前最新 `patch` 的 actor**——作者自己写 waiver 不算数、
+   单独判一条「豁免不算独立留痕」。
+
+这样降档不再能静默跳过，而必须**留痕且由他人确认**。
+
+**实测规模（2026-11-01，全仓 1001 个 thread）：**
+
+| 口径 | 数量 |
+|---|---|
+| 已合并但零 `review` | 47 |
+| 其中合并发生在契约阈值之后 | 20 |
+| 新规生效后全仓判红 | 4（全部来自既有判据，与本判据无关；改动前后 orig=1/new=1 逐条一致） |
 
 ## 历史条目
 
@@ -69,7 +113,7 @@ tools/check_review_cadence.sh --json tools/review-cadence/samples/ok_basic.json 
 
 退出码：`0` 通过；`1` 违规；`2` 用法/工具错误（缺 jq、thread 取不到、JSON 非法）。
 
-守卫自身的自测（合规 + 违规 + 守卫失效模式，共 21 例）随仓提交，并在
+守卫自身的自测（合规 + 违规 + 守卫失效模式，共 40 例）随仓提交，并在
 `.walgit/ci.toml` 的 `review-cadence-selftest` 任务里执行：
 
 ```sh
