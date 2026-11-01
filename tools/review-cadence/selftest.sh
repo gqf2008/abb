@@ -8,9 +8,13 @@
 # 用法：tools/review-cadence/selftest.sh
 # 退出码：0 = 全部用例符合预期；1 = 有用例不符合预期。
 #
-# 阈值邻域：所有样本用 --contract-ts 1000000 显式喂入，
-#   ts=999999 ⇒ 契约前（缺契约行跳过）；ts=1000000 ⇒ 恰好阈值（视为契约后，缺则判红）；
-#   ts=1000001 ⇒ 契约后。
+# 阈值邻域：所有样本用 --contract-ts 1000000 / --no-review-ts 1000000 显式喂入，
+#   契约阈值（判据 (a)-(f)）：ts=999999 ⇒ 契约前（缺契约行跳过）；ts=1000000 ⇒ 恰好阈值
+#     （视为契约后，缺则判红）；ts=1000001 ⇒ 契约后。
+#   无评审阈值（判据 (g)）：merge ts=999999 ⇒ 新规前（祖父条款豁免）；ts=1000000 ⇒ 恰好阈值
+#     **必须判**（`>=` 不是 `>`）；ts=1000001 ⇒ 新规后。这两条邻域用例是「阈值方向」的
+#     唯一守卫（实测：把 (g) 的 `>=` 改成 `>`，之前 40 例全绿 ⇒ 现已由
+#     bad_merged_at_no_review_ts / ok_merged_before_no_review_ts 各自钉住）。
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -22,8 +26,7 @@ pass=0
 fail=0
 
 # expect_rc <描述> <期望 rc> <命令...>
-expect_rc() {
-  local desc="$1" want="$2"
+expect_rc() {  local desc="$1" want="$2"
   shift 2
   local out rc
   out="$("$@" 2>&1)"
@@ -38,12 +41,50 @@ expect_rc() {
   fi
 }
 
-echo "── check_review_cadence 自测（contract-ts=${ts}）"
+# expect_violations <描述> <期望违规条数> <命令...>
+# 为什么要数条数：判据 (g) 改成「对每一条 merge_result 各判一次」后，最危险的回归是
+# **只判一条**（首条/末条）—— 那样多条违规仍会 rc=1，单看 rc 看不出差别。
+# rc 也一并断言（want=0 ⇒ rc=0，want>0 ⇒ rc=1），避免「条数对但退出码错」的漏网。
+expect_violations() {
+  local desc="$1" want="$2"
+  shift 2
+  local out rc got want_rc=1
+  [ "$want" -eq 0 ] && want_rc=0
+  out="$("$@" 2>&1)"
+  rc=$?
+  got="$(printf '%s\n' "$out" | grep -c '^  - ' || true)"
+  if [ "$got" -eq "$want" ] && [ "$rc" -eq "$want_rc" ]; then
+    pass=$((pass + 1))
+    printf 'ok   (violations=%d) %s\n' "$got" "$desc"
+  else
+    fail=$((fail + 1))
+    printf 'FAIL (want %s violations & rc=%d, got %s & rc=%d) %s\n' "$want" "$want_rc" "$got" "$rc" "$desc"
+    printf '%s\n' "$out" | sed 's/^/     | /'
+  fi
+}
+
+# expect_msg <描述> <输出里必须出现的片段> <命令...>
+expect_msg() {
+  local desc="$1" needle="$2"
+  shift 2
+  local out
+  out="$("$@" 2>&1 || true)"
+  if printf '%s' "$out" | grep -qF -- "$needle"; then
+    pass=$((pass + 1))
+    printf 'ok   (msg ∋ %s) %s\n' "$needle" "$desc"
+  else
+    fail=$((fail + 1))
+    printf 'FAIL (输出缺片段「%s」) %s\n' "$needle" "$desc"
+    printf '%s\n' "$out" | sed 's/^/     | /'
+  fi
+}
+
+echo "── check_review_cadence 自测（contract-ts=${ts}；no-review-ts=${ts}）"
 
 # ── 合规样本（rc=0）─────────────────────────────────────────────────────────
 for s in ok_basic ok_comment_exempt ok_comment_exempt_blocking ok_no_reviews ok_merge_resolved ok_historical_missing \
          ok_unknown_decision_historical ok_same_reviewer_multi_round ok_unverified_comment \
-         ok_historical_contract_mismatch ok_merged_with_independent_waiver; do
+         ok_historical_contract_mismatch ok_merged_with_independent_waiver ok_merged_before_no_review_ts; do
   expect_rc "合规：$s" 0 "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 
@@ -56,9 +97,36 @@ for s in bad_missing_after_threshold bad_missing_at_threshold bad_label_mismatch
          bad_last_review_contract_mismatch bad_last_review_blocks_but_approves \
          bad_tie_blocking_hidden_first bad_tie_blocking_hidden_last \
          bad_tie_self_review_first bad_tie_self_review_last \
-         bad_merged_without_any_review bad_merged_with_self_waiver; do
+         bad_merged_without_any_review bad_merged_with_self_waiver \
+         bad_merged_at_no_review_ts bad_merged_backdated_merge_tail \
+         bad_merged_grandfathered_then_violation bad_merged_two_violations \
+         bad_merged_only_comment_decision_review \
+         bad_waiver_prose_mention bad_waiver_prose_refusal \
+         bad_merged_with_merger_waiver bad_waiver_after_merge \
+         bad_waiver_by_earlier_patch_author bad_waiver_unverified \
+         bad_waiver_before_no_review_ts bad_waiver_missing_actor; do
   expect_rc "违规：$s" 1 "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
+
+# ── 违规**条数**：判据 (g) 逐条 merge 判，多条违规不得合并成一条、也不得丢 ──────
+for pair in "ok_merged_before_no_review_ts 0" "bad_merged_two_violations 2" \
+            "bad_merged_backdated_merge_tail 1" "bad_merged_grandfathered_then_violation 1"; do
+  set -- $pair
+  expect_violations "违规条数：$1" "$2" "$check" --json "$samples/$1.json" --contract-ts "$ts" --no-review-ts "$ts"
+done
+
+# ── 违规**理由**：每条豁免失效必须报出对应原因，而不是笼统地变成“另一处坏了”───────
+#    （否则把 blocking-2 的某个子约束删掉，用例只会因为其他原因变红，等于没有守卫）
+expect_msg "豁免事后补签的报因" "不得事后补签" \
+  "$check" --json "$samples/bad_waiver_after_merge.json" --contract-ts "$ts" --no-review-ts "$ts"
+expect_msg "豁免由某份 patch 作者签的报因" "是本 thread 某份 patch 的作者" \
+  "$check" --json "$samples/bad_waiver_by_earlier_patch_author.json" --contract-ts "$ts" --no-review-ts "$ts"
+expect_msg "豁免由合并者签的报因" "就是本次合并的执行者" \
+  "$check" --json "$samples/bad_merged_with_merger_waiver.json" --contract-ts "$ts" --no-review-ts "$ts"
+expect_msg "豁免未验签的报因" "签名验不过" \
+  "$check" --json "$samples/bad_waiver_unverified.json" --contract-ts "$ts" --no-review-ts "$ts"
+expect_msg "豁免早于新规的报因" "早于无评审新规" \
+  "$check" --json "$samples/bad_waiver_before_no_review_ts.json" --contract-ts "$ts" --no-review-ts "$ts"
 
 # ── 守卫自身失效模式 / 用法错误（rc=2）───────────────────────────────────────
 expect_rc "JSON 文件不存在" 2 "$check" --json "$samples/does-not-exist.json" --contract-ts "$ts"

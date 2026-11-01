@@ -23,12 +23,22 @@
 #         blocking>0 ⇒ decision=request_changes；blocking=0 ⇒ decision=approve；
 #         若 note 另有逐条 `[blocking]` / `[non-blocking]` 标签，标签计数须与契约行相等；
 #         契约前（ts < 阈值）缺契约行 ⇒ 跳过计数；契约后缺 ⇒ 判红。
-#   (b) 同一 thread 的 blocking 轮数（契约行 blocking>0 的 review 条数）≤ 2。
-#   (c) 存在 merge_result{merged:true} 时，其前最后一次 blocking 轮之后必须有 blocking=0 的 approve。
-#   (g) 合并于**无评审新规之后**却没有任何判决类 review ⇒ 判红（判据 (c) 对空 review
-#       数组零次迭代，天然不报——这是它的盲区，见 docs/review-findings-contract.md）。
-#       豁免：由**作者以外**的 principal 签一条 comment，正文含
-#       `review-waiver: no-independent-review`（含这句的 comment 不得由该作者本人签）。
+#       历史未知 decision（曾出现 needs-changes / null）同口径：契约前跳过、契约后判红。
+#   (b) 同一 thread 的 blocking 轮数（契约行 blocking>0 的判决类 review 条数）≤ 2。
+#   (c) thread 内**最后一条**（ts ≥ 契约阈值）判决类 review 必须是 blocking=0 的 approve，
+#       否则判红。该判据在**合并之前**即可跑（不依赖是否已有 merge_result）。
+#   (d) 独立评审（§0b）：最后一条判决类 review 的 actor 不得与本 thread 任何 patch 的
+#       actor 相同（自审就算签出合法 approve 也不算独立评审）。
+#   (e) 终审不得与合并者同人（§4）：已合并的 thread，最后一条判决类 review 的 actor 与
+#       merge_result 的 actor 必须不同。同一个人**多轮评审**是合法的，不在此拦。
+#   (f) 未验签（verified=false）的**判决性**条目（patch / review / merge_result）不得据以
+#       合并。`comment` 上的未验签不算：那通常是“写错身份后重签”的记录。
+#   (g) 合并于**无评审新规之后**却没有任何判决类 review ⇒ 判红。**逐条 merge 判**：每条
+#       ts ≥ no_review_ts 的 merge_result{merged:true} 各判一次，多条违规各报一条。
+#       降档豁免：由**独立第三方**签一条 comment，其 `body.waiver` 字段等于字符串
+#       "no-independent-review"（**散文里提到该词不算**）；该 comment 还必须
+#        ① ts ≥ no_review_ts ② ts ≤ 该次合并的 ts（不得事后补签）③ verified ≠ false
+#        ④ actor 既不是本 thread 任何一份 patch 的作者、也不是该次合并的执行者。
 #   `decision=="comment"` 的 review 不参与判定（不要求契约行、不计 blocking 轮）。
 #
 # 退出码
@@ -41,18 +51,30 @@ set -euo pipefail
 
 # 契约落地时间（epoch 秒）。此日期之前的 review 视为历史，缺契约行跳过。
 # = 「现存 review 最大 ts」+ 1（落地前扫全部 thread 得出，保证不误判历史）；**不得调低**，
-# 否则会把契约前的历史条目当成契约后而误红。改动本常量须重跑自测的时间阈值邻域用例。
+# 否则会把契约前的历史条目当成契约后而误红。改动本常量须重跑自测的时间阈值邻域用例
+# （`bad_missing_at_threshold` = 恰好阈值必须判、`ok_historical_missing` = 阈值 -1 必须跳过）。
 CONTRACT_TS_DEFAULT=1791876192
 
 # 无评审新规生效时间（epoch 秒）：判据 (g) 只对**此时间之后**的 merge_result 生效。
-# = 本判据落地的当刻，保证不追溯判红此前的历史合并（包括 owner 明确授权降档的那批）。
-# 改动本常量须重跑自测里 (g) 的时间阈值邻域用例。
+# 推导（2026-11-01 扫全仓 refs/collab/inbox 的 4104 条 entry，命令见
+# docs/review-findings-contract.md 的「常量推导（可复现）」）：
+#   · 全仓 merge_result{merged:true} 共 199 条，**最大 ts = 1793356481**；
+#   · 本常量取 1793524600（= 2026-11-01 09:16:40 UTC，判据 (g) 落地当刻），
+#     比最后一条历史合并晚 168119 s ≈ 1.95 天 ⇒ 满足「严格大于全仓现存 merge ts」
+#     这条硬约束，落地时**0 条**历史合并被追溯判红（含 owner 明确授权降档的那批）。
+# **不得调低到 ≤ 1793356481**（否则追溯判红历史合并）；调高只会多豁免，但会放过真实违规。
+# 改动本常量须重跑自测的 (g) 阈值邻域用例（`bad_merged_at_no_review_ts` = 恰好阈值必须判、
+# `ok_merged_before_no_review_ts` = 阈值 -1 必须豁免）。
 NO_REVIEW_TS_DEFAULT=1793524600
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 jq_program="$script_dir/review-cadence/check.jq"
 
-usage() { sed -n '2,40p' "${BASH_SOURCE[0]}"; }
+# 打印本文件头部注释（第 2 行到 `set -euo pipefail` 之前一行）。
+# 为什么不用 `sed -n '2,40p'`：行号是脆的——头部注释每加几行，帮助就会被**静默截断**
+# （上一版加完判据列表后正好吃到 40 行边界，再添一行就会把「退出码」段整段吃掉）。
+# 用标记行定位，头部注释多长都不会断。
+usage() { awk 'NR == 1 { next } /^set -euo pipefail$/ { exit } { print }' "${BASH_SOURCE[0]}"; }
 
 thread_id=""
 json_input=""

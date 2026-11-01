@@ -1,0 +1,6 @@
+[
+ {"entry":{"kind":"issue","id":"t","actor":"A","ts":1000000,"body":{}},"oid":"i1","principal":"A","verified":true},
+ {"entry":{"kind":"patch","id":"t","actor":"A","ts":1000100,"body":{}},"oid":"p1","principal":"A","verified":true},
+ {"entry":{"kind":"comment","id":"t","ts":1000180,"body":{"waiver":"no-independent-review"}},"oid":"w1","verified":true},
+ {"entry":{"kind":"merge_result","id":"t","actor":"M","ts":1000200,"body":{"merged":true,"oid":"abc"}},"oid":"m1","principal":"M","verified":true}
+]

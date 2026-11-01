@@ -90,7 +90,11 @@ def label_counts:
       else . end);
 
 . as $raw
-# 无评审新规生效时间（`--no-review-ts` / `--argjson no_review_ts` 注入；缺省 0 = 全量生效）。
+# 无评审新规生效时间。**调用方必须传** `--argjson no_review_ts <epoch>`（`tools/check_review_cadence.sh`
+# 恒定传，缺省取常量 NO_REVIEW_TS_DEFAULT）。这里的 `// 0` **兜不住漏传**：jq 对未定义变量是
+# **编译期错误**（实测 `jq -f check.jq --argjson contract_ts …` ⇒ `$no_review_ts is not defined` rc=3），
+# 不是运行期 null。`//` 只处理显式传 `--argjson no_review_ts null` 的情形。
+# 取到 0 的语义 = 全量生效（不豁免任何合并）。
 # (g) 判据只对**此时间之后**的合并生效，更早的历史合并豁免——与「契约前条目豁免」同口径，
 # 否则会把 owner 明确授权降档的那批历史卡追溯判红。
 | ($no_review_ts // 0) as $no_review_ts
@@ -251,37 +255,81 @@ def label_counts:
       # 为什么用**独立阈值**而不是复用 $contract_ts：本判据落地前的历史合并（含 owner
       # 明确授权降档的那批）不该被追溯判红。与既有「契约前条目豁免」同口径。
       #
-      # 豁免（降档）机制：必须由**作者以外的 principal** 签一条 `comment`，正文含
-      #   `review-waiver: no-independent-review`
-      # 为什么是 comment 而不是补一条 approve review：补 approve 会被判据 (d)
-      # 「最后一条判决类 review 的 actor 不得是它所审 patch 的作者」当自审拦下——
-      # 实验证实（patch(作者) → review(作者, approve) → merge ⇒ (d) 判红）。
-      # 所以豁免只能用不参与判决的 comment 载体，且其 actor 必须不同于该合并前
-      # 最新 patch 的 actor，否则不算独立留痕。
-      ( if ($merge_items | length) > 0 then
-          ($merge_items[-1]) as $m
-          | if ($m.ts >= $no_review_ts) then
-              ( [ $reviews[]
-                  | select(.ts >= $contract_ts
-                           and (.decision == "approve" or .decision == "request_changes")) ]
-                | length ) as $judged_n
-              | ( [ $items[]
-                    | select(.e.kind == "comment"
-                             and (.e.ts // 0) >= $no_review_ts
-                             and (((.e.body.body // "") + "\n" + (.e.body.note // ""))
-                                  | test("review-waiver:[ \\t]*no-independent-review"))) ] ) as $waivers
-              | ( $patches | sort_by(.ts) | map(select(.ts < $m.ts)) | last ) as $p
-              | ( [ $waivers[]
-                    | select($p == null or .e.actor == null or .e.actor != $p.actor) ] ) as $good
-              | if $judged_n > 0 then empty
-                elif ($good | length) > 0 then empty
-                elif ($waivers | length) > 0 then
-                  "\($m.oid): 合并无任何判决类 review，且唯一的 review-waiver 由 patch 作者本人签署 ⇒ 豁免不算独立留痕（§0b）"
-                else
-                  "\($m.oid): 合并发生在无评审新规之后，但该 thread 没有任何判决类 review，也没有 review-waiver 条目 ⇒ 未经独立评审即合并"
-                end
-            else empty end
-        else empty end )
+      # **逐条判，不是只看一条**（评审 abb-reviewer-171 的 blocking-3）：`ts` 由客户端在
+      # 签名时写入、不是服务端盖章 ⇒ 只要判据只挑**数组里的某一条** merge，构造一条 ts
+      # 回溯的 merge 就能把整条判据关掉。实测（旧实现取 `$merge_items[-1]`）：
+      #   issue → patch(A) → merge(ts=1000300, 零 review) → merge(ts=999000)，阈值 1000000
+      #   ⇒ 旧实现 rc=0（只看末尾那条 999000，判据整条跳过），尽管 1000300 那次合并明确在
+      #     新规之后且零 review。
+      # 所以这里对**每一条** `ts >= $no_review_ts` 的 merge_result 各判一次：同一 thread 里
+      # 多条违规各报一条，谁也遮不住谁。
+      #
+      # 豁免（降档）机制：必须由**独立第三方**签一条 `comment`，其 `body.waiver` 字段
+      # **等于字符串** `"no-independent-review"`。约定与理由：
+      #   · **只看结构化字段，不看散文**（评审 abb-reviewer-171 的 blocking-1）：早先实现在
+      #     `body.body + "\n" + body.note` 全文里匹配 `review-waiver: no-independent-review`，
+      #     没有行锚定 ⇒ 任何**提到**这句话的普通评论都成了豁免，连「不接受用
+      #     review-waiver: no-independent-review 跳过评审」这种**明确拒绝豁免**的评论也能
+      #     把红卡刷绿（两条均实测 rc=0）。豁免是授权动作，必须显式编码，不能靠引用。
+      #   · 为什么是 comment 而不是补一条 approve review：补 approve 会被判据 (d)
+      #     「最后一条判决类 review 的 actor 不得是它所审 patch 的作者」当自审拦下——
+      #     实验证实（patch(作者) → review(作者, approve) → merge ⇒ (d) 判红）。
+      #     所以豁免只能用不参与判决的 comment 载体。
+      #   · 效力约束（评审 abb-reviewer-171 的 blocking-2 + non-blocking-4，每条都有实测
+      #     绕过用例，见 samples/bad_waiver_*.json）：
+      #     1. actor **不得是本 thread 任何一份 patch 的作者**（集合判定；早先只比「merge 前
+      #        最后一份 patch」⇒ 双 patch 时更早那位作者 A 可自签豁免，实测 rc=0）；
+      #     2. actor **不得是本次合并的执行者**（合并者不得自签豁免）；
+      #     3. `ts <= merge.ts`（不得事后补签）；
+      #     4. `ts >= $no_review_ts`（新规之前写的评论不构成对本次降档的授权）；
+      #     5. `verified != false`（未验签的豁免不算数）；
+      #     6. actor 不得缺失（无主体的豁免无法追责）。
+      #     豁免是**一次一议**：每条 merge 各自校验，A 次合并的豁免不外溢到 B 次。
+      ( $merge_items[]
+        | select(.ts >= $no_review_ts)
+        | . as $m
+        | ( [ $reviews[]
+              | select(.ts >= $contract_ts
+                       and (.decision == "approve" or .decision == "request_changes")) ]
+            | length ) as $judged_n
+        | if $judged_n > 0 then empty
+          else
+            ( [ $items[]
+                | select(.e.kind == "comment"
+                         and ((.e.body.waiver // null) == "no-independent-review"))
+                | { oid, actor: (.e.actor // null), ts: (.e.ts // 0), verified } ]
+              | map(. as $w
+                    | { oid: $w.oid,
+                        reasons: [
+                          (if $w.ts < $no_review_ts then
+                             "ts=\($w.ts) 早于无评审新规 ts=\($no_review_ts)"
+                           else empty end),
+                          (if $w.ts > $m.ts then
+                             "ts=\($w.ts) 晚于本次合并 ts=\($m.ts)（不得事后补签）"
+                           else empty end),
+                          (if $w.verified == false then
+                             "签名验不过（verified=false）"
+                           else empty end),
+                          (if $w.actor == null then
+                             "缺 actor（无法确认豁免主体）"
+                           elif ([ $patches[] | .actor ] | index($w.actor)) != null then
+                             "actor=\($w.actor) 是本 thread 某份 patch 的作者"
+                           elif $w.actor == $m.actor then
+                             "actor=\($w.actor) 就是本次合并的执行者"
+                           else empty end)
+                        ] } ) ) as $waivers
+            | ( [ $waivers[] | select((.reasons | length) == 0) ] | length ) as $good_n
+            | if $good_n > 0 then empty
+              elif ($waivers | length) > 0 then
+                "\($m.oid): 合并（ts=\($m.ts)）时该 thread 无任何判决类 review，且 review-waiver 条目不成立 ⇒ "
+                + ([ $waivers[] | "\(.oid): \(.reasons | join("；"))" ] | join(" / "))
+                + "（豁免须由独立第三方在 comment.body.waiver 显式声明）"
+              else
+                "\($m.oid): 合并（ts=\($m.ts)）发生在无评审新规之后，但该 thread 没有任何判决类 review，"
+                + "也没有 review-waiver 条目（comment.body.waiver == \"no-independent-review\"）"
+                + " ⇒ 未经独立评审即合并"
+              end
+          end )
     ]
   ) as $violations| { violations: $violations,
     summary: { reviews: ($reviews | length),
