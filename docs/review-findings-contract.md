@@ -51,7 +51,7 @@ findings: blocking=1 non-blocking=2
 | (b) | **blocking 轮数 ≤ 2**：同一 thread 里契约行 `blocking>0` 的 review 条数不超过 2（第 2 轮仍未决 ⇒ 升级为架构问题）。 |
 | (c) | **可合并**：thread 内最后一条（`ts` ≥ 契约阈值）判决类 review 必须是 `blocking=0` 的 `approve`；否则判红。在**写 `merge_result` 之前**就能跑——这正是「不得带未决 blocking 合并」的机器判据。 |
 | (d) | **独立评审（§0b）**：最后一条判决类 review 的 actor 不得是它所审那份 `patch` 的作者。自审就算签出完全合法的 approve 也不算独立评审。 |
-| (e) | **终审不得与合并者同人（§4）**：已合并的 thread，最后一条判决类 review 的 actor 与 `merge_result` 的 actor 必须不同。同一个人**多轮评审**是合法的，不在此拦。 |
+| (e) | **终审不得与合并者同人（§4）**：已合并的 thread，最后一条判决类 review 的 actor 与**每一条** `merge_result` 的 actor 都必须不同（逐条判，理由同 (g) 的「不得只挑一条」）。同一个人**多轮评审**是合法的，不在此拦。历史豁免口径与 (a) 同：只看 `ts` ≥ 契约阈值的 review。 |
 | (f) | **未验签不得参与合并**：`verified=false` 的判决性条目（`patch` / `review` / `merge_result`）不得据以合并。`comment` 的未验签不算（通常是「写错身份重签」的记录，污染的是审计叙述而不是代码授权）。 |
 | (g) | **不得零评审合并**：合并于无评审新规之后、却没有任何判决类 review ⇒ 判红。细则与豁免契约见下文「判据 (g)」一节。 |
 
@@ -120,6 +120,28 @@ thread 里**多条违规各报一条**（`bad_merged_two_violations` 样本断�
 | 已合并但零 `review` | 47 |
 | 其中合并发生在契约阈值之后 | 20 |
 | 新规生效后全仓判红 | 4（全部来自既有判据，与本判据无关；改动前后 orig=1/new=1 逐条一致） |
+
+### 判据 (e) 同样逐条判 merge（2026-11-01，同卡并入）
+
+判据 (e)（终审不得与合并者同人）原先取 `$merge_items[-1]`——只比**数组末一条** merge。
+这与 (g) 是同一个洞的另一个入口：`ts` 由客户端在签名时写入、不是服务端盖章，所以构造
+一条 `ts` 回溯的 merge 就能把 (e) 关掉。实测（阈值 1000000）：
+
+```text
+approve(M) → merge(M, ts=1000200) → merge(X, ts=999000)   ⇒ 旧实现 rc=0
+删掉尾部那条 merge(X, ts=999000)                          ⇒ 旧实现 rc=1
+```
+
+旧实现取到的是末尾那条 `X`（`X ≠ M` ⇒ “不同人”），而真正的终审 `M` 正是第一次合并的
+执行者。现在 (e) 对**每一条** `merge_result{merged:true}` 各判一次，同 ts 的多条 merge
+会各报一条（多报只更严，不更松）。
+
+- 回归样本：`bad_merged_backdated_merge_tail_hides_final_reviewer`（回溯尾部遮不住，断言
+  恰好 1 条违规）、`bad_merged_two_final_reviewer_merges`（两条 merge 同人 ⇒ 各报一条）。
+- **历史豁免口径不变**：(e) 仍只看 `ts` ≥ 契约阈值的 review；`ok_merged_historical_review_by_merger`
+  样本钉住「契约前的 review 与合并同人不追溯」（把该门槛改成恒真，此样本即变红）。
+- **无新增误判**：全仓 1002 个 thread 在改动前后各跑一遍 `tools/check_review_cadence.sh`，
+  判红数 **4 → 4**，逐条回报一致（详见提交说明）。
 
 ### 常量推导（可复现）
 

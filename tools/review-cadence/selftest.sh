@@ -84,7 +84,8 @@ echo "── check_review_cadence 自测（contract-ts=${ts}；no-review-ts=${ts
 # ── 合规样本（rc=0）─────────────────────────────────────────────────────────
 for s in ok_basic ok_comment_exempt ok_comment_exempt_blocking ok_no_reviews ok_merge_resolved ok_historical_missing \
          ok_unknown_decision_historical ok_same_reviewer_multi_round ok_unverified_comment \
-         ok_historical_contract_mismatch ok_merged_with_independent_waiver ok_merged_before_no_review_ts; do
+         ok_historical_contract_mismatch ok_merged_with_independent_waiver ok_merged_before_no_review_ts \
+         ok_merged_historical_review_by_merger ok_merged_multi_merge_not_by_reviewer; do
   expect_rc "合规：$s" 0 "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 
@@ -104,7 +105,9 @@ for s in bad_missing_after_threshold bad_missing_at_threshold bad_label_mismatch
          bad_waiver_prose_mention bad_waiver_prose_refusal \
          bad_merged_with_merger_waiver bad_waiver_after_merge \
          bad_waiver_by_earlier_patch_author bad_waiver_unverified \
-         bad_waiver_before_no_review_ts bad_waiver_missing_actor; do
+         bad_waiver_before_no_review_ts bad_waiver_missing_actor \
+         bad_merged_backdated_merge_tail_hides_final_reviewer \
+         bad_merged_two_final_reviewer_merges; do
   expect_rc "违规：$s" 1 "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 
@@ -113,6 +116,15 @@ for pair in "ok_merged_before_no_review_ts 0" "bad_merged_two_violations 2" \
             "bad_merged_backdated_merge_tail 1" "bad_merged_grandfathered_then_violation 1"; do
   set -- $pair
   expect_violations "违规条数：$1" "$2" "$check" --json "$samples/$1.json" --contract-ts "$ts" --no-review-ts "$ts"
+done
+
+# ── 违规**条数**：判据 (e) 也是逐条 merge 判（abb-worker-78 的同类洞）──────────────
+#    只判某一条 merge ⇒ 一条 ts 回溯的尾部 merge 就能洗白「终审 = 合并者」。
+#    所以两个用例：回溯尾部那条**遮不住**真违规（仍 1 条），两条 merge 同人则**各报一条**（2 条）。
+for pair in "bad_merged_backdated_merge_tail_hides_final_reviewer 1" \
+            "bad_merged_two_final_reviewer_merges 2"; do
+  set -- $pair
+  expect_violations "(e) 违规条数：$1" "$2" "$check" --json "$samples/$1.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 
 # ── 违规**理由**：每条豁免失效必须报出对应原因，而不是笼统地变成“另一处坏了”───────
@@ -127,6 +139,9 @@ expect_msg "豁免未验签的报因" "签名验不过" \
   "$check" --json "$samples/bad_waiver_unverified.json" --contract-ts "$ts" --no-review-ts "$ts"
 expect_msg "豁免早于新规的报因" "早于无评审新规" \
   "$check" --json "$samples/bad_waiver_before_no_review_ts.json" --contract-ts "$ts" --no-review-ts "$ts"
+# (e) 的报因必须来自 (e) 本身：回溯尾部样本若因别的判据变红（如 (g)），这条断言就会失败。
+expect_msg "(e) 终审=合并者的报因" "终审不得与合并者同人" \
+  "$check" --json "$samples/bad_merged_backdated_merge_tail_hides_final_reviewer.json" --contract-ts "$ts" --no-review-ts "$ts"
 
 # ── 守卫自身失效模式 / 用法错误（rc=2）───────────────────────────────────────
 expect_rc "JSON 文件不存在" 2 "$check" --json "$samples/does-not-exist.json" --contract-ts "$ts"

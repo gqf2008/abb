@@ -216,16 +216,28 @@ def label_counts:
       # (e) 终审不得与合并者同人（§4）：已合并的 thread，最后一条判决类 review 与 merge_result 的 actor 必须不同。
       #     注意：同一个人多轮评审（request_changes → approve）是**合法**的，不在这里拦；只有
       #     “评审者又去合并”才是违规——这两件事极易混，样本里各有对应用例。
-      ( if ($merge_items | length) > 0 then
-          ( $reviews
-            | map(select(.ts >= $contract_ts
-                         and (.decision == "approve" or .decision == "request_changes"))) ) as $post2
-          | ($merge_items[-1]) as $m
-          | ( $post2 | final_judged )[] | . as $last
-          | if ($m.actor != null and $last.actor != null and $m.actor == $last.actor) then
-              "\($last.oid): 终审 review 与 merge_result(\($m.oid)) 同为 \($m.actor) ⇒ 终审不得与合并者同人（§4）"
-            else empty end
-        else empty end ),
+      #
+      #     **对每一条 merge_result{merged:true} 各判一次，不是只判某一条**（与 (g) 的 blocking-3
+      #     属同一类洞；本卡实现者在上一轮报告里自行指出，经协调者决定并入同卡）：`ts` 由客户端
+      #     在签名时写入、不是服务端盖章 ⇒ 只要判据挑定**数组里的某一条** merge，构造一条 ts
+      #     回溯的 merge（它排在数组末尾，`$merge_items[-1]` 恰好取到它）就能把整个 (e) 关掉。
+      #     实测（旧实现）：
+      #       approve(M) → merge(M, ts=1000200) → merge(X, ts=999000)，阈值 1000000
+      #       ⇒ 旧实现 rc=0（取到末尾那条 X，X ≠ M 故“不同人”），尽管终审 M 就是第一次合并的
+      #         执行者。删掉尾部那条则 rc=1。
+      #     样本 bad_merged_backdated_merge_tail_hides_final_reviewer 钉住这一条；每一条 merge
+      #     都与终审成对判定 ⇒ 多条同人 merge 各报一条违规（多报只更严，不更松）。
+      #     历史豁免口径不变：只有 ts ≥ $contract_ts 的 review 参与（与 (a) 同口径），样本
+      #     ok_merged_historical_review_by_merger 钉住「契约前的 review 与合并同人不追溯」。
+      #     空 $merge_items 的 `[]` 迭代是**零次** ⇒ 不需要 `if length > 0` 守卫（同 final_judged 的注释）。
+      ( ( $reviews
+          | map(select(.ts >= $contract_ts
+                       and (.decision == "approve" or .decision == "request_changes"))) ) as $post2
+        | $merge_items[] | . as $m
+        | ( $post2 | final_judged )[] | . as $last
+        | if ($m.actor != null and $last.actor != null and $m.actor == $last.actor) then
+            "\($last.oid): 终审 review 与 merge_result(\($m.oid)) 同为 \($m.actor) ⇒ 终审不得与合并者同人（§4）"
+          else empty end ),
 
       # (f) 签名未验签的**判决性**条目不得参与合并：patch / review / merge_result。
       #     为什么只算判决性条目：`comment` 上的未验签往往只是“写错身份重签”的记录，

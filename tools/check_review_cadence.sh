@@ -30,7 +30,9 @@
 #   (d) 独立评审（§0b）：最后一条判决类 review 的 actor 不得与本 thread 任何 patch 的
 #       actor 相同（自审就算签出合法 approve 也不算独立评审）。
 #   (e) 终审不得与合并者同人（§4）：已合并的 thread，最后一条判决类 review 的 actor 与
-#       merge_result 的 actor 必须不同。同一个人**多轮评审**是合法的，不在此拦。
+#       **每一条** merge_result{merged:true} 的 actor 都必须不同（**逐条 merge 判**：只挑某一条
+#       merge 时，一条 ts 回溯的尾部 merge 就能把本条洗白）。同一个人**多轮评审**是合法的，
+#       不在此拦。历史豁免口径与 (a) 同：(e) 只看 ts ≥ 契约阈值的 review。
 #   (f) 未验签（verified=false）的**判决性**条目（patch / review / merge_result）不得据以
 #       合并。`comment` 上的未验签不算：那通常是“写错身份后重签”的记录。
 #   (g) 合并于**无评审新规之后**却没有任何判决类 review ⇒ 判红。**逐条 merge 判**：每条
