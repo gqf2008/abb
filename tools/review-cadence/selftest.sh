@@ -81,6 +81,27 @@ expect_msg() {
 
 echo "── check_review_cadence 自测（contract-ts=${ts}；no-review-ts=${ts}）"
 
+# ── 前置：jq 程序必须能编译（变异/编辑把 jq 写崩时，下面的用例会集体「红」，
+#    看起来像覆盖良好，实际是语法炸 —— 2026-11-01 实测踩过：一次变异少写一个括号，
+#    jq 编译失败，输出「红 56 例」。rc=2（工具错误）与 rc=1（真违规）在 expect_rc
+#    眼里都是 FAIL，必须在这里先分开。 ──────────────────────────────────────
+preflight_ok=0
+if jq -n -f "$here/../review-cadence/check.jq" --argjson contract_ts "$ts" --argjson no_review_ts "$ts" >/dev/null 2>&1; then
+  preflight_ok=1
+else
+  out="$(jq -n -f "$here/../review-cadence/check.jq" --argjson contract_ts "$ts" --argjson no_review_ts "$ts" 2>&1)"
+fi
+if [ "$preflight_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo 'ok   (0) 前置：check.jq 可编译'
+else
+  fail=$((fail + 1))
+  echo 'FATAL check.jq 编译失败（下面所有用例的红绿都不可信）：'
+  printf '%s\n' "$out" | sed 's/^/     | /'
+  echo "── pass=$pass fail=$fail"
+  exit 1
+fi
+
 # ── 合规样本（rc=0）─────────────────────────────────────────────────────────
 for s in ok_basic ok_comment_exempt ok_comment_exempt_blocking ok_no_reviews ok_merge_resolved ok_historical_missing \
          ok_unknown_decision_historical ok_same_reviewer_multi_round ok_unverified_comment \

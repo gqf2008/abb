@@ -201,7 +201,7 @@ tools/check_review_cadence.sh --json tools/review-cadence/samples/ok_basic.json 
 
 退出码：`0` 通过；`1` 违规；`2` 用法/工具错误（缺 jq、thread 取不到、JSON 非法）。
 
-守卫自身的自测（合规 + 违规 + 守卫失效模式，共 63 例）随仓提交，并在
+守卫自身的自测（合规 + 违规 + 守卫失效模式，共 73 例）随仓提交，并在
 `.walgit/ci.toml` 的 `review-cadence-selftest` 任务里执行：
 
 ```sh
