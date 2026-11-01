@@ -1,0 +1,5 @@
+[{"entry":{"kind":"issue","id":"t","actor":"A","ts":1000000,"body":{}},"oid":"i1","principal":"A","verified":true},
+ {"entry":{"kind":"patch","id":"t","actor":"A","ts":1000100,"body":{}},"oid":"p1","principal":"A","verified":true},
+ {"entry":{"kind":"review","id":"t","actor":"R","ts":1000200,"body":{"decision":"request_changes","agent":"R","note":"findings: blocking=1 non-blocking=0"}},"oid":"r1","principal":"R","verified":true},
+ {"entry":{"kind":"merge_result","id":"t","actor":"M","ts":1000300,"body":{"merged":true,"oid":"abc"}},"oid":"m2","principal":"M","verified":true},
+ {"entry":{"kind":"review","id":"t","actor":"R","ts":1000500,"body":{"decision":"approve","agent":"R","note":"findings: blocking=0 non-blocking=0"}},"oid":"r2","principal":"R","verified":true}]

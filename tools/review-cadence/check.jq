@@ -115,7 +115,7 @@ def label_counts:
         labels: ((.e.body.note // "") | label_counts) } ] as $reviews
 # 结构性判据（§0b/§4）需要看“谁签的”：patch 作者、merge 执行者、以及每条 review 的 actor。
 | [ $items[] | select(.e.kind == "patch") | {oid, actor: (.e.actor // null), ts: (.e.ts // 0)} ] as $patches
-| [ $items[] | select(.e.kind == "merge_result" and (.e.body.merged == true)) | {oid, actor: (.e.actor // null), ts: (.e.ts // 0)} ] as $merge_items
+| [ $items[] | select(.e.kind == "merge_result" and (.e.body.merged == true)) | {oid, actor: (.e.actor // null), ts: (.e.ts // 0), idx} ] as $merge_items
 | [ $items[] | select(.e.kind == "merge_result" and (.e.body.merged == true)) | .idx ] as $merges
 | ($reviews | map(select(.decision != "comment" and .contract != null and .contract.blocking > 0)) | length) as $blocking_rounds
 # 历史自审（告警，不阻塞）：逐条比对该 review 之前的最新 patch。只用于 summary 上报，
@@ -312,23 +312,31 @@ def label_counts:
         | select(.ts >= $no_review_ts)
         | . as $m
         | ( [ $reviews[]
-              | select(.ts >= $contract_ts and .ts <= $m.ts
+              | select(.ts >= $contract_ts and .idx < $m.idx
                        and (.decision == "approve" or .decision == "request_changes")) ]
             | length ) as $judged_n
-        | if $judged_n > 0 then empty
+        | ( [ $reviews[]
+              | select(.ts >= $contract_ts and .idx < $m.idx
+                       and (.decision == "approve" or .decision == "request_changes")) ]
+            | last ) as $last_before
+        | if ($judged_n > 0
+              and $last_before != null
+              and $last_before.decision == "approve"
+              and ($last_before.contract == null or $last_before.contract.blocking == 0))
+          then empty
           else
             ( [ $items[]
                 | select(.e.kind == "comment"
                          and ((.e.body.waiver // null) == "no-independent-review"))
-                | { oid, actor: (.e.actor // null), ts: (.e.ts // 0), verified } ]
+                | { oid, actor: (.e.actor // null), ts: (.e.ts // 0), verified, idx } ]
               | map(. as $w
                     | { oid: $w.oid,
                         reasons: [
                           (if $w.ts < $no_review_ts then
                              "ts=\($w.ts) 早于无评审新规 ts=\($no_review_ts)"
                            else empty end),
-                          (if $w.ts > $m.ts then
-                             "ts=\($w.ts) 晚于本次合并 ts=\($m.ts)（不得事后补签）"
+                          (if $w.idx > $m.idx then
+                             "在账本里位于本次合并之后（idx=\($w.idx) > \($m.idx)）⇒ 不得事后补签"
                            else empty end),
                           (if $w.verified == false then
                              "签名验不过（verified=false）"
