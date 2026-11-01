@@ -1,6 +1,60 @@
 [
- {"entry":{"kind":"issue","id":"t","actor":"A","ts":1000000,"body":{}},"oid":"i1","principal":"A","verified":true},
- {"entry":{"kind":"patch","id":"t","actor":"A","ts":1000100,"body":{}},"oid":"p1","principal":"A","verified":true},
- {"entry":{"kind":"merge_result","id":"t","actor":"M","ts":1000300,"body":{"merged":true,"oid":"abc"}},"oid":"m1","principal":"M","verified":true},
- {"entry":{"kind":"merge_result","id":"t","actor":"M","ts":999000,"body":{"merged":true,"oid":"abc"}},"oid":"m2","principal":"M","verified":true}
+ {
+  "entry": {
+   "kind": "issue",
+   "id": "t",
+   "actor": "A",
+   "ts": 1000000,
+   "body": {},
+   "parent": ""
+  },
+  "oid": "i1",
+  "principal": "A",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "patch",
+   "id": "t",
+   "actor": "A",
+   "ts": 1000100,
+   "body": {},
+   "parent": "i1"
+  },
+  "oid": "p1",
+  "principal": "A",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "merge_result",
+   "id": "t",
+   "actor": "M",
+   "ts": 1000300,
+   "body": {
+    "merged": true,
+    "oid": "abc"
+   },
+   "parent": "p1"
+  },
+  "oid": "m1",
+  "principal": "M",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "merge_result",
+   "id": "t",
+   "actor": "M",
+   "ts": 999000,
+   "body": {
+    "merged": true,
+    "oid": "abc"
+   },
+   "parent": "m1"
+  },
+  "oid": "m2",
+  "principal": "M",
+  "verified": true
+ }
 ]

@@ -81,6 +81,25 @@ def final_judged:
 # 空数组的 `[]` 迭代是**零次** ⇒ 天然不产生违规，不需要额外判空。**别改成显式
 # `if length > 0` 分支**——那样平局组为空与组内多条两个边界都得各写一遍，容易写漏。
 
+# 从某条目的 parent 起沿父链走到 root，返回「祖先 oid 集合」（不含自身）。
+# 为什么用父链而不是数组位置（idx）：`walgit_wal::collab::thread()` 的聚合顺序是
+# **先按 (ts, actor, oid) 排序，再对 parent 尚未 emit 的条目延后**——它只延后、不提前。
+# 所以数组位置主要由**可伪造的 ts** 决定，不是写入顺序。实测攻击（真二进制+真签名）：
+#   issue ← patch ← { review(ts 更早, parent=patch),  merge(parent=patch) }
+# 聚合后数组是 issue,patch,review,merge ⇒ review 的 idx 小于 merge ⇒ 被判「合并前已评审」。
+# 父链则不可伪造：条目 oid 覆盖自身 ts/parent 的规范字节，merge 要引用 review 的 oid，
+# 就必须在 review 存在之后才签名 ⇒ 「谁在谁的因果链上」由密码学保证，不由客户端字段决定。
+# **环保护是承重的，不是防御性装饰**（第三轮评审 NB-4）：去掉 `.seen[.cur] == true`
+# 这一支后，喂一份自环/两元环输入会让 jq **永久挂起**（实测 4s 仍在跑），而门禁脚本
+# 本身没有超时 ⇒ 一次误改会把「红」变成「CI 无限挂」。变异 M-C 实测 83 例全绿（零覆盖，
+# 因为真路径上 oid 由 blob 内容派生、环不可构造），故单列注释说明它守的是什么。
+def ancestor_oids($by_oid; $oid):
+  { seen: {}, cur: (($by_oid[$oid].parent) // "") }
+  | until(.cur == "" or .seen[.cur] == true;
+      .seen[.cur] = true
+      | .cur = (($by_oid[.cur].parent) // ""))
+  | (.seen | keys);
+
 def label_counts:
   (. // "")
   | split("\n")
@@ -103,6 +122,9 @@ def label_counts:
 | [range(0; ($raw | length))
    | {idx: ., oid: $raw[.].oid, e: $raw[.].entry,
       verified: (if ($raw[.] | has("verified")) then $raw[.].verified else true end)}] as $items
+# oid → 条目，用于沿 parent 链回溯（判据 (g) 的「合并前评审」必须落在合并的祖先链上）。
+| ( reduce $items[] as $it ({}; .[$it.oid] = $it.e) ) as $by_oid
+
 | [ $items[]
     | select(.e.kind == "review")
     | { idx: .idx,
@@ -311,15 +333,47 @@ def label_counts:
       ( $merge_items[]
         | select(.ts >= $no_review_ts)
         | . as $m
+        | ( ancestor_oids($by_oid; $m.oid) ) as $anc
         | ( [ $reviews[]
-              | select(.ts >= $contract_ts and .idx < $m.idx
+              | select(.ts >= $contract_ts and (. as $r | ($anc | index($r.oid)) != null)
                        and (.decision == "approve" or .decision == "request_changes")) ]
             | length ) as $judged_n
         | ( [ $reviews[]
-              | select(.ts >= $contract_ts and .idx < $m.idx
+              | select(.ts >= $contract_ts and (. as $r | ($anc | index($r.oid)) != null)
                        and (.decision == "approve" or .decision == "request_changes")) ]
             | last ) as $last_before
-        | if ($judged_n > 0
+        # **完备性**，不只是存在性（第三轮评审 blocking-1）：`merge.parent` 由签名者**任选**、
+        # walgit 不校验（本仓 tools/check_collab_parents.sh 头注释即写明 `--parent` 不校验）。
+        # 所以「merge 选中的那条链上有没有干净 approve」仍是攻击者可以挑的 —— 只要把
+        # parent 指向前一个 approve、跳过真正的末条 review 即可。
+        # 实测 S1（只用合并者密钥，零伪造）：(g) 判绿，唯一挡路的是 ts 序的 (c)；
+        # 叠加 reviewer 侧 ts 伪造（S2：approve 前推 + rc 回溯）⇒ **整条门禁 rc=0**。
+        # 改成完备性：thread 里**每一条**判决类 review 都必须是该次 merge 的祖先
+        # （等价于「merge.parent 必须指向该 thread 当时的最新条目」）。这条不可挑 ——
+        # 想跳过任何一条 review，就得让它挂在别的分支上或成为第二个 root，而那样仍然判红。
+        # 语义：**凡声称早于本次合并的判决类 review，都必须在本次合并的祖先链上**。
+        # 用 `ts < $m.ts` 而不是 `ts >= $contract_ts`（第四轮评审 blocking-1）：
+        # 后者让「把 request_changes 的 ts 写到契约阈值之前」绕过整套判据 —— (a)~(g)
+        # 每一条的视野都钉在 ts>=契约 这个客户端自选的比较上，所以这条 rc 对全部判据
+        # 隐形（实测：skipped=0 judged=1）。换成 `ts < $m.ts` 后方向 fail-closed：
+        # 回溯 ts ⇒ 它声称早于合并 ⇒ **必须上链**（这是本判据实际堵住的）；**但仅此而已**：
+        # 上链之后它是否被 (g) 认成"合并前最后一条"，取决于 `$last_before`，而后者取的是
+        # 数组 `last`——数组序是 `thread()` 按 (ts,actor,oid) 排序的结果，回溯后它反而排到
+        # 前面，于是 `last` 取到的是那条 approve ⇒ **仍然判绿**（实测 D4 形状：
+        # `approve(ts=1000900) ← rc(ts=999999) ← merge(parent=rc)` ⇒ rc=0）。
+        # 所以本行只关掉 off-chain 那一半；**上链回溯是已知未修洞 D4**，登记在架构卡
+        # `abb-cadence-timing-axes-20261101`。前推 ts 则由 (c) 的 final_judged 逮住。
+        # 同时这个限定给「当时还不存在」的 review 留了豁免（第四轮评审 blocking-2，
+        # 真实账本 8 个多合并 thread 里 5 个含合并之后的 review，否则会大面积误红）。
+        | ( [ $reviews[]
+              | select(.ts < $m.ts
+                       and (.decision == "approve" or .decision == "request_changes")
+                       and (. as $r | ($anc | index($r.oid)) == null)) ] ) as $offchain
+        | if ($offchain | length) > 0 then
+            "\($m.oid): 合并（ts=\($m.ts)）的父链没有涵盖这些判决类 review："
+            + ([ $offchain[] | .oid ] | join(", "))
+            + " ⇒ merge.parent 必须指向该 thread 当时的最新条目（不得跳过前驱）"
+          elif ($judged_n > 0
               and $last_before != null
               and $last_before.decision == "approve"
               and ($last_before.contract == null or $last_before.contract.blocking == 0))
@@ -335,8 +389,8 @@ def label_counts:
                           (if $w.ts < $no_review_ts then
                              "ts=\($w.ts) 早于无评审新规 ts=\($no_review_ts)"
                            else empty end),
-                          (if $w.idx > $m.idx then
-                             "在账本里位于本次合并之后（idx=\($w.idx) > \($m.idx)）⇒ 不得事后补签"
+                          (if ($anc | index($w.oid)) == null then
+                             "不在本次合并的父链上（未在账本因果链上先于该合并）⇒ 不得事后补签"
                            else empty end),
                           (if $w.verified == false then
                              "签名验不过（verified=false）"
@@ -352,12 +406,20 @@ def label_counts:
             | ( [ $waivers[] | select((.reasons | length) == 0) ] | length ) as $good_n
             | if $good_n > 0 then empty
               elif ($waivers | length) > 0 then
-                "\($m.oid): 合并（ts=\($m.ts)）时该 thread 无任何判决类 review，且 review-waiver 条目不成立 ⇒ "
+                # 与 else 分支同口径（第四轮评审 NB-1 的另一半）：thread **可能**有判决类
+                # review，不能一律说「无任何」。
+                "\($m.oid): 合并（ts=\($m.ts)）时该 thread 有 \([ $reviews[] | select(.ts >= $contract_ts and (.decision == "approve" or .decision == "request_changes")) ] | length) 条判决类 review（其中在本次合并之前 \($judged_n) 条），但 review-waiver 条目不成立 ⇒ "
                 + ([ $waivers[] | "\(.oid): \(.reasons | join("；"))" ] | join(" / "))
                 + "（豁免须由独立第三方在 comment.body.waiver 显式声明）"
               else
-                "\($m.oid): 合并（ts=\($m.ts)）发生在无评审新规之后，但该 thread 没有任何判决类 review，"
-                + "也没有 review-waiver 条目（comment.body.waiver == \"no-independent-review\"）"
+                # 文案要分成因（第四轮评审 NB-1，连点两轮没修）：走到这里时 thread **可能**
+                # 有判决类 review，只是它们（a）在本次合并之后才发生，或（b）不在本次合并的
+                # 父链上，或（c）合并前最后一条不是 blocking=0 的 approve。原来一律写
+                # 「该 thread 没有任何判决类 review」是与事实相反的审计叙述。
+                "\($m.oid): 合并（ts=\($m.ts)）未经有效独立评审：本次合并之前"
+                + "没有落在其父链上的 blocking=0 approve（该 thread 判决类 review 共 \([ $reviews[] | select(.ts >= $contract_ts and (.decision == "approve" or .decision == "request_changes")) ] | length) 条，"
+                + "其中在本次合并之前的 \($judged_n) 条），"
+                + "且没有 review-waiver 条目（comment.body.waiver == \"no-independent-review\"）"
                 + " ⇒ 未经独立评审即合并"
               end
           end )

@@ -1,81 +1,86 @@
 [
-  {
-    "entry": {
-      "kind": "issue",
-      "id": "t",
-      "actor": "author",
-      "ts": 1000000,
-      "body": {
-        "title": "t",
-        "body": "b"
-      }
-    },
-    "oid": "i1",
-    "principal": "author",
-    "verified": true
+ {
+  "entry": {
+   "kind": "issue",
+   "id": "t",
+   "actor": "author",
+   "ts": 1000000,
+   "body": {
+    "title": "t",
+    "body": "b"
+   },
+   "parent": ""
   },
-  {
-    "entry": {
-      "kind": "patch",
-      "id": "t",
-      "actor": "abb-worker-9",
-      "ts": 1000100,
-      "body": {
-        "title": "fix",
-        "body": "x",
-        "state": "needs-review"
-      }
-    },
-    "oid": "p1",
-    "principal": "abb-worker-9",
-    "verified": true
+  "oid": "i1",
+  "principal": "author",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "patch",
+   "id": "t",
+   "actor": "abb-worker-9",
+   "ts": 1000100,
+   "body": {
+    "title": "fix",
+    "body": "x",
+    "state": "needs-review"
+   },
+   "parent": "i1"
   },
-  {
-    "entry": {
-      "kind": "review",
-      "id": "t",
-      "actor": "abb-reviewer-5",
-      "ts": 1000150,
-      "body": {
-        "decision": "approve",
-        "agent": "abb-reviewer-5",
-        "note": "findings: blocking=0 non-blocking=0\n"
-      }
-    },
-    "oid": "r1",
-    "principal": "abb-reviewer-5",
-    "verified": true
+  "oid": "p1",
+  "principal": "abb-worker-9",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "review",
+   "id": "t",
+   "actor": "abb-reviewer-5",
+   "ts": 1000150,
+   "body": {
+    "decision": "approve",
+    "agent": "abb-reviewer-5",
+    "note": "findings: blocking=0 non-blocking=0\n"
+   },
+   "parent": "p1"
   },
-  {
-    "entry": {
-      "kind": "merge_result",
-      "id": "t",
-      "actor": "abb-reviewer-5",
-      "ts": 1000200,
-      "body": {
-        "merged": true,
-        "oid": "abc",
-        "result": "merged"
-      }
-    },
-    "oid": "m1",
-    "principal": "abb-reviewer-5",
-    "verified": true
+  "oid": "r1",
+  "principal": "abb-reviewer-5",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "merge_result",
+   "id": "t",
+   "actor": "abb-reviewer-5",
+   "ts": 1000200,
+   "body": {
+    "merged": true,
+    "oid": "abc",
+    "result": "merged"
+   },
+   "parent": "r1"
   },
-  {
-    "entry": {
-      "kind": "merge_result",
-      "id": "t",
-      "actor": "abb-other",
-      "ts": 999000,
-      "body": {
-        "merged": true,
-        "oid": "def",
-        "result": "merged"
-      }
-    },
-    "oid": "m2",
-    "principal": "abb-other",
-    "verified": true
-  }
+  "oid": "m1",
+  "principal": "abb-reviewer-5",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "merge_result",
+   "id": "t",
+   "actor": "abb-other",
+   "ts": 999000,
+   "body": {
+    "merged": true,
+    "oid": "def",
+    "result": "merged"
+   },
+   "parent": "m1"
+  },
+  "oid": "m2",
+  "principal": "abb-other",
+  "verified": true
+ }
 ]

@@ -68,7 +68,18 @@ findings: blocking=1 non-blocking=2
 （2026-11-01 实测：该形状的样本曾判 `✅ 通过`）。
 
 **判据 (g)**：**每一条** `ts >= NO_REVIEW_TS` 的 `merge_result{merged:true}`，若该 thread
-没有任何（`ts >= 契约阈值` 的）`approve` / `request_changes` ⇒ 判红。
+没有任何（`ts >= 契约阈值` 的、且**落在该次合并父链上**的）判决类 review ⇒ 判红；
+或虽有、但**合并前最后一条不是 `blocking=0` 的 `approve`** ⇒ 也判红（覆盖「合并时仍是
+`request_changes`」「合并前那条 approve 自己带了 blocking」两种形态）。
+
+**用父链而不是 `ts`、也不是数组下标**（2026-11-01 第二轮评审的 blocking-1）：
+`ts` 由客户端签名时写入、可任意伪造；而数组下标也不可靠 ——
+`walgit_wal::collab::thread()` 的聚合顺序是「先按 `(ts, actor, oid)` 排序，再对 `parent`
+尚未 emit 的条目**延后**」，只延后不提前 ⇒ 位置主要由**可伪造的 `ts`** 决定。
+实测攻击（真二进制 + 真签名）：`issue ← patch ← { review(ts 更早, parent=patch),
+merge(parent=patch) }` ⇒ 聚合后 review 排在 merge 之前，被判「合并前已评审」。
+**父链不可伪造**：条目 oid 覆盖自身 `ts`/`parent` 的规范字节，`merge` 要引用 `review`
+的 oid 就必须在它存在之后才签名 ⇒ 「谁在谁的因果链上」由密码学保证。
 
 **逐条判，不是只看一条**：`ts` 由客户端在签名时写入、不是服务端盖章，所以只要判据挑
 「数组里的某一条」merge，构造一条 `ts` 回溯的 merge 就能把整条判据关掉——实测旧实现取
@@ -100,7 +111,7 @@ thread 里**多条违规各报一条**（`bad_merged_two_violations` 样本断�
    - `actor` 不得是本 thread **任何一份** `patch` 的作者（集合判定；只比「合并前最后一份
      patch」时，双 patch 的 thread 里更早那位作者仍可自签豁免）；
    - `actor` 不得是**该次合并的执行者**（合并者不得自签豁免）；
-   - `ts <= merge.ts`（不得事后补签）；
+   - `parent` 父链在该次合并之前（不得事后补签）；
    - `ts >= NO_REVIEW_TS`（新规之前写的评论不构成对本次降档的授权）；
    - `verified != false`（未验签的豁免不算数）；
    - `actor` 不得缺失（无主体的豁免无法追责）。
@@ -110,10 +121,10 @@ thread 里**多条违规各报一条**（`bad_merged_two_violations` 样本断�
 
 **向后兼容性（收紧的追溯影响）**：`body.waiver` 是本轮（评审 `abb-reviewer-171`）新引入的字段，
 此前的**散文写法一律不再算数**。实测（2026-11-01）全仓 `ts >= NO_REVIEW_TS` 的
-`merge_result{merged:true}` 为 **0** 条 ⇒ 这次收紧**没有追溯影响**，只对新合并生效；
+`merge_result{merged:true}` 为 **1** 条 ⇒ 这次收紧**没有追溯影响**，只对新合并生效；
 代价是此后的降档必须用结构化字段写（本文件即唯一口径）。
 
-**实测规模（2026-11-01，全仓 1001 个 thread）：**
+**实测规模（2026-11-01，全仓 1004 个 thread）：**
 
 | 口径 | 数量 |
 |---|---|
@@ -201,7 +212,7 @@ tools/check_review_cadence.sh --json tools/review-cadence/samples/ok_basic.json 
 
 退出码：`0` 通过；`1` 违规；`2` 用法/工具错误（缺 jq、thread 取不到、JSON 非法）。
 
-守卫自身的自测（合规 + 违规 + 守卫失效模式，共 73 例）随仓提交，并在
+守卫自身的自测（合规 + 违规 + 守卫失效模式，共 83 例）随仓提交，并在
 `.walgit/ci.toml` 的 `review-cadence-selftest` 任务里执行：
 
 ```sh

@@ -1,6 +1,60 @@
 [
- {"entry":{"kind":"issue","id":"t","actor":"A","ts":1000000,"body":{}},"oid":"i1","principal":"A","verified":true},
- {"entry":{"kind":"patch","id":"t","actor":"A","ts":1000100,"body":{}},"oid":"p1","principal":"A","verified":true},
- {"entry":{"kind":"comment","id":"t","actor":"X","ts":1000180,"body":{"author":"X","waiver":"no-independent-review"}},"oid":"w1","principal":"X","verified":false},
- {"entry":{"kind":"merge_result","id":"t","actor":"M","ts":1000200,"body":{"merged":true,"oid":"abc"}},"oid":"m1","principal":"M","verified":true}
+ {
+  "entry": {
+   "kind": "issue",
+   "id": "t",
+   "actor": "A",
+   "ts": 1000000,
+   "body": {},
+   "parent": ""
+  },
+  "oid": "i1",
+  "principal": "A",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "patch",
+   "id": "t",
+   "actor": "A",
+   "ts": 1000100,
+   "body": {},
+   "parent": "i1"
+  },
+  "oid": "p1",
+  "principal": "A",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "comment",
+   "id": "t",
+   "actor": "X",
+   "ts": 1000180,
+   "body": {
+    "author": "X",
+    "waiver": "no-independent-review"
+   },
+   "parent": "p1"
+  },
+  "oid": "w1",
+  "principal": "X",
+  "verified": false
+ },
+ {
+  "entry": {
+   "kind": "merge_result",
+   "id": "t",
+   "actor": "M",
+   "ts": 1000200,
+   "body": {
+    "merged": true,
+    "oid": "abc"
+   },
+   "parent": "w1"
+  },
+  "oid": "m1",
+  "principal": "M",
+  "verified": true
+ }
 ]

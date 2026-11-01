@@ -1,65 +1,69 @@
 [
-  {
-    "entry": {
-      "kind": "issue",
-      "id": "t",
-      "actor": "author",
-      "ts": 999000,
-      "body": {
-        "title": "t",
-        "body": "b"
-      }
-    },
-    "oid": "i1",
-    "principal": "author",
-    "verified": true
+ {
+  "entry": {
+   "kind": "issue",
+   "id": "t",
+   "actor": "author",
+   "ts": 999000,
+   "body": {
+    "title": "t",
+    "body": "b"
+   },
+   "parent": ""
   },
-  {
-    "entry": {
-      "kind": "patch",
-      "id": "t",
-      "actor": "abb-worker-9",
-      "ts": 999100,
-      "body": {
-        "title": "fix",
-        "body": "x",
-        "state": "merged"
-      }
-    },
-    "oid": "p1",
-    "principal": "abb-worker-9",
-    "verified": true
+  "oid": "i1",
+  "principal": "author",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "patch",
+   "id": "t",
+   "actor": "abb-worker-9",
+   "ts": 999100,
+   "body": {
+    "title": "fix",
+    "body": "x",
+    "state": "merged"
+   },
+   "parent": "i1"
   },
-  {
-    "entry": {
-      "kind": "review",
-      "id": "t",
-      "actor": "abb-reviewer-5",
-      "ts": 999200,
-      "body": {
-        "decision": "approve",
-        "agent": "abb-reviewer-5",
-        "note": "历史条目：契约行落地之前的 approve，缺 findings 契约行。"
-      }
-    },
-    "oid": "r1",
-    "principal": "abb-reviewer-5",
-    "verified": true
+  "oid": "p1",
+  "principal": "abb-worker-9",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "review",
+   "id": "t",
+   "actor": "abb-reviewer-5",
+   "ts": 999200,
+   "body": {
+    "decision": "approve",
+    "agent": "abb-reviewer-5",
+    "note": "历史条目：契约行落地之前的 approve，缺 findings 契约行。"
+   },
+   "parent": "p1"
   },
-  {
-    "entry": {
-      "kind": "merge_result",
-      "id": "t",
-      "actor": "abb-reviewer-5",
-      "ts": 999300,
-      "body": {
-        "merged": true,
-        "oid": "abc",
-        "result": "merged"
-      }
-    },
-    "oid": "m1",
-    "principal": "abb-reviewer-5",
-    "verified": true
-  }
+  "oid": "r1",
+  "principal": "abb-reviewer-5",
+  "verified": true
+ },
+ {
+  "entry": {
+   "kind": "merge_result",
+   "id": "t",
+   "actor": "abb-reviewer-5",
+   "ts": 999300,
+   "body": {
+    "merged": true,
+    "oid": "abc",
+    "result": "merged"
+   },
+   "parent": "r1"
+  },
+  "oid": "m1",
+  "principal": "abb-reviewer-5",
+  "verified": true
+ }
 ]
