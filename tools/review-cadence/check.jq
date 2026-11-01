@@ -351,8 +351,17 @@ def label_counts:
         # 改成完备性：thread 里**每一条**判决类 review 都必须是该次 merge 的祖先
         # （等价于「merge.parent 必须指向该 thread 当时的最新条目」）。这条不可挑 ——
         # 想跳过任何一条 review，就得让它挂在别的分支上或成为第二个 root，而那样仍然判红。
+        # 语义：**凡声称早于本次合并的判决类 review，都必须在本次合并的祖先链上**。
+        # 用 `ts < $m.ts` 而不是 `ts >= $contract_ts`（第四轮评审 blocking-1）：
+        # 后者让「把 request_changes 的 ts 写到契约阈值之前」绕过整套判据 —— (a)~(g)
+        # 每一条的视野都钉在 ts>=契约 这个客户端自选的比较上，所以这条 rc 对全部判据
+        # 隐形（实测：skipped=0 judged=1）。换成 `ts < $m.ts` 后方向 fail-closed：
+        # 回溯 ts ⇒ 它声称早于合并 ⇒ 必须在链上 ⇒ 上链后按链序它是末条 ⇒ (g) 红；
+        # 前推 ts ⇒ (c) 的 final_judged 立刻逮住。
+        # 同时这个限定给「当时还不存在」的 review 留了豁免（第四轮评审 blocking-2，
+        # 真实账本 8 个多合并 thread 里 5 个含合并之后的 review，否则会大面积误红）。
         | ( [ $reviews[]
-              | select(.ts >= $contract_ts
+              | select(.ts < $m.ts
                        and (.decision == "approve" or .decision == "request_changes")
                        and (. as $r | ($anc | index($r.oid)) == null)) ] ) as $offchain
         | if ($offchain | length) > 0 then
@@ -396,8 +405,14 @@ def label_counts:
                 + ([ $waivers[] | "\(.oid): \(.reasons | join("；"))" ] | join(" / "))
                 + "（豁免须由独立第三方在 comment.body.waiver 显式声明）"
               else
-                "\($m.oid): 合并（ts=\($m.ts)）发生在无评审新规之后，但该 thread 没有任何判决类 review，"
-                + "也没有 review-waiver 条目（comment.body.waiver == \"no-independent-review\"）"
+                # 文案要分成因（第四轮评审 NB-1，连点两轮没修）：走到这里时 thread **可能**
+                # 有判决类 review，只是它们（a）在本次合并之后才发生，或（b）不在本次合并的
+                # 父链上，或（c）合并前最后一条不是 blocking=0 的 approve。原来一律写
+                # 「该 thread 没有任何判决类 review」是与事实相反的审计叙述。
+                "\($m.oid): 合并（ts=\($m.ts)）未经有效独立评审：本次合并之前"
+                + "没有落在其父链上的 blocking=0 approve（该 thread 判决类 review 共 \([ $reviews[] | select(.ts >= $contract_ts and (.decision == "approve" or .decision == "request_changes")) ] | length) 条，"
+                + "其中在本次合并之前的 \($judged_n) 条），"
+                + "且没有 review-waiver 条目（comment.body.waiver == \"no-independent-review\"）"
                 + " ⇒ 未经独立评审即合并"
               end
           end )

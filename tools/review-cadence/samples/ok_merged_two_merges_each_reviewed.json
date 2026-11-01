@@ -1,0 +1,7 @@
+[{"entry":{"kind":"issue","id":"t","actor":"A","ts":1000000,"parent":"","body":{}},"oid":"i1","principal":"A","verified":true},
+ {"entry":{"kind":"patch","id":"t","actor":"A","ts":1000100,"parent":"i1","body":{}},"oid":"p1","principal":"A","verified":true},
+ {"entry":{"kind":"review","id":"t","actor":"R","ts":1000200,"parent":"p1","body":{"decision":"approve","agent":"R","note":"findings: blocking=0 non-blocking=0"}},"oid":"rA","principal":"R","verified":true},
+ {"entry":{"kind":"merge_result","id":"t","actor":"M","ts":1000300,"parent":"rA","body":{"merged":true,"oid":"abc"}},"oid":"m1","principal":"M","verified":true},
+ {"entry":{"kind":"patch","id":"t","actor":"A","ts":1000400,"parent":"m1","body":{}},"oid":"p2","principal":"A","verified":true},
+ {"entry":{"kind":"review","id":"t","actor":"R","ts":1000500,"parent":"p2","body":{"decision":"approve","agent":"R","note":"findings: blocking=0 non-blocking=0"}},"oid":"rB","principal":"R","verified":true},
+ {"entry":{"kind":"merge_result","id":"t","actor":"M","ts":1000600,"parent":"rB","body":{"merged":true,"oid":"def"}},"oid":"m2","principal":"M","verified":true}]

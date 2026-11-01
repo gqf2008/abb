@@ -108,7 +108,7 @@ for s in ok_basic ok_comment_exempt ok_comment_exempt_blocking ok_no_reviews ok_
          ok_historical_contract_mismatch ok_merged_with_independent_waiver ok_merged_before_no_review_ts \
          ok_merged_historical_review_by_merger ok_merged_multi_merge_not_by_reviewer \
          ok_merged_reviewed_before_merge ok_merged_blocking_then_fixed \
-         ok_merged_review_on_ancestor_chain; do
+         ok_merged_review_on_ancestor_chain ok_merged_two_merges_each_reviewed; do
   expect_rc "合规：$s" 0 "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 
@@ -130,6 +130,7 @@ for s in bad_missing_after_threshold bad_missing_at_threshold bad_label_mismatch
          bad_merged_review_second_root bad_waiver_forked_off_chain \
          bad_merged_before_uncontracted_blocking bad_merged_before_approved_with_blocking \
          bad_merged_parent_skips_review bad_merged_parent_skips_head_review \
+         bad_merged_backdated_review_offsets_chain \
          bad_waiver_prose_mention bad_waiver_prose_refusal \
          bad_merged_with_merger_waiver bad_waiver_after_merge \
          bad_waiver_by_earlier_patch_author bad_waiver_unverified \
