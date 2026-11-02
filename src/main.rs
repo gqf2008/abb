@@ -64,6 +64,7 @@ mod spawn_guard;
 mod svc_tasks;
 mod syschat;
 mod syschat_sched;
+mod syschat_share;
 mod task_identity;
 mod task_migrate;
 mod task_proc;
