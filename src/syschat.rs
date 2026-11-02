@@ -129,6 +129,31 @@ pub fn dir() -> PathBuf {
     crate::bridge_dir().join("syschat")
 }
 
+/// 读某会话的**全量**逐轮历史（供会话分享用；卡 `abb-syschat-share-session-20261102`）。
+///
+/// **全量，不裁**：`HISTORY_KEEP_TURNS` 只是「喂模型」的上界，磁盘文件才是真相。
+/// 分享若从界面模型反推，会静默少掉最早几轮——这是本卡的验收 3。
+///
+/// `None` = 会话不存在（调用方据此报「找不到会话」，而不是给一张空图）。
+pub fn read_all_turns(id: &str) -> Option<Vec<Turn>> {
+    let store = SessionStore::production();
+    let state = store.load();
+    if !state.sessions.iter().any(|s| s.id == id) {
+        return None;
+    }
+    Some(store.read_history(id))
+}
+
+/// 当前会话 id（分享按钮不带参时的目标）。
+pub fn current_session_id() -> Option<String> {
+    let state = SessionStore::production().load();
+    if state.current.is_empty() {
+        None
+    } else {
+        Some(state.current)
+    }
+}
+
 /// 会话元数据（`sessions.json` 条目）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionMeta {

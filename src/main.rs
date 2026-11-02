@@ -65,6 +65,7 @@ mod svc_tasks;
 mod syschat;
 mod syschat_sched;
 mod syschat_share;
+mod syschat_share_cli;
 mod task_identity;
 mod task_migrate;
 mod task_proc;
@@ -610,6 +611,13 @@ fn main() {
     // 本来就在拒绝之列。挂在 `$ABB_BIN` 下，授权面就是一处、可审、可单测。
     if args.len() >= 2 && args[1] == "chart" {
         std::process::exit(run_chart_cli(&args[2..]));
+    }
+
+    // 会话分享出图（卡 `abb-syschat-share-session-20261102`）。
+    // **必须走子进程**：它要装 Slint 软件后端，而 Slint 平台是每线程一次的——
+    // GUI 那条线程已被 winit 占住，就地渲染必失败。GUI 的分享按钮就是 spawn 这条命令。
+    if args.len() >= 2 && args[1] == "syschat-share" {
+        std::process::exit(syschat_share_cli::run(&args[2..]));
     }
 
     // 删除保护回收站 CLI（#88）：供 owner 手动恢复/清理（也可被桥 /trash 指令调用）。

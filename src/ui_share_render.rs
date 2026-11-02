@@ -148,10 +148,15 @@ pub(crate) fn render_share(share: &[ShareTurn], out: &Path) -> Result<ShareRende
     // 「MAX_HEIGHT − convo_h」反推 chrome 是**自成循环**的（实测把 truncated 误判成 true）。
     // 在 H0 上量一次得到「上 chrome」与「下 chrome」，两者都与内容高度无关：
     //   need_h = convo_y + 内容真实高度 + 下 chrome
-    const H0: u32 = 900;
-    ui.window().set_size(slint::PhysicalSize::new(w, H0));
+    // 参考高度取上限：**必须给足**，否则 `flick`（消息区）高不够，内容会被裁掉。
+    // 这里踩过一次：小样本（783px）看不出来，30 轮（16000px）时后面 15000px 全是空白。
+    let h_ref = MAX_HEIGHT;
+    ui.window().set_size(slint::PhysicalSize::new(w, h_ref));
     apply_syschat_layout(&ui, w as f32);
-    let _ = frame(&win, w, H0); // 让布局跑完一轮
+    // 消息区（`flick`）的高度由 Rust 写（`root.convo-h`）；默认只有 326px。
+    // **必须撑到可用空间**，否则超过 326px 的内容一律画不出来。
+    ui.set_convo_h(h_ref as f32);
+    let _ = frame(&win, w, h_ref); // 让布局跑完一轮
     let content_h = ui.get_dbg_col_h();
     if content_h <= 0.0 {
         return Err("布局报出的内容高度为 0，无法出图".to_string());
@@ -161,7 +166,7 @@ pub(crate) fn render_share(share: &[ShareTurn], out: &Path) -> Result<ShareRende
     // `dbg-col-h` 是内容真实高度（含 col 的 12px 上下 padding）。
     let convo_y = ui.get_dbg_flick_y().max(0.0);
     let convo_h = ui.get_dbg_flick_h().max(0.0);
-    let bottom_chrome = (H0 as f32 - convo_y - convo_h).max(0.0);
+    let bottom_chrome = (h_ref as f32 - convo_y - convo_h).max(0.0);
     let need_h = (convo_y + content_h + bottom_chrome).ceil() as u32;
     let final_h = need_h.clamp(1, MAX_HEIGHT);
     let truncated = need_h > MAX_HEIGHT;
@@ -169,6 +174,7 @@ pub(crate) fn render_share(share: &[ShareTurn], out: &Path) -> Result<ShareRende
     // 第二趟：按确定的高度重排一次，出图。
     ui.window().set_size(slint::PhysicalSize::new(w, final_h));
     apply_syschat_layout(&ui, w as f32);
+    ui.set_convo_h(final_h as f32);
     let f = frame(&win, w, final_h);
 
     // 裁出消息区：y 从 convo_y 开始，高 = min(内容高, 可用高)。
@@ -448,6 +454,59 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = r;
+    }
+
+    /// 长会话**必须整段画进图里**，不能只有开头一段有墨迹。
+    ///
+    /// **回归守卫（真出过一次）**：`flick`（消息区）高由 `root.convo-h` 写，默认只有
+    /// 326px。不显式撑开时，**超过 326px 的内容一律画不出来**——30 轮那次的图是
+    /// 16602px 高，但第一屏之后 16000px 全是空白。
+    ///
+    /// 为什么之前的守卫没抓住：小样本（783px）刚好没超过夹取线。**大样本才暴露的问题
+    /// 必须用大样本守**，所以这条按 30 轮造。
+    #[test]
+    fn long_session_has_ink_all_the_way_down() {
+        let _home = TempHome::new("inkdown");
+        let dir = std::env::temp_dir().join(format!("abb-share-inkdown-{}", std::process::id()));
+        let out = dir.join("inkdown.png");
+        let md = "## 结论\n\n正文一段。\n\n| a | b |\n|--|--|\n| 1 | 2 |\n";
+        let turns: Vec<Turn> = (0..30).map(|_| turn("assistant", md)).collect();
+        let share = crate::syschat_share::share_blocks(&turns);
+        let r = render_share(&share, &out).expect("出图失败");
+        let img = image::open(&out).expect("解不开 PNG").to_rgba8();
+        let (w, h) = (img.width(), img.height());
+        assert!(
+            h > 3000,
+            "30 轮每轮约 200px，图高应远超 3000px（默认 convo-h=326px 的 10 倍），实际 {h}"
+        );
+
+        // 把图纵向切成 6 段，**每一段都必须有墨迹**。
+        // 只查首尾不够：中间空掉同样是"内容丢了"。
+        let ink_in = |y0: u32, y1: u32| -> u32 {
+            let mut n = 0;
+            for y in y0..y1.min(h) {
+                for x in 0..w {
+                    let p = img.get_pixel(x, y).0;
+                    if p[0] < 200 || p[1] < 200 || p[2] < 200 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let seg = h / 6;
+        for i in 0..6 {
+            let n = ink_in(i * seg, (i + 1) * seg);
+            assert!(
+                n > 100,
+                "第 {}/6 段（y {}..{}）只有 {n} 个墨点 ⇒ 该段内容没被画出来",
+                i + 1,
+                i * seg,
+                (i + 1) * seg
+            );
+        }
+        assert!(!r.truncated, "30 轮不该触发上限");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
