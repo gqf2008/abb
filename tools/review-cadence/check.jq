@@ -352,10 +352,31 @@ def label_counts:
       # 「这轮拍了 N 个、问了 0 个」——异常可见就够了，不制造误红。
       #
       # 历史条目无此字段：只对 `ts >= $contract_ts` 的 patch 判，不追溯。
+      #
+      # **错记账可被后续 patch 显式修正**（问过 Jev：`all_but_allow_correction`
+      # p=0.69 / conf=0.53——**它自己也不确定**；同时 `risk=high` p=0.71，
+      # 即「用后续条目洗白」的风险被它判为高）。
+      #
+      # 为什么必须有这条：账本 append-only，一条早期 patch 把该项记成 `self_decided`
+      # 之后**改不回来**；若照旧永久判红，作者只剩两条路——弃卡，或改账本（禁止）。
+      # 实测就卡在 `abb-mcp-bus-s2d`：早期 patch 把「重连封顶/放弃阈值」记成自决，
+      # 后来按纪律问了 Jev、改了参数、在新 patch 里记成 asked，旧条目仍永久红。
+      #
+      # 防「静默洗白」的做法：修正必须**显式指名**被修正的 patch oid
+      # （`asked[].corrects == "<oid>"`），且被点名的 oid 必须**真是一条更早的 patch**。
+      # 于是"修正"是一次公开指认，不是悄悄放过。
+      ( [ $items[] | select(.e.kind == "patch") ] | map({
+          oid: .oid,
+          ts: (.e.ts // 0),
+          corrects: [ .e.body.decisions.asked[]? | .corrects // empty ]
+        }) ) as $all_patches |
       ( $items[]
         | select(.e.kind == "patch" and (.e.ts // 0) >= $contract_ts)
         | .e.body.decisions as $d
         | select($d != null)
+        # 绑定当前 patch 的身份：下面遍历 `$self[]` 时 `.` 会变成数组元素，
+        # 拿不到 oid/ts。不绑的话「修正豁免」永远不生效（且不报错）。
+        | . as $p
         | if ($d | type) != "object" then
             "\(.oid): decisions 必须是对象（{asked:[…], self_decided:[…]}）"
           else
@@ -381,6 +402,15 @@ def label_counts:
                     | gsub("(不是|并非|而非|而不是|不涉及|不属于|非)"
                            + "(默认值|阈值|上限|界面文案|UI ?文案|用户文案|用户看到|产品决定|按惯例)"; "")
                     | test($t_signal)
+                  )
+                # 被**更早更晚**的 patch 显式 `corrects` 指名 ⇒ 视为已修正，不判红。
+                # 条件写全（更晚 + 指向更早）是为了「不能用未来的条目修过去的」同时
+                # 也不允许「用更早的条目修更晚的」。
+                | select(
+                    ( [ $all_patches[]
+                        | select(.ts > ($p.e.ts // 0))
+                        | .corrects[] ]
+                      | any(. == ($p.oid // "")) ) | not
                   )
                 | "\(.what // "?"): 这一项命中了触发清单（T1–T4 的信号词）却记成 self_decided"
                   + " ⇒ 应先问 Jev 再落；口径见 docs/decision-defaults.md" ),

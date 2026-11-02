@@ -195,13 +195,14 @@ esac
 # 所以两条并排钉住**收窄后仍有效**：改界面文案 ⇒ 红；改跳过提示 ⇒ 绿。
 for s in bad_decisions_fake_rid bad_decisions_self_decided_crosses_trigger \
          bad_decisions_low_confidence_not_stated bad_decisions_ui_wording \
-         bad_decisions_affirmative_mention; do
+         bad_decisions_affirmative_mention bad_decisions_corrects_itself; do
   expect_rc "(h) 违规：$s" 1 \
     "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 for s in ok_decisions_self_decided_technical_only \
          ok_decisions_asked_with_low_confidence_stated ok_decisions_absent \
-         ok_decisions_debug_output_wording ok_decisions_negated_mention; do
+         ok_decisions_debug_output_wording ok_decisions_negated_mention \
+         ok_decisions_corrected_by_later_patch; do
   expect_rc "(h) 合规：$s" 0 \
     "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
