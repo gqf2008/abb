@@ -288,12 +288,16 @@ scan_self_test() {
   # ── 陈旧数据防护：MCP 发布不写本地 refs，本守卫读本地 refs ────────────────
   # 临时仓没有 origin ⇒ 同步必失败 ⇒ 必须 fail-closed（exit 2），不许拿陈旧 refs
   # 判「全部合规」（card abb-d68-local-commands-20261102）。
-  local nfstatus dstatus
-  bash "$tmp/tools/check_collab_parents.sh" >/dev/null 2>&1; nfstatus=$?
-  if [ "$nfstatus" -eq 2 ]; then
+  local nfstatus dstatus nfout
+  # 断言必须同时看**退出码**与**输出**：只看 rc=2 不够——变异成「同步失败也继续扫」后，
+  # 脚本会打出「✅ 所有 parent 引用合规」然后 rc=0；但若用例本身落在别的失败分支上，
+  # 单看 rc 可能仍是 2 而掩盖逃逸（变异自测工具 M6 就是这样发现这条断言不够强的）。
+  nfout=$(bash "$tmp/tools/check_collab_parents.sh" 2>&1); nfstatus=$?
+  if [ "$nfstatus" -eq 2 ] && ! printf '%s' "$nfout" | grep -q '所有 parent 引用合规'; then
     echo "  ✅ 无 origin 时同步失败 ⇒ exit 2（不许用陈旧 refs 判合规）"
   else
     echo "  ❌ 无 origin 时没有 fail-closed（exit=${nfstatus}）"
+    printf '%s\n' "$nfout" | tail -3 | sed 's/^/       | /'
     bad=1
   fi
   # 显式 --no-fetch 必须能降级（否则离线/自测场景不可用）
