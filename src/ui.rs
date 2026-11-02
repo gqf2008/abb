@@ -10694,6 +10694,13 @@ async fn run_wx_login(idx: i32, bot_key: &str, tx: std_mpsc::Sender<WxEvt>) {
 #[path = "ui_headless_render_test.rs"]
 mod headless_render;
 
+/// 会话分享的渲染层（卡 `abb-syschat-share-session-20261102`）。
+///
+/// **不是**测试模块：它由 `syschat-share` 子命令在**独立子进程**里调用。
+/// 之所以要子进程，见模块头「为什么必须在子进程里跑」——Slint 平台是每线程一次的。
+#[path = "ui_share_render.rs"]
+pub(crate) mod share_render;
+
 #[cfg(test)]
 mod tests {
 
