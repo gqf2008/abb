@@ -221,5 +221,24 @@ expect_rc "--no-fetch 显式降级后可离线判定" 0 \
   env PATH="$shim3:$PATH" sh -c "cd '$stale' && \"$check\" some-thread --no-fetch --contract-ts '$ts' --no-review-ts '$ts'"
 rm -rf "$stale" "$shim3"
 
+# 「判定依据」必须自报状态：同步过与拿陈旧 refs 不能长得一样。否则协调者合并前
+# 加 --no-fetch 就能让守卫给自己开绿灯，而输出里看不出差别（同一个毛病：
+# abb-coordinator-bypassed-merge-gate-20261101）。
+shim4="$(mktemp -d)"
+printf '#!/bin/sh\necho "[]"\n' > "$shim4/walgit"
+chmod +x "$shim4/walgit"
+out_nofetch="$(env ABB_CADENCE_SKIP_FETCH=1 PATH="$shim4:$PATH" "$check" some-thread --contract-ts "$ts" --no-review-ts "$ts" 2>&1)"
+if printf '%s' "$out_nofetch" | grep -q '未同步'; then
+  pass=$((pass + 1)); echo 'ok   (0) 未同步时输出必须自报「未同步」（不许与同步过长得一样）'
+else
+  fail=$((fail + 1)); echo 'FAIL 未同步时输出没有自报状态，--no-fetch 可静默降级'
+fi
+if printf '%s' "$out_nofetch" | grep -q '✅ 通过'; then
+  fail=$((fail + 1)); echo 'FAIL 未同步仍打干净的 ✅ 通过（应打带警示的通过）'
+else
+  pass=$((pass + 1)); echo 'ok   (0) 未同步时不得打干净的 ✅ 通过'
+fi
+rm -rf "$shim4"
+
 echo "── pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

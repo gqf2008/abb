@@ -143,6 +143,7 @@ else
   # 评审者若按新接口用 MCP 发布 `request_changes`，这里会看不到它而判绿。
   # 因此默认先同步 `refs/collab/*`；同步不了就 fail-closed（宁可红，不可假绿）。
   # `--no-fetch` 或 `ABB_CADENCE_SKIP_FETCH=1` 跳过（离线/自测），跳过是**降级为 best-effort**。
+  fetched=0
   if [ "$skip_fetch" != "1" ]; then
     if ! git fetch --quiet origin \
         'refs/collab/inbox/*:refs/collab/inbox/*' \
@@ -153,6 +154,7 @@ else
       rm -f "$tmp.err"
       exit 2
     fi
+    fetched=1
   fi
   # D68：本地子命令默认关闭，脚本必须显式声明这是本地读取（见脚本头注释）。
   if ! WALGIT_LOCAL_COMMANDS=1 walgit collab thread "$thread_id" > "$tmp" 2>"$tmp.err"; then
@@ -178,7 +180,18 @@ if ! result="$(jq -f "$jq_program" --argjson contract_ts "$contract_ts" --argjso
   exit 2
 fi
 
+# 判定依据必须自报：「同步过」与「拿陈旧 refs」不能长得一样，否则协调者合并前
+# 加 --no-fetch 就能让守卫给自己开绿灯，而账本里看不出差别（card
+# abb-coordinator-bypassed-merge-gate-20261101 的同一个毛病）。
+if [ -n "$json_input" ]; then
+  basis="外部 JSON（离线输入）"
+elif [ "${fetched:-0}" = "1" ]; then
+  basis="已同步 refs/collab/*"
+else
+  basis="⚠ 未同步（陈旧本地 refs，best-effort）"
+fi
 echo "── review cadence：${thread_id:-<json>}（契约阈值 ts=${contract_ts}；无评审新规 ts=${no_review_ts}）"
+echo "   判定依据：${basis}"
 echo "$result" | jq -r '
   "review 条目 \(.summary.reviews) 条（其中判决类 \(.summary.judged_reviews) 条）；"
   + "blocking 轮数 \(.summary.blocking_rounds)；"
@@ -189,4 +202,8 @@ if [ -n "$violations" ]; then
   echo "$violations" | sed 's/^/  - /'
   exit 1
 fi
-echo "✅ 通过"
+if [ "${fetched:-0}" = "1" ] || [ -n "$json_input" ]; then
+  echo "✅ 通过"
+else
+  echo "⚠️ 通过（未同步：MCP 发布不写本地 refs，此结果 best-effort，不构成假绿防护）"
+fi
