@@ -163,6 +163,10 @@ echo "== ABB 门禁：crates/abb-chart（独立包，中间产物外置于 ${cha
 echo "== ABB 门禁：协作闸门自测（不联网、不编译）=="
 tools/review-cadence/selftest.sh
 tools/check_collab_parents.sh --self-test
+# 架构文档防腐：docs/architecture.md 里的规模数字与结构断言必须与代码一致。
+# 不加这条的话，图会烂成「看着对、其实早不是这样」——而人不会主动去核数字。
+# 它不联网、不编译，只读行数与几个符号，毫秒级。
+tools/arch-check.sh
 # 变异自测：证明上面那些自测**真的能咬住回归**（评审 B3 的教训——手工变异逃逸过两次）。
 # 它在临时副本里改代码、跑自测、销毁，主检出不受影响。
 tools/review-cadence/mutation-selftest.sh
