@@ -4184,6 +4184,71 @@ fn crop(f: &Frame, x: u32, y: u32, w: u32, h: u32) -> Frame {
     Frame { buf, w, h }
 }
 
+/// 分享按钮的 `📤` 在系统 UI 字体链下**真出字形**吗（卡 `abb-syschat-share-session-20261102`）。
+///
+/// 为什么要这条：v14 的教训是 `⧉`(U+29C9) / `⟳`(U+27F3) 在真机画成方框，被换成了 emoji。
+/// 分享按钮同样只能靠渲染看得见——「按钮存在」证明不了「字形存在」。
+///
+/// 判据用**对照**：同一行高下，`📤` 的墨迹量不得比已确认可用的 `📋` 少太多。
+/// 只断言「墨迹 > 0」不够——豆腐块（缺字形方框）本身也有墨。
+///
+/// ⚠️ 这条是**近似判据**，不是字形归属证明：headless 帮我们排除「整块空/明显是空框」，
+/// 真机确认仍列在卡的验收 1（写进本注释是为了不让后人误以为它替代了真机）。
+#[test]
+fn share_icon_renders_actual_glyphs_not_tofu() {
+    // **不能复用 `glyph_ink_probe`**：它用 `is_dark`（RGB 和 < 300）判墨迹，
+    // 而 emoji 是**彩色**的——📤/📋 这类浅色 emoji 实测两边都是 0（第一版就这么红的）。
+    // 所以这里自己数「非背景像素」：背景是面板白，任何着色都算墨。
+    let ink = |ch: char| -> usize {
+        let (ui, win, _m) = setup(vec![row("p", &ch.to_string())], SHORT_H);
+        let _ = settle_w(&win, W, SHORT_H);
+        let f = settle_w(&win, W, SHORT_H);
+        let y0 = ui.get_dbg_flick_y().round().max(0.0) as u32;
+        let h = ui.get_dbg_flick_h().round().max(0.0) as u32;
+        let mut n = 0;
+        for y in y0..(y0 + h).min(f.h) {
+            for x in 4..W - 4 {
+                let p = f.px(x, y);
+                // 非背景 = 不是纯白（面板底）也不是全透明
+                let colored = p.alpha > 0 && !(p.red >= 250 && p.green >= 250 && p.blue >= 250);
+                if colored {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+
+    // 三组对照，判据是**填充面积**：
+    //   私用区码点（U+E123）必然没有字形 ⇒ 画成空心框/替换框，墨量小；
+    //   真 emoji 是实心彩色块，墨量大。
+    let tofu = ink('\u{E123}');
+    let known_good = ink('📋');
+    let share = ink('📤');
+
+    // **环境前置**：本 headless 台**没有加载 emoji 字体**（实测 ASCII 'A' 有 49 个墨点，
+    // 而 📋/📤/私用区码点全是 0 —— emoji 被静默不画）。
+    // 所以在这个环境里无论怎么断言都判不出「字形在不在」，只能显式 `[skip]` 并说清原因，
+    // 而不是假装测过了（那正是本仓反复踩的「跳过式断言当验证」）。
+    if known_good == 0 {
+        println!(
+            "[skip] 分享按钮字形探针：本 headless 台无 emoji 字体（📋 也是 0 墨点）⇒ \
+             判不出字形存在性；这条只能在真机确认（见卡 abb-syschat-share-session-20261102 验收 1）"
+        );
+        return;
+    }
+
+    assert!(
+        known_good > tofu,
+        "对照组失效：📋（{known_good}）不比私用区豆腐块（{tofu}）墨多 ⇒ 本环境判不出填充面积"
+    );
+    // 只要求「明显多于豆腐块」：给 1.0 倍容差（大于空框的描边即可）。
+    assert!(
+        share > tofu,
+        "📤（{share}）不多于私用区豆腐块（{tofu}）⇒ 疑似画成豆腐块"
+    );
+}
+
 /// 用**真实会话里那张表**（owner 反馈「表格渲染不对」的原文本）验解析与渲染。
 #[test]
 #[ignore = "出图/定性用；默认不跑"]
