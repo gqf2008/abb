@@ -187,5 +187,23 @@ chmod +x "$shim/walgit"
 expect_rc "thread 取不到（walgit 非零 ⇒ rc=2）" 2 env PATH="$shim:$PATH" "$check" some-nonexistent-thread
 rm -rf "$shim"
 
+# D68 回归：walgit 把本地子命令关在 `WALGIT_LOCAL_COMMANDS=1` 后面（对外面是 MCP `/mcp`），
+# 而门禁脚本读的是本检出的 refs、不该去要 MCP 的 token。裸调会在任何机器上直接 rc=2，
+# 且上面那条 shim 用例看不出区别（shim 总是 exit 1）——所以这里用一个会**记录自己看到的
+# 环境**的 shim：只要脚本没带这个变量，就明显变红并指出原因。
+shim2="$(mktemp -d)"
+cat > "$shim2/walgit" <<'SHIM'
+#!/bin/sh
+if [ "${WALGIT_LOCAL_COMMANDS:-}" != "1" ]; then
+  echo "shim: WALGIT_LOCAL_COMMANDS not set — 门禁脚本裸调了 walgit collab（D68 会拒）" >&2
+  exit 9
+fi
+echo '[]'
+SHIM
+chmod +x "$shim2/walgit"
+expect_rc "D68：门禁脚本必须带 WALGIT_LOCAL_COMMANDS=1 调 walgit" 0 \
+  env PATH="$shim2:$PATH" "$check" some-thread --contract-ts "$ts" --no-review-ts "$ts"
+rm -rf "$shim2"
+
 echo "── pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

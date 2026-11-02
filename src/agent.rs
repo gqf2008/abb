@@ -274,12 +274,17 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 命令形态（下面的 `$WALGIT` 指**探测到的 walgit 可执行路径**；`--parent` 必须取上一条命令
 返回的 oid；中文 body 用 python3 生成 JSON 再 `--body \"$(cat f)\"`，别在 shell 里手写转义）：
 
+> **D68：`walgit collab` / `walgit ci` 本地子命令默认拒执行**，对外协作面是 MCP `/mcp`
+> （`collab_board` / `collab_thread` / `collab_report` / `collab_publish` / `ci_status` + 资源订阅）。
+> 它们还能本地跑，但**必须显式带 `WALGIT_LOCAL_COMMANDS=1`**——这是 walgit 给脚本/运维留的门。
+> 记账仍要签名，而 MCP 从**不**代签（`collab_publish` 只收已签好的条目），所以本地签名这步用 CLI：
+
 ```sh
-\"$WALGIT\" --config ~/.walgit/walgit.toml collab entry --kind patch --id <线程> \
+WALGIT_LOCAL_COMMANDS=1 \"$WALGIT\" --config ~/.walgit/walgit.toml collab entry --kind patch --id <线程> \
     --actor <你的 principal> --parent <上一条 oid> --body \"$(cat body.json)\" \
     --base refs/heads/main --head refs/heads/<branch> \
   --push origin
-# 身份：每个 worktree 一个 principal（`walgit collab join --principal <proj>-<role>-N --push origin`
+# 身份：每个 worktree 一个 principal（`WALGIT_LOCAL_COMMANDS=1 walgit collab join --principal <proj>-<role>-N --push origin`
 # 生成密钥到该 worktree 的 git dir，不共享、不代签）；有本地身份后 --actor/--key 自动解析。
 ```
 
@@ -296,7 +301,8 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
    （本机 PATH 通常已含 `~/.local/bin`，别假设）。三个都没有 → **明确告诉用户「本机没有 walgit CLI，
    无法记账」**，把要记的内容留成文本，别假装记了。
 2. 仓库 `origin` 必须是本机 walgit（`git remote -v` 里能看到 `127.0.0.1:8081`），否则条目推不上去。
-3. 查状态：`\"$WALGIT\" collab board`（看板）、`collab thread <id>`（单线程）、`collab report`（总览）。
+3. 查状态：`WALGIT_LOCAL_COMMANDS=1 \"$WALGIT\" collab board`（看板）、`collab thread <id>`（单线程）、
+   `collab report`（总览）。不带 `WALGIT_LOCAL_COMMANDS=1` 会被 D68 直接拒。
 
 **受限（授权者）会话里用不了**：白名单里**没有 walgit**（实测 `walgit --version` 直接 deny）。
 白名单只放行 `$ABB_BIN` 的少数子命令（`job add` / `task add` / `session reset` / `deliver`；其中
@@ -1403,12 +1409,23 @@ mod tests {
                     && text.contains("必须取上一条命令")
                     && text.contains("谁签什么")
                     && text.contains("request_changes")
-                    && text.contains("walgit collab join"),
+                    && text.contains("WALGIT_LOCAL_COMMANDS=1 walgit collab join"),
                 "{name} 缺 walgit 协作契约"
             );
             assert!(
                 text.contains("command -v walgit") && text.contains("无法记账"),
                 "{name} 缺 walgit 可达性探测"
+            );
+            // D68：提示词里每条 `walgit collab` 都得能被真跑起来。walgit 把本地子命令
+            // 关在 `WALGIT_LOCAL_COMMANDS=1` 后面（对外面是 MCP），裸调会直接被拒。
+            // 断言钉在**命令形态**上（`WALGIT_LOCAL_COMMANDS=1 "$WALGIT"` 与 join 命令），
+            // 不是「全文出现过就算」：光在解说里提一句并不让 agent 的命令跑起来。
+            // 也正因如此，`walgit collab join` 这个旧断言换成带 env 的形式。
+            assert!(
+                text.contains("WALGIT_LOCAL_COMMANDS=1 \"$WALGIT\" --config")
+                    && text.contains("WALGIT_LOCAL_COMMANDS=1 walgit collab join")
+                    && text.contains("collab entry"),
+                "{name} 缺 walgit 的本地命令门（D68：WALGIT_LOCAL_COMMANDS=1 未进命令形态）"
             );
             assert!(
                 text.contains("受限（授权者）会话里用不了"),

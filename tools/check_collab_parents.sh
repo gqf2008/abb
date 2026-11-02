@@ -480,9 +480,12 @@ print(json.dumps({"bad": [{"entry": r[0], "reason": r[1], "parent": r[2]} for r 
      · 未来的写入必须先校验。
 
    写入前的正确做法（本仓已发生 ≥4 次同类事故）：
-     oid=$(walgit collab thread <id> | jq -r '.[-1].oid')   # 取完整 oid，别抄前缀
+     oid=$(WALGIT_LOCAL_COMMANDS=1 walgit collab thread <id> | jq -r '.[-1].oid')   # 取完整 oid，别抄前缀
      git cat-file -t "$oid"                                  # 确认存在
-     walgit collab entry ... --parent "$oid"
+     WALGIT_LOCAL_COMMANDS=1 walgit collab entry ... --parent "$oid"
+
+   （D68 起 `walgit collab` 默认拒执行，对外面是 MCP `/mcp`；本地读写要显式带
+    `WALGIT_LOCAL_COMMANDS=1`，这是 walgit 为脚本保留的门。）
 
    自测：tools/check_collab_parents.sh --self-test
 MSG

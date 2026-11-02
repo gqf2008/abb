@@ -8,6 +8,11 @@
 #   tools/check_review_cadence.sh <thread-id>          # 跑 `walgit collab thread <id>`
 #   tools/check_review_cadence.sh --json <file|->      # 离线：直接喂 thread JSON（自测/样本）
 #
+# 注：walgit D68 起 `walgit collab` 不再是协作的对外接口（对外面是 MCP `/mcp`），
+# 本地子命令默认拒绝执行；本脚本是**合并前的本地闸**，读的是本检出里的 refs、
+# 不该为了它去要 MCP 的 token 与网络，因此显式走 walgit 保留的本地门
+# `WALGIT_LOCAL_COMMANDS=1`（walgit 自己的文案即「survives for scripts and emergencies」）。
+#
 # 选项
 #   --contract-ts <epoch>   契约落地时间阈值（秒）。缺省取 env ABB_REVIEW_CONTRACT_TS，
 #                           再缺省取本脚本内常量（见下）。ts 小于该值的 review 视为**契约前**
@@ -124,8 +129,9 @@ if [ -n "$json_input" ]; then
     cp "$json_input" "$tmp"
   fi
 else
-  if ! walgit collab thread "$thread_id" > "$tmp" 2>"$tmp.err"; then
-    echo "❌ 取不到 thread '$thread_id'（walgit collab thread 非零退出）：" >&2
+  # D68：本地子命令默认关闭，脚本必须显式声明这是本地读取（见脚本头注释）。
+  if ! WALGIT_LOCAL_COMMANDS=1 walgit collab thread "$thread_id" > "$tmp" 2>"$tmp.err"; then
+    echo "❌ 取不到 thread '$thread_id'（WALGIT_LOCAL_COMMANDS=1 walgit collab thread 非零退出）：" >&2
     cat "$tmp.err" >&2 || true
     rm -f "$tmp.err"
     exit 2

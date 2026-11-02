@@ -23,15 +23,24 @@ entire runtime directory; empty means default); per-bot workspaces under
 - **Canonical development remote**: `origin` is the local walgit repository at
   `http://127.0.0.1:8081/gqf2008/abb.git`; `github` is a mirror/release remote only.
 - **All work tracking lives in walgit**: create/update issues, patches, reviews,
-  merge results and status transitions with `walgit collab` entries under
+  merge results and status transitions with collab entries under
   `refs/collab/*`. Do not open new GitHub issues or PRs for normal development.
+- **两个面：MCP 是协作接口，CLI 要显式开门（D68）**。walgit **v0.13.0** 起 `walgit collab` /
+  `walgit ci` 本地子命令**默认拒执行**（报错会直接说去用 MCP）：对外协作面是 MCP `/mcp`
+  —— `collab_board` / `collab_thread` / `collab_report` / `collab_publish` / `ci_status` + 资源订阅。
+  但**签名只能在本地做**（MCP 从不代签，`collab_publish` 只收已签好的条目），本地闸门脚本读的也是
+  本检出里的 refs，所以**凡是要跑 CLI 的场合一律加 `WALGIT_LOCAL_COMMANDS=1`**：
+  `WALGIT_LOCAL_COMMANDS=1 walgit collab board` / `… collab entry …` / `… collab join …` / `… ci status`。
+  本仓已按此改齐：`tools/check_review_cadence.sh`、`tools/check_collab_parents.sh`、
+  `tools/run_ci_runner.sh` 与 `src/agent.rs` 的提示词（后者的断言钉在命令形态上，删掉 env 会红）。
+  **注意参数校验在门控之前**：`walgit collab thread`（缺 id）报的是 clap 的参数错，不是门被开。
 - **The host standard is normative**: agents collaborate by this walgit host's `SKILL.md` (`http://walgit.localhost:8081/SKILL.md`, §0–§7). Where this file and that standard disagree, **the standard wins**; this section is a pointer, not a second source of truth.
 - **Identity first (§0/§0a)**: one principal per collaborator, one Ed25519 key, materialized **per worktree** by
-  `walgit collab join --principal <proj>-<role>-N --push origin` (the seed lands in that worktree's git dir;
+  `WALGIT_LOCAL_COMMANDS=1 walgit collab join --principal <proj>-<role>-N --push origin` (the seed lands in that worktree's git dir;
   never share a key, never sign an entry for someone else). This project's convention is
   `abb-worker-N` (author) / `abb-reviewer-N` (acceptance) / `abb-coordinator` (merge & close) — take the
   next free index after the highest registered one. Do the §0a routine before filing or claiming: fetch
-  `refs/collab/inbox/*` + `refs/collab/meta/*`, read `walgit collab board`, then claim.
+  `refs/collab/inbox/*` + `refs/collab/meta/*`, read `WALGIT_LOCAL_COMMANDS=1 walgit collab board`, then claim.
 - **Entry contract**: `issue` opens a thread (objective, owner, **machine-checkable acceptance**);
   `comment` + `status: in-progress` records the claim (`owner` / `worktree` / `branch` / `work`);
   `status` values are `in-progress` / `needs-review` / `blocked` / `needs-human` / `done` / `closed`
@@ -68,7 +77,7 @@ entire runtime directory; empty means default); per-bot workspaces under
   「什么都没发生」）。写走 `collab_entry` / `collab_claim` 两个工具（`actor` 必须是 `--key`
   绑定的 principal），重活（构建、测试、push）仍在工具调用之外跑，收尾只写一条 entry。
   **看板内容不要走 `read_resource`**：本项目 board 约 580 KB，而 ki 的读工具硬截断 20 KiB
-  （拿到的是断掉的 JSON 残片）；唤醒后用 CLI 取全文 —— `walgit collab board` / `walgit collab board --format json`。
+  （拿到的是断掉的 JSON 残片）；唤醒后用 CLI 取全文 —— `WALGIT_LOCAL_COMMANDS=1 walgit collab board` / `… --format json`。
   同理 `walgit://refs/<owner>/<repo>` **不要订**：实测该仓库 4514 条 ref（`inbox` 3625、
   `ci-artifacts` 516、tag 166、`refs/heads` 1），摘要按字典序预算 464 条**全部**是
   `refs/collab/ci-artifacts/*`，分支/inbox 一条不回；而它的 `_meta.version` 是全量 ref 的流式
@@ -93,7 +102,7 @@ entire runtime directory; empty means default); per-bot workspaces under
   + independent review — `merge_rule_eval` on this repo requires no CI run (`base is not protected`).
   This repo keeps **no resident local walgit CI runner**: do not start `tools/run_ci_runner.sh`. Historical
   runs do exist in the collab log (the last one is from 2026-10-09, produced by the `ci-runner` principal),
-  so `walgit ci status` may answer with old runs — treat them as **history, not verification of your head**.
+  so `WALGIT_LOCAL_COMMANDS=1 walgit ci status` may answer with old runs — treat them as **history, not verification of your head**.
   GitHub Actions covers `ci.yml` at PR/mirror level (six jobs) and `release.yml` at tag/release time
   (`anti-spam.yml` / `release-on-acceptance.yml` cover their own narrow paths); the full
   build/sign/notarize path lives in `release.yml`.

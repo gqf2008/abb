@@ -44,6 +44,9 @@ cat > "$launcher" <<EOF
 #!/bin/sh
 export TMPDIR='$tmp'
 export CARGO_TARGET_DIR='$target'
+# D68：`walgit ci` 与 `walgit collab` 默认关闭（对外面是 MCP `/mcp`，`ci_status`），
+# 常驻 runner 属于「脚本/运维」那一类，显式走 walgit 保留的本地门。
+export WALGIT_LOCAL_COMMANDS=1
 exec walgit --config '$config' ci run --repo '$repo' --remote origin --actor ci-runner --key '$key' $extra
 EOF
 chmod +x "$launcher"
