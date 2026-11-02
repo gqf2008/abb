@@ -683,7 +683,36 @@ impl Messenger for DingTalkMessenger {
 }
 
 /// 按 bot 配置构造对应 Messenger。
+///
+/// **`kind = "mcp"` 与内置渠道在这里合流**（总线 S1c/S1d）：上层（`bridge/`、
+/// `deliver`、`schedule`）只拿到一个 `Arc<dyn Messenger>`，不知道消息从哪来。
+/// 这就是「ABB 是总线」的实际含义——加渠道不改上层。
 pub fn build(bot: &BotConfig) -> Result<std::sync::Arc<dyn Messenger>> {
+    if bot.is_mcp() {
+        // 缺配置要**明确报错**，不能静默 fallback 到飞书：那会拿飞书凭证去连一个
+        // 本该由 MCP 服务的渠道，症状是「渠道在线但收发全乱」。
+        let ch = bot.mcp_channel.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "bot「{}」的 kind=mcp 但没配 mcp_channel（需要 command；args/env 可选）",
+                bot.name
+            )
+        })?;
+        let envs: Vec<(String, String)> = ch
+            .env
+            .iter()
+            .map(|e| (e.name.clone(), e.value.clone()))
+            .collect();
+        // 建连时就校验能力（缺 send_text / 无入站 ⇒ 在这里失败），
+        // 而不是等到第一条消息要发出去。
+        let m = crate::mcp_channel::McpChannelMessenger::connect(
+            &ch.name,
+            &ch.command,
+            &ch.args,
+            &envs,
+        )
+        .map_err(anyhow::Error::msg)?;
+        return Ok(std::sync::Arc::new(m));
+    }
     if bot.is_dingtalk() {
         return Ok(std::sync::Arc::new(DingTalkMessenger::new(
             DingTalkClient::new(&bot.app_id, &bot.app_secret),
@@ -919,5 +948,68 @@ mod tests {
         m.path = String::new();
         m.mime = String::new();
         assert_eq!(attachment_upload_name(&m), "attachment.bin", "其它兜底 bin");
+    }
+
+    /// `kind = "mcp"` 但没有 `mcp_channel` ⇒ **明确报错**，不许静默回落飞书。
+    ///
+    /// 静默回落的后果：拿飞书凭证去连一个本该由 MCP 服务的渠道，症状是
+    /// 「渠道显示在线但收发全乱」——这类故障最难查，所以宁可建不起来。
+    #[test]
+    fn mcp_bot_without_channel_config_fails_loudly() {
+        let bot = BotConfig {
+            kind: "mcp".into(),
+            mcp_channel: None,
+            ..Default::default()
+        };
+        let err = build(&bot).err().expect("缺 mcp_channel 应当失败");
+        let msg = err.to_string();
+        assert!(msg.contains("mcp_channel"), "报因要点名缺什么：{msg}");
+        assert!(msg.contains("kind=mcp"), "报因要说清是哪种 bot：{msg}");
+    }
+
+    /// `kind = "mcp"` 的 bot 真的走到 MCP 分派（而不是落进飞书分支）。
+    ///
+    /// 用一个**能力不齐**的假服务：它必然在建连校验处失败，而报因里带服务名 ——
+    /// 这就证明分派走对了。若落进飞书分支，会因为 app_id 为空而走别的路径，
+    /// 报因不会长这样。
+    #[test]
+    fn mcp_bot_dispatches_to_mcp_channel_not_feishu() {
+        let bot = BotConfig {
+            name: "别处的群".into(),
+            kind: "mcp".into(),
+            mcp_channel: Some(crate::channel_mcp::McpServerConfig {
+                name: "slack-bridge".into(),
+                // 什么都不做、立刻退出 ⇒ tools/list 必失败
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "exit 0".into()],
+                env: vec![],
+            }),
+            ..Default::default()
+        };
+        let err = build(&bot).err().expect("该假服务应当连不上");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("slack-bridge"),
+            "报因要带 MCP 服务名（证明走的是 mcp 分派而不是飞书）：{msg}"
+        );
+    }
+
+    /// 非 mcp bot 的 `mcp_channel` 字段必须是**可选且不落盘**。
+    ///
+    /// 这条守的是「旧配置零影响」：老 config 没有这个字段，反序列化不能失败；
+    /// 新写的普通 bot 也不该凭空多一行 `mcp_channel: null`。
+    #[test]
+    fn mcp_channel_is_optional_and_not_serialized_when_absent() {
+        let bot = BotConfig::default();
+        assert!(bot.mcp_channel.is_none());
+        let json = serde_json::to_string(&bot).expect("序列化");
+        assert!(
+            !json.contains("mcp_channel"),
+            "非 mcp bot 不该落盘这个字段：{json}"
+        );
+        // 反向：旧配置（完全没有该字段）必须能解析。
+        let old: BotConfig =
+            serde_json::from_str(r#"{"name":"旧的","kind":"feishu"}"#).expect("旧配置必须能解析");
+        assert!(old.mcp_channel.is_none());
     }
 }

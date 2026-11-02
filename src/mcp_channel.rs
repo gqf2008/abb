@@ -21,8 +21,6 @@
 
 // 与 `mcp_bus`/`mcp_client` 同口径：还没接进 `service.rs` 的 bot 装配（S1d），
 // 故部分成员暂时未用。**移除这个 allow 必须是「真接上了」**，不是「先关警告」。
-#![allow(dead_code)]
-
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
@@ -93,10 +91,17 @@ impl McpChannelMessenger {
         })
     }
 
+    /// 服务名（日志与报因用）。
+    ///
+    /// 模块级 `allow(dead_code)` 已移除——`messenger::build` 真用上了本类型。
+    /// 这两个访问器留给 S2 入站与 GUI 状态展示，**逐项**标注而不是把整个模块放开：
+    /// 逐项标注会让「哪些还没接」一目了然，模块级放开会把将来新加的死代码一起藏住。
+    #[allow(dead_code)]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    #[allow(dead_code)]
     pub fn capabilities(&self) -> &ChannelCapabilities {
         &self.caps
     }

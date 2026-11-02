@@ -52,9 +52,21 @@ pub struct BotConfig {
     /// 隔离名（目录名）。空则用 app_id 尾 6 位兜底，保证唯一且文件系统安全。
     #[serde(default)]
     pub name: String,
-    /// bot 类型：feishu（默认）| wechat | dingtalk
+    /// bot 类型：feishu（默认）| wechat | dingtalk | mcp
+    ///
+    /// `mcp` = 该 bot 的消息走**外部 MCP 渠道服务**（总线 S1d），由
+    /// [`Self::mcp_channel`] 指定拉起什么程序。渠道配置最终由提供 MCP 的一方决定，
+    /// ABB 只负责拉起并遵守契约（`docs/mcp-bus-architecture.md`）。
     #[serde(default = "default_kind")]
     pub kind: String,
+    /// `kind = "mcp"` 时的渠道服务描述（S1d）。
+    ///
+    /// 复用 [`crate::channel_mcp::McpServerConfig`] 的形状（command/args/env）——
+    /// 与 agent 侧 `mcp.json` 同一结构，用户不用记两套写法。
+    ///
+    /// **旧配置零影响**：字段可选，且 `skip_serializing_if` 保证非 mcp bot 不落盘。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_channel: Option<crate::channel_mcp::McpServerConfig>,
     /// 是否启用。false 时 service 不启动此 bot（仍在设置窗显示，可重新启用）。
     /// 默认 true；旧 config 无此字段时反序列化按 true（default_true）。
     #[serde(default = "default_true")]
@@ -192,6 +204,7 @@ impl Default for BotConfig {
         Self {
             name: String::new(),
             kind: default_kind(),
+            mcp_channel: None,
             enabled: true,
             app_id: String::new(),
             app_secret: String::new(),
@@ -515,10 +528,24 @@ impl BotConfig {
         self.kind == "dingtalk"
     }
 
+    /// 是否 MCP 渠道（总线 S1d）：消息走外部 MCP 服务，内置协议一行不参与。
+    pub fn is_mcp(&self) -> bool {
+        self.kind == "mcp"
+    }
+
     /// 凭证是否齐备可跑（单一事实源：service 启动门槛 + Config::missing 都用它）。
     /// 飞书要 app_id+app_secret；微信要 wx_token+wx_user_id（扫码登录拿到）；
     /// 钉钉要 app_id（AppKey）+app_secret（AppSecret）。
     pub fn credentials_ready(&self) -> bool {
+        // MCP 渠道不需要平台凭证——它要的是「拉得起来一个程序」。
+        // 判据用 `is_usable()`（名字与 command 都非空），与 `channel_mcp` 同口径。
+        if self.is_mcp() {
+            return self
+                .mcp_channel
+                .as_ref()
+                .map(|c| c.is_usable())
+                .unwrap_or(false);
+        }
         if self.is_wechat() {
             !self.wx_token.is_empty() && !self.wx_user_id.is_empty()
         } else {

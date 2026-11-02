@@ -29,8 +29,6 @@
 //
 // 与 `mcp_bus` 同口径：**移除这个 allow 的时候必须是「真的接上了」**，不是「先关警告」。
 // 所以它写得范围最小（只有此模块），且解除条件明确记为 S1c 完成。
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -96,6 +94,8 @@ impl std::error::Error for ClientError {}
 /// 读在**独立线程**上做、通过通道回流：这样「等响应」就能带超时
 /// （std 的 `read_line` 本身不支持超时，而拉 tokio 进这一层只为超时不值）。
 pub struct StdioChannelClient {
+    /// 服务名。目前只用于 [`Self::name`]（S2 入站与日志要用），故逐项 allow。
+    #[allow(dead_code)]
     name: String,
     child: Child,
     stdin: ChildStdin,
@@ -154,15 +154,18 @@ impl StdioChannelClient {
     }
 
     /// 覆盖单次调用超时（测试与「慢渠道」用）。
+    #[allow(dead_code)]
     pub fn with_timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
         self
     }
 
+    #[allow(dead_code)]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    #[allow(dead_code)]
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
@@ -186,6 +189,10 @@ impl StdioChannelClient {
     }
 
     /// 发一条通知（无响应）。
+    ///
+    /// S2 入站要用（`resources/subscribe` 得先发一条 `initialized` 通知），
+    /// 现在还没到那一步 ⇒ 逐项 allow（理由见 [`Self::name`]）。
+    #[allow(dead_code)]
     pub fn notify(&mut self, method: &str, params: Value) -> Result<(), ClientError> {
         let msg = crate::mcp_bus::build_notification(method, params);
         let mut line =
@@ -248,6 +255,7 @@ impl StdioChannelClient {
     ///
     /// 为什么单独取而不是在 [`call`] 里回调：回调会要求持锁调上层，容易死锁；
     /// 让调用方在自己方便的时候取更简单。
+    #[allow(dead_code)]
     pub fn drain_notifications(&mut self) -> Vec<Value> {
         // 先把通道里已到达的都收进来（非阻塞）。
         while let Ok(msg) = self.rx.try_recv() {
