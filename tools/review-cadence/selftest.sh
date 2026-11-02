@@ -189,20 +189,26 @@ esac
 #    所以改成结构化字段 + 门禁查形状。
 #    三红三绿的分工：假 rid / 自决越界 / 低置信包装成定论 各红一条；
 #    纯技术自决、真问过且如实写明、无字段（纯技术卡）各绿一条（防误红）。
+# `bad_decisions_ui_wording`：判据 (h) 第一版把**裸「文案」**放进词表，于是
+# 「自己打 skip 文案」（改的是跳过提示=开发者/门禁输出）被判越界 —— 实测过一次误红，
+# Jev 判 `fix_jq_wordlist` p=1.0/conf=1.0、`gate_false_positive` p=0.95/conf=0.92。
+# 所以两条并排钉住**收窄后仍有效**：改界面文案 ⇒ 红；改跳过提示 ⇒ 绿。
 for s in bad_decisions_fake_rid bad_decisions_self_decided_crosses_trigger \
-         bad_decisions_low_confidence_not_stated; do
+         bad_decisions_low_confidence_not_stated bad_decisions_ui_wording; do
   expect_rc "(h) 违规：$s" 1 \
     "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 for s in ok_decisions_self_decided_technical_only \
-         ok_decisions_asked_with_low_confidence_stated ok_decisions_absent; do
+         ok_decisions_asked_with_low_confidence_stated ok_decisions_absent \
+         ok_decisions_debug_output_wording; do
   expect_rc "(h) 合规：$s" 0 \
     "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 # 报因要指对地方（否则被别的原因顶住，对这条判据零判别力）
 for pair in "bad_decisions_fake_rid 假装问过" \
             "bad_decisions_self_decided_crosses_trigger 触发清单" \
-            "bad_decisions_low_confidence_not_stated 包装成强结论"; do
+            "bad_decisions_low_confidence_not_stated 包装成强结论" \
+            "bad_decisions_ui_wording 触发清单"; do
   set -- $pair
   msg="$("$check" --json "$samples/$1.json" --contract-ts "$ts" --no-review-ts "$ts" 2>&1 || true)"
   case "$msg" in
