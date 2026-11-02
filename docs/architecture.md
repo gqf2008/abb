@@ -103,18 +103,22 @@ $AGENT_BRIDGE_HOME 或 ~/.agent-bridge/        （main.rs:97 bridge_dir）
 ## 6. 代码规模（了解重心在哪）
 
 > **本文的规模数字只在本节给一次**，别处只指路。这样同一个数字不会出现两个值。
+>
+> 取当前值：`bash tools/arch-check.sh --print`（它从代码里读，手抄必错）。
+> `bash tools/arch-check.sh` 会断言本文与代码一致，不一致就红。
 
 | 分区 | 行数 |
 |---|---|
 | `src/` 顶层 | 见下表 |
-| `src/runtime/`（从上游移植的会话层） | acp 4888 / harness 4332 / pool 2173 / queue 1536 / oneshot 571 |
+| `src/runtime/`（从上游移植的会话层）**全目录 13727** | 主要 5 个：acp 4888 / harness 4332 / pool 2173 / queue 1536 / oneshot 571；其余 4 个小文件合计 227 |
 | `src/` 合计 | **113128** |
 | `ui/app.slint` | 5892 |
+| GUI 三件合计（ui.rs + syschat.rs + 渲染台） | **25517** |
 
 最大的六个文件：`ui.rs` 12290、`syschat.rs` 7639、`ui_headless_render_test.rs` 5588、
 `task_run.rs` 4563、`platform.rs` 4096、`main.rs` 3435。
 
-> **重心在 GUI（ui + syschat + 渲染台 ≈ 25500 行）**，比整个 `src/runtime/`（13600 行）还大。
+> **重心在 GUI**：`ui.rs` + `syschat.rs` + 渲染台三件（见上表）比整个 `src/runtime/` 全目录还大。
 > 所以「ABB 是个桥」这个说法在代码量上不成立：它一半是桌面应用。
 
 ## 7. 现在缺什么（诚实清单）
