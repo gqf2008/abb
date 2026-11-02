@@ -520,13 +520,19 @@ print(json.dumps({"bad": [{"entry": r[0], "reason": r[1], "parent": r[2]} for r 
      · 未来的写入必须先校验。
 
    写入前的正确做法（本仓已发生 ≥4 次同类事故）：
-     oid=$(WALGIT_LOCAL_COMMANDS=1 walgit collab thread <id> | jq -r '.[-1].oid')   # 取完整 oid，别抄前缀
-     git cat-file -t "$oid"                                  # 确认存在
-     WALGIT_LOCAL_COMMANDS=1 walgit collab entry ... --parent "$oid"
 
-   （D68 起 `walgit collab` 默认拒执行，对外面是 MCP `/mcp`；本地读写要显式带
-    `WALGIT_LOCAL_COMMANDS=1`，这是 walgit 为脚本保留的门。）
+     # ① 取上一条条目的**完整** oid（别抄前缀）。主路径走 MCP，本地没有 walgit 也行：
+     python3 tools/review-cadence/mcp_thread.py <owner>/<repo> <id> | jq -r '.[-1].oid'
+     # （本机恰好还有 walgit 二进制时：WALGIT_LOCAL_COMMANDS=1 walgit collab thread <id>）
 
+     # ② 确认该 oid 在本仓存在（防止抄到别仓/拼错的 oid）
+     git cat-file -t "$oid"
+
+     # ③ 签名后经 MCP collab_publish 发布，entry.parent 填上面那个 oid。
+     #    签名字节 = 把 sig 置成空串（键保留）后键排序、无空白；任何 ed25519 都能签。
+
+   （D68 起 `walgit collab` 默认拒执行；主机搬到服务器后本地将不再有该命令。
+    所以本地二进制只当**便利路径**，不要写成唯一方式。）
    自测：tools/check_collab_parents.sh --self-test
 MSG
       exit 1

@@ -5,61 +5,25 @@
 # 把 `RULE_审查规范.md` 第 7–12 条从人核变成可机查。
 #
 # 用法
-#   tools/check_review_cadence.sh <thread-id>          # 跑 `walgit collab thread <id>`
+#   tools/check_review_cadence.sh <thread-id>          # 取 thread 数据后判定（见「数据源」）
 #   tools/check_review_cadence.sh --json <file|->      # 离线：直接喂 thread JSON（自测/样本）
 #
-# 陈旧数据防护（card abb-d68-local-commands-20261102）：MCP 的 `collab_publish` **不写本地
-# refs**，而本门禁读的是本地 refs。若评审者用 MCP 发布 `request_changes`，不同步就会
-# **看不到它而判绿**。所以 <> 模式默认先 `git fetch` 同步 `refs/collab/*`；同步失败即
-# fail-closed（exit 2，宁红不假绿）。`--no-fetch` 或 `ABB_CADENCE_SKIP_FETCH=1` 跳过，
-# 跳过等于把门禁降级为 best-effort。
+# 数据源（card abb-d68-local-commands-20261102）：walgit 的协作面是「纯 git + MCP」，
+# 本地 `walgit` 二进制将不再部署，所以**不把 CLI 当唯一来源**。优先级：
+#   1. `--json <file|->`：离线输入，调用方自负责新鲜度
+#   2. **MCP `collab_thread`**（本仓常规；需 `WALGIT_MCP_TOKEN`，可选 `WALGIT_MCP_URL`）
+#      —— 读服务端权威聚合，不存在「本地 refs 陈旧」问题
+#   3. `walgit collab thread`（过渡回落，需 `WALGIT_LOCAL_COMMANDS=1`）
+#      —— 读本地 refs，因此**默认先 `git fetch` 同步 `refs/collab/*`**；
+#         同步失败即 fail-closed（exit 2）。`--no-fetch` / `ABB_CADENCE_SKIP_FETCH=1`
+#         可显式跳过，跳过等于降级为 best-effort（输出会标 ⚠️）
+#   4. 都没有 ⇒ fail-closed（exit 2）并给出配置指引
 #
-# 注：walgit D68 起 `walgit collab` 不再是协作的对外接口（对外面是 MCP `/mcp`），
-# 本地子命令默认拒绝执行；本脚本是**合并前的本地闸**，读的是本检出里的 refs、
-# 不该为了它去要 MCP 的 token 与网络，因此显式走 walgit 保留的本地门
-# `WALGIT_LOCAL_COMMANDS=1`（walgit 自己的文案即「survives for scripts and emergencies」）。
+# 判定依据自报：输出里有一行「判定依据：…」说明这次用的是哪个数据源，
+# 「真同步过」与「拿陈旧 refs」不会长得一样。
 #
-# 选项
-#   --contract-ts <epoch>   契约落地时间阈值（秒）。缺省取 env ABB_REVIEW_CONTRACT_TS，
-#                           再缺省取本脚本内常量（见下）。ts 小于该值的 review 视为**契约前**
-#                           历史条目，缺契约行时跳过并计数、不判红。
-#   --no-review-ts <epoch>  无评审新规生效时间（秒）。缺省取 env ABB_NO_REVIEW_TS，再缺省
-#                           取本脚本常量 NO_REVIEW_TS_DEFAULT。判据 (g) 只对**此时间之后**
-#                           的 merge_result 生效（更早的历史合并豁免，不追溯判红）。
-#   -h | --help
+# 退出码：0 通过；1 违规；2 用法/工具/内部错误（**内部错误绝不允许退 0**）
 #
-# 判据（与 docs/review-findings-contract.md 一致；核心实现见 tools/review-cadence/check.jq）
-#   (a) 判决类 review（approve / request_changes）note 顶部必须有契约行
-#       `findings: blocking=N non-blocking=M`，且：
-#         blocking>0 ⇒ decision=request_changes；blocking=0 ⇒ decision=approve；
-#         若 note 另有逐条 `[blocking]` / `[non-blocking]` 标签，标签计数须与契约行相等；
-#         契约前（ts < 阈值）缺契约行 ⇒ 跳过计数；契约后缺 ⇒ 判红。
-#       历史未知 decision（曾出现 needs-changes / null）同口径：契约前跳过、契约后判红。
-#   (b) 同一 thread 的 blocking 轮数（契约行 blocking>0 的判决类 review 条数）≤ 2。
-#   (c) thread 内**最后一条**（ts ≥ 契约阈值）判决类 review 必须是 blocking=0 的 approve，
-#       否则判红。该判据在**合并之前**即可跑（不依赖是否已有 merge_result）。
-#   (d) 独立评审（§0b）：最后一条判决类 review 的 actor 不得与本 thread 任何 patch 的
-#       actor 相同（自审就算签出合法 approve 也不算独立评审）。
-#   (e) 终审不得与合并者同人（§4）：已合并的 thread，最后一条判决类 review 的 actor 与
-#       **每一条** merge_result{merged:true} 的 actor 都必须不同（**逐条 merge 判**：只挑某一条
-#       merge 时，一条 ts 回溯的尾部 merge 就能把本条洗白）。同一个人**多轮评审**是合法的，
-#       不在此拦。历史豁免口径与 (a) 同：(e) 只看 ts ≥ 契约阈值的 review。
-#   (f) 未验签（verified=false）的**判决性**条目（patch / review / merge_result）不得据以
-#       合并。`comment` 上的未验签不算：那通常是“写错身份后重签”的记录。
-#   (g) 合并于**无评审新规之后**却没有任何判决类 review ⇒ 判红。**逐条 merge 判**：每条
-#       ts ≥ no_review_ts 的 merge_result{merged:true} 各判一次，多条违规各报一条。
-#       降档豁免：由**独立第三方**签一条 comment，其 `body.waiver` 字段等于字符串
-#       "no-independent-review"（**散文里提到该词不算**）；该 comment 还必须
-#        ① ts ≥ no_review_ts ② 在该次合并的父链上（因果先于合并）（不得事后补签）③ verified ≠ false
-#        ④ actor 既不是本 thread 任何一份 patch 的作者、也不是该次合并的执行者。
-#   `decision=="comment"` 的 review 不参与判定（不要求契约行、不计 blocking 轮）。
-#
-# 退出码
-#   0 = 通过（可能含历史跳过）
-#   1 = 违规（violations 非空）
-#   2 = 用法/工具错误（缺 jq、thread 取不到、JSON 不可解析等）
-#
-# 依赖：jq（本仓随包工具之一）。契约落地时间常量 CONTRACT_TS_DEFAULT 见下方。
 set -euo pipefail
 
 # 契约落地时间（epoch 秒）。此日期之前的 review 视为历史，缺契约行跳过。
@@ -176,8 +140,12 @@ else
     _repo="${_url##*/}"
     if [ -n "$_owner" ] && [ -n "$_repo" ]; then
       repo_slug="$_owner/$_repo"
+      repo_slug_note=""
     else
-      repo_slug="gqf2008/abb"           # 推导失败才退回规范名
+      # 退回规范名，但**必须明示**：静默回落等于「拿别人的数据判自己的卡」
+      # （评审 NB-3：无 origin 时实测静默生效且 rc=0）。
+      repo_slug="gqf2008/abb"
+      repo_slug_note="（⚠ origin 不可得，已退回规范名）"
     fi
   fi
   if [ -n "${WALGIT_MCP_TOKEN:-}" ] && [ -f "$mcp_py" ]; then
@@ -249,7 +217,7 @@ fi
 if [ -n "$json_input" ]; then
   basis="外部 JSON（离线输入）"
 elif [ "${source:-}" = "MCP collab_thread" ]; then
-  basis="MCP collab_thread @ ${repo_slug:-?}（服务端权威聚合）"
+  basis="MCP collab_thread @ ${repo_slug:-?}${repo_slug_note:-}（服务端权威聚合）"
 elif [ "${fetched:-0}" = "1" ]; then
   basis="walgit CLI + 已同步 refs/collab/*（过渡路径）"
 else
@@ -263,16 +231,16 @@ echo "$result" | jq -r '
   + "历史跳过 \(.summary.skipped_historical) 条；merge_result(merged) \(.summary.merges) 条"'
 violations="$(echo "$result" | jq -r '.violations[]')"
 if [ -n "$violations" ]; then
-  verdict_emitted=1
   echo "❌ 违规："
   echo "$violations" | sed 's/^/  - /'
+  verdict_emitted=1        # 打印完才置位：否则中间崩掉会被误当成"已给出判定"
   exit 1
 fi
 # 只有「走 CLI 且没同步」这一种组合是 best-effort：MCP 读服务端、--json 由调用方负责，
 # 两者都不存在陈旧问题，必须打干净的 ✅（否则真绿也被降级，信噪比会崩）。
-verdict_emitted=1
 if [ -n "$json_input" ] || [ "${source:-}" = "MCP collab_thread" ] || [ "${fetched:-0}" = "1" ]; then
   echo "✅ 通过"
 else
   echo "⚠️ 通过（未同步：本地 refs 可能陈旧，此结果 best-effort，不构成假绿防护）"
 fi
+verdict_emitted=1          # 同上：打印之后才置位

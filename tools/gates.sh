@@ -157,4 +157,11 @@ echo "== ABB 门禁：crates/abb-chart（独立包，中间产物外置于 ${cha
   cargo test --manifest-path "$chart_manifest" --offline
 )
 
-echo "✅ 八条门禁全绿（root 四条 + crates/abb-chart 四条）；checkout 内未产生 target/（中间产物在 ${CARGO_TARGET_DIR} 与 ${chart_target}）；测试夹具残留已清扫"
+# 协作门禁（crates/* 之外，跑得快、不联网、不编译）：这两条守的是「合并闸门本身」，
+# 之前只在 .walgit/ci.toml 里跑，本地 gates.sh 漏了 —— 而协调者合并前跑的是 gates.sh
+# （评审 NB-6）。放在最后：前面任何一条失败都不会掩盖它们。
+echo "== ABB 门禁：协作闸门自测（不联网、不编译）=="
+tools/review-cadence/selftest.sh
+tools/check_collab_parents.sh --self-test
+
+echo "✅ 八条门禁 + 协作闸门自测全绿（root 四条 + crates/abb-chart 四条 + review-cadence/parents 自测）；checkout 内未产生 target/（中间产物在 ${CARGO_TARGET_DIR} 与 ${chart_target}）；测试夹具残留已清扫"

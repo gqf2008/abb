@@ -42,6 +42,10 @@ if PATH="$NW_PATH" command -v walgit >/dev/null 2>&1; then
   bad "无法构造不含 walgit 的 PATH（还有 $(PATH="$NW_PATH" command -v walgit)）"
   exit 1
 fi
+# 可归因：把「测的是哪个检出、哪个 head」打出来。评审跑这条时曾遇到三次不同结果却无法
+# 定位来源（不同 worktree / 并发会话 / 不同 token 环境）。少了这三行，失败了也没法判断
+# 是不是同一个东西（评审 N7）。
+echo "── 无 walgit 断言：repo=$(basename "$repo_root") head=$(git rev-parse --short HEAD 2>/dev/null || echo '?') tok=$([ -n "${WALGIT_MCP_TOKEN:-}" ] && echo env || echo none)"
 echo "── PATH 中已无 walgit（共 $(printf '%s' "$NW_PATH" | tr ':' '\n' | wc -l | tr -d ' ') 个目录）"
 
 # ── 取 MCP 凭据（只进环境变量，不进命令行）──────────────────────────────────
@@ -106,7 +110,7 @@ else
 fi
 
 # ── 4. 门禁自测：不应依赖本机 walgit ─────────────────────────────────────────
-if PATH="$NW_PATH" bash tools/review-cadence/selftest.sh >/tmp/nw-selftest.log 2>&1; then
+if PATH="$NW_PATH" env -u WALGIT_MCP_TOKEN bash tools/review-cadence/selftest.sh >/tmp/nw-selftest.log 2>&1; then
   n="$(grep -o 'pass=[0-9]*' /tmp/nw-selftest.log | tail -1 | cut -d= -f2)"
   ok "review-cadence selftest 在无 walgit 下全绿（pass=${n}）"
 else
@@ -114,10 +118,33 @@ else
   grep -E 'FAIL|FATAL' /tmp/nw-selftest.log | head -5 | sed 's/^/       | /'
 fi
 
+# ── 5. 自测必须与「有没有 MCP 凭据」无关（评审 B2）─────────────────────────────
+# 曾经：导出 WALGIT_MCP_TOKEN 后门禁走 MCP，于是几条**专测 CLI 回落路径**的用例
+# 静默不执行（3 条假红 + 守卫根本没被测）。自测现在自己清掉这些变量，
+# 这里断言两种环境下例数一致——否则「配好凭据的人」就等于没有那几条测试。
+if [ -n "$token" ]; then
+  WALGIT_MCP_TOKEN="$token" PATH="$NW_PATH" bash tools/review-cadence/selftest.sh >/tmp/nw-selftest-tok.log 2>&1
+  tok_rc=$?
+  tok_n="$(grep -o 'pass=[0-9]*' /tmp/nw-selftest-tok.log | tail -1 | cut -d= -f2)"
+  if [ "$tok_rc" -eq 0 ] && [ "${tok_n:-0}" = "${n:-0}" ]; then
+    ok "自测在带 MCP 凭据时结果一致（pass=${tok_n}，CLI 路径用例未被跳过）"
+  else
+    bad "自测在带凭据时结果不同（rc=${tok_rc} pass=${tok_n:-?}，无凭据时 pass=${n:-?}）"
+    grep -E 'FAIL|FATAL' /tmp/nw-selftest-tok.log | head -5 | sed 's/^/       | /'
+  fi
+  rm -f /tmp/nw-selftest-tok.log
+else
+  echo "  ⊘ 无 MCP 凭据：跳过「带凭据一致性」断言"
+fi
+
 rm -f /tmp/nw-ccp.log /tmp/nw-selftest.log
 echo
 if [ "$fail" -eq 0 ]; then
-  echo "✅ 无 walgit 断言全过（pass=${pass}）"
+  if [ -n "$token" ]; then
+    echo "✅ 无 walgit 断言全过（pass=${pass}，含 MCP 主路径）"
+  else
+    echo "✅ 无 walgit 断言全过（pass=${pass}，⚠ 无 MCP 凭据：主路径 2 条断言已跳过）"
+  fi
   exit 0
 fi
 echo "❌ 无 walgit 断言失败 ${fail} 条（pass=${pass}）"

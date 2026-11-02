@@ -278,8 +278,10 @@ walgit 的本地子命令自 D68 起默认拒执行，而且**主机会搬到服
 
 > **写一条条目 = 构造 JSON + 客户端签名 + MCP `collab_publish`。**
 > `collab_publish` **从不代签**（它 hold 不到 key，这是安全边界）。
-> 要签的字节见 `entry_canonical`：**去掉 `sig` 后，对象键按字节排序、无空白**——
-> 一句规则，**任何 ed25519 实现都能签**（openssl 即可），不需要 walgit。
+> 要签的字节见 `entry_canonical`：**把 `sig` 的值置成空串（键要保留，别删掉这个键）**，
+> 再把对象键按字节排序、去掉全部空白——一句规则，**任何 ed25519 实现都能签**（openssl 即可），
+> 不需要 walgit。**删掉 `sig` 键会签出验不过的条目**：实测拿真账本里的条目比过——
+> 去键串验签失败，`\"sig\":\"\"` 串验签通过。
 > 协作类 MCP 工具就这几个：`collab_board` / `collab_thread` / `collab_report` /
 > `collab_publish` / `collab_register` / `ci_status`；claim、status、patch、review、
 > merge_result **都不是独立工具**，而是发一条对应 `kind` 的条目。
@@ -294,14 +296,17 @@ openssl pkey -in \"$gd/walgit/keys/<principal>.pem\" -pubout -outform DER \\
 # 把公钥交给 MCP collab_register {{repo, principal, public_key}}。
 # （本机恰好还有 walgit 二进制时，`walgit collab join` 是这两步的一步等价形式。）
 
-# ② 签一条条目（以 patch 为例）：canonical = 去 sig 后键排序、无空白的 JSON。
-#    jq -S 按键排序、-c 无空白 —— 正好就是 canonical 形式。
-jq -S -c --arg b \"$(cat body.json)\" \\
+# ② 签一条条目（以 patch 为例）：canonical = `sig` 值置空串 + 键排序 + 无空白。
+#    先写出**完整** entry（含 \"sig\": \"\"），再整条规范化 —— 别用字段投影把 sig 键弄丢。
+#    jq -S 按键排序、-c 无空白，正好就是 canonical 形式。
+jq -n --arg b \"$(cat body.json)\" \
   '{{version:1, kind:\"patch\", id:\"<线程>\", actor:\"<principal>\",
-    ts:(now|floor), parent:\"<上一条 oid>\", body:($b|fromjson)}}' > canonical.json
-openssl pkeyutl -sign -inkey \"$gd/walgit/keys/<principal>.pem\" -rawin \\
+    ts:(now|floor), parent:\"<上一条 oid>\", body:($b|fromjson), sig:\"\"}}' \
+  > entry.json
+jq -S -c . entry.json > canonical.json
+openssl pkeyutl -sign -inkey \"$gd/walgit/keys/<principal>.pem\" -rawin \
   -in canonical.json -out sig.bin
-# entry 里的 sig 字段 = \"ed25519:\" + base64(sig.bin)
+# 发布前把 sig 填回去：sig = \"ed25519:\" + base64(sig.bin)，写进 entry.json 的 sig 字段
 
 # ③ 发布（MCP）：collab_publish {{repo, entry}}；actor 必须等于凭据的 principal。
 ```
@@ -1453,6 +1458,13 @@ mod tests {
                     && text.contains("从不代签")
                     && text.contains("openssl")
                     && text.contains("entry_canonical")
+                    // 被签的字节里 `sig` 键必须**保留**（值为空串）。早先提示词写成
+                    // 「去掉 sig 键」，照做会签出 verified:false 的条目，而断言当时钉的
+                    // 正是那个错说法（评审 B1，真实账本 399/400 条目用 `sig:""` 规则验签通过、
+                    // 用去键规则全部失败）。这条反向断言防止它被改回去。
+                    && text.contains("sig` 的值置成空串")
+                    && text.contains("别删掉这个键")
+                    && !text.contains("去掉 `sig` 后")
                     && text.contains("本地将不再有 walgit")
                     && text.contains("refs/collab/inbox/*:refs/collab/inbox/*"),
                 "{name} 缺「纯 git + MCP」的协作口径（不代签/任意 ed25519/发布后 fetch）"

@@ -33,16 +33,20 @@ entire runtime directory; empty means default); per-bot workspaces under
   （+ `repo_*` 与 `wal_ls`）。claim / status / patch / review / merge_result **都不是独立工具**，
   而是发一条对应 `kind` 的条目走 `collab_publish`。
 - **签名在客户端，不是「MCP 做不到」**。`collab_publish` 从不代签（hold 不到 key），条目得先签好；
-  要签的字节是 `entry_canonical`：**去掉 `sig` 后对象键按字节排序、无空白**（一句规则）。
-  **任何 ed25519 实现都行**，不必是 walgit CLI——已实测 Python 复刻 canonical +
-  `openssl pkeyutl -sign -rawin`（32 字节 seed → PKCS8 DER）签出的条目 `collab_publish` 后
-  `verified: true`。密钥永不上行是**安全边界**，不是能力缺口。
+  要签的字节是 `entry_canonical`：**把 `sig` 的值置成空串（键必须保留，别删掉这个键）**，
+  再把对象键按字节排序、去掉全部空白。**删掉 `sig` 键会签出 `verified: false` 的条目**——
+  实测过：拿真账本里 399 条已验证的条目，用 `"sig":""` 规则逐条验签全部通过，用「去键」规则全部失败。
+  规则就这一句，**任何 ed25519 实现都行**，不必是 walgit CLI
+  （`openssl pkeyutl -sign -rawin` + 32 字节 seed → PKCS8 DER 即可）。
+  密钥永不上行是**安全边界**，不是能力缺口。
 - **本地二进制正在退场（重要）**：主机会部署到服务器，**本地不再有 `walgit` 命令**。
   所以本仓的脚本与提示词一律**不把本地二进制当唯一路径**。现状：
   `tools/check_review_cadence.sh` 的数据源顺序是 **MCP → CLI（过渡回落）→ fail-closed**，
   MCP 走 `tools/review-cadence/mcp_thread.py`（凭据 `WALGIT_MCP_TOKEN` / `WALGIT_MCP_URL`）；
-  `tools/check_collab_parents.sh` 本来就是纯 git（`for-each-ref` + `cat-file`），天然合规；
-  `src/agent.rs` 的提示词改为「构造 JSON + 客户端签名（openssl 即可，canonical = 去 `sig`
+  `tools/check_collab_parents.sh` 读的是**纯 git** 本地 refs（`for-each-ref` + `cat-file`），
+  因此它自己也**默认先 `git fetch refs/collab/*`**、同步失败 fail-closed
+  （`--no-fetch` 可显式降级）——「纯 git」不等于「天然无陈旧问题」；
+  `src/agent.rs` 的提示词改为「构造 JSON + 客户端签名（openssl 即可，canonical = `sig` 置空串
   后键排序无空白）+ MCP `collab_publish`」，并**反向断言**不许再把 CLI 写成唯一命令形态。
 - **CLI 只剩本地特权动作**（不是协作，也不是长期依赖）：`collab gc`（inbox fold）、repo ops
   （fsck/gc/repair/compact/rev-index/checkpoint）、`ci run`（runner 本体）、key 生成。

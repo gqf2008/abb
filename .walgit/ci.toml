@@ -89,3 +89,13 @@ refs = ["refs/heads/*", "refs/tags/v*"]
 command = "sh -c 'tools/review-cadence/selftest.sh'"
 timeout = "5m"
 env_allow = []
+
+# 协作账本的 `parent` 引用完整性守卫的自测：注入坏 parent，断言守卫变红。
+# 纯 git（for-each-ref + cat-file），不依赖 walgit 二进制、不联网。
+# 守卫本身默认先 fetch refs/collab/*；自测内部对临时仓的调用一律带 --no-fetch。
+[[task]]
+name = "collab-parents-selftest"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "sh -c 'tools/check_collab_parents.sh --self-test'"
+timeout = "5m"
+env_allow = []

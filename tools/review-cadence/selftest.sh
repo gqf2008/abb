@@ -184,7 +184,7 @@ expect_rc "顶层非数组（异常应 rc=2，不得漏成 0/5）" 2 "$check" --
 shim="$(mktemp -d)"
 printf '#!/bin/sh\nexit 1\n' > "$shim/walgit"
 chmod +x "$shim/walgit"
-expect_rc "thread 取不到（walgit 非零 ⇒ rc=2）" 2 env ABB_CADENCE_SKIP_FETCH=1 PATH="$shim:$PATH" "$check" some-nonexistent-thread
+expect_rc "thread 取不到（walgit 非零 ⇒ rc=2）" 2 env -u WALGIT_MCP_TOKEN -u WALGIT_REPO ABB_CADENCE_SKIP_FETCH=1 PATH="$shim:$PATH" "$check" some-nonexistent-thread
 rm -rf "$shim"
 
 # D68 回归：walgit 把本地子命令关在 `WALGIT_LOCAL_COMMANDS=1` 后面（对外面是 MCP `/mcp`），
@@ -202,7 +202,7 @@ echo '[]'
 SHIM
 chmod +x "$shim2/walgit"
 expect_rc "D68：门禁脚本必须带 WALGIT_LOCAL_COMMANDS=1 调 walgit" 0 \
-  env ABB_CADENCE_SKIP_FETCH=1 PATH="$shim2:$PATH" "$check" some-thread --contract-ts "$ts" --no-review-ts "$ts"
+  env -u WALGIT_MCP_TOKEN -u WALGIT_REPO ABB_CADENCE_SKIP_FETCH=1 PATH="$shim2:$PATH" "$check" some-thread --contract-ts "$ts" --no-review-ts "$ts"
 rm -rf "$shim2"
 
 # 陈旧数据防护：MCP 的 `collab_publish` 不写本地 refs，门禁读本地 refs 会漏判评审。
@@ -215,10 +215,10 @@ printf '#!/bin/sh\necho "[]"\n' > "$shim3/walgit"
 chmod +x "$shim3/walgit"
 # 同步失败 ⇒ rc=2（不许拿陈旧数据判绿）
 expect_rc "同步失败必须 fail-closed（不许用陈旧 refs 判绿）" 2 \
-  env PATH="$shim3:$PATH" sh -c "cd '$stale' && \"$check\" some-thread --contract-ts '$ts' --no-review-ts '$ts'"
+  env -u WALGIT_MCP_TOKEN -u WALGIT_REPO PATH="$shim3:$PATH" sh -c "cd '$stale' && \"$check\" some-thread --contract-ts '$ts' --no-review-ts '$ts'"
 # 显式 --no-fetch ⇒ 允许降级为 best-effort（空 thread 无判据可红）
 expect_rc "--no-fetch 显式降级后可离线判定" 0 \
-  env PATH="$shim3:$PATH" sh -c "cd '$stale' && \"$check\" some-thread --no-fetch --contract-ts '$ts' --no-review-ts '$ts'"
+  env -u WALGIT_MCP_TOKEN -u WALGIT_REPO PATH="$shim3:$PATH" sh -c "cd '$stale' && \"$check\" some-thread --no-fetch --contract-ts '$ts' --no-review-ts '$ts'"
 rm -rf "$stale" "$shim3"
 
 # 「判定依据」必须自报状态：同步过与拿陈旧 refs 不能长得一样。否则协调者合并前
@@ -227,11 +227,15 @@ rm -rf "$stale" "$shim3"
 shim4="$(mktemp -d)"
 printf '#!/bin/sh\necho "[]"\n' > "$shim4/walgit"
 chmod +x "$shim4/walgit"
-out_nofetch="$(env ABB_CADENCE_SKIP_FETCH=1 PATH="$shim4:$PATH" "$check" some-thread --contract-ts "$ts" --no-review-ts "$ts" 2>&1)"
-if printf '%s' "$out_nofetch" | grep -q '未同步'; then
-  pass=$((pass + 1)); echo 'ok   (0) 未同步时输出必须自报「未同步」（不许与同步过长得一样）'
+out_nofetch="$(env -u WALGIT_MCP_TOKEN -u WALGIT_REPO ABB_CADENCE_SKIP_FETCH=1 PATH="$shim4:$PATH" "$check" some-thread --contract-ts "$ts" --no-review-ts "$ts" 2>&1)"
+# 必须锚在「判定依据：」这一行上：末尾的「⚠️ 通过（未同步…）」本身也含「未同步」，
+# 只 grep 全输出会让「basis 硬编码成已同步」这种改法也通过（评审 N1 实测）。
+basis_line="$(printf '%s' "$out_nofetch" | grep '判定依据' || true)"
+if [ -n "$basis_line" ] && printf '%s' "$basis_line" | grep -q '未同步'; then
+  pass=$((pass + 1)); echo 'ok   (0) 判定依据行必须自报「未同步」（不许与同步过长得一样）'
 else
-  fail=$((fail + 1)); echo 'FAIL 未同步时输出没有自报状态，--no-fetch 可静默降级'
+  fail=$((fail + 1)); echo 'FAIL 判定依据行没有自报未同步，--no-fetch 可静默降级'
+  printf '%s\n' "$basis_line" | sed 's/^/     | /'
 fi
 if printf '%s' "$out_nofetch" | grep -q '✅ 通过'; then
   fail=$((fail + 1)); echo 'FAIL 未同步仍打干净的 ✅ 通过（应打带警示的通过）'
@@ -318,7 +322,9 @@ cp "$here/check.jq" "$internal/review-cadence/check.jq"
 python3 - "$check" "$internal/check.sh" <<'PYINJ'
 import sys
 src = open(sys.argv[1]).read()
-needle = 'verdict_emitted=1\nif [ -n "$json_input" ]'
+# 注入点：最终判定**打印之前**（NB-1 之后 verdict_emitted 改为打印后置位，
+# 所以这里锚在判定分支上，而不是锚在置位行上）。
+needle = 'if [ -n "$json_input" ] || [ "${source:-}" = "MCP collab_thread" ]'
 assert needle in src, "注入点没找到（脚本结构变了，请同步更新这条用例）"
 src = src.replace(
     needle,
@@ -330,6 +336,69 @@ chmod +x "$internal/check.sh"
 expect_rc "内部错误（set -u）⇒ exit 2，不得伪装成绿" 2 \
   "$internal/check.sh" --json "$samples/ok_basic.json" --contract-ts "$ts" --no-review-ts "$ts"
 rm -rf "$internal"
+
+# ── 数据源隔离：MCP 调用失败（rc=4）绝不许回落到 CLI（评审 B3）──────────────
+# 这是本卡最关键的不变量：MCP 坏了却换 CLI 判绿 = 假绿（而且没人知道 MCP 坏了）。
+# 早先只测了 mcp_thread.py 自己返回 4，没测**消费方**怎么处理 4，于是把
+# `-ne 3` 改成 `-gt 9`（等于 4 也允许回落）能绿着进主干。
+#
+# 做法：造一个**假 mcp_thread.py 返回 4** 的门禁副本，PATH 里放一个「必定成功且有留痕」
+# 的 walgit shim。断言：① 门禁 rc=2；② 输出里没有 CLI 数据源字样；③ shim 没被调用过。
+iso="$(mktemp -d)"
+mkdir -p "$iso/review-cadence"
+cp "$here/check.jq" "$iso/review-cadence/check.jq"
+printf 'import sys\nsys.stderr.write("mcp boom\\n")\nsys.exit(4)\n' > "$iso/review-cadence/mcp_thread.py"
+cp "$check" "$iso/check.sh"
+chmod +x "$iso/check.sh"
+isos="$(mktemp -d)"
+printf '#!/bin/sh\ntouch "%s/called"\necho "[]"\n' "$isos" > "$isos/walgit"
+chmod +x "$isos/walgit"
+iso_out="$(WALGIT_MCP_TOKEN=dummy PATH="$isos:$PATH" "$iso/check.sh" some-thread \
+  --contract-ts "$ts" --no-review-ts "$ts" 2>&1)"
+iso_rc=$?
+expect_rc_is() {  # 保持与 expect_rc 一致的口径，但复用已跑出的 rc/输出
+  local desc="$1" want="$2" got="$3" out="$4"
+  if [ "$got" -eq "$want" ]; then
+    pass=$((pass + 1)); printf 'ok   (%d) %s\n' "$got" "$desc"
+  else
+    fail=$((fail + 1)); printf 'FAIL (want %d, got %d) %s\n' "$want" "$got" "$desc"
+    printf '%s\n' "$out" | head -6 | sed 's/^/     | /'
+  fi
+}
+expect_rc_is "MCP 返回 4 ⇒ 门禁 exit 2（不许回落 CLI）" 2 "$iso_rc" "$iso_out"
+if printf '%s' "$iso_out" | grep -q 'walgit CLI'; then
+  fail=$((fail + 1)); echo 'FAIL MCP 失败时输出里出现了 CLI 数据源（说明回落了）'
+else
+  pass=$((pass + 1)); echo 'ok   (0) MCP 失败时判定依据不含 CLI 数据源'
+fi
+if [ -f "$isos/called" ]; then
+  fail=$((fail + 1)); echo 'FAIL MCP 失败时竟然调用过 walgit（回落已发生）'
+else
+  pass=$((pass + 1)); echo 'ok   (0) MCP 失败时根本没有调用 walgit'
+fi
+rm -rf "$iso" "$isos"
+
+# 反向对照：MCP 缺凭据（rc=3）时**必须**允许回落 CLI —— 否则「一律 exit 2」
+# 这种把回落整个砍掉的改法也会被判过（这个洞同样会伤可用性）。
+allow="$(mktemp -d)"
+mkdir -p "$allow/review-cadence"
+cp "$here/check.jq" "$allow/review-cadence/check.jq"
+printf 'import sys\nsys.exit(3)\n' > "$allow/review-cadence/mcp_thread.py"
+cp "$check" "$allow/check.sh"
+chmod +x "$allow/check.sh"
+allows="$(mktemp -d)"
+printf '#!/bin/sh\necho "[]"\n' > "$allows/walgit"
+chmod +x "$allows/walgit"
+allow_out="$(WALGIT_MCP_TOKEN=dummy ABB_CADENCE_SKIP_FETCH=1 PATH="$allows:$PATH" \
+  "$allow/check.sh" some-thread --contract-ts "$ts" --no-review-ts "$ts" 2>&1)"
+allow_rc=$?
+rm -rf "$allow" "$allows"
+expect_rc_is "MCP 缺凭据（rc=3）⇒ 允许回落 CLI（rc=0）" 0 "$allow_rc" "$allow_out"
+if printf '%s' "$allow_out" | grep -q 'walgit CLI'; then
+  pass=$((pass + 1)); echo 'ok   (0) rc=3 时判定依据显示走的是 CLI 回落路径'
+else
+  fail=$((fail + 1)); echo 'FAIL rc=3 时没有回落 CLI（可用性被砍掉）'
+fi
 
 echo "── pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
