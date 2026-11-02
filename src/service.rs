@@ -1271,7 +1271,34 @@ async fn run_bot(
     }
 
     // 事件循环：按通道分派
-    if bot.is_dingtalk() {
+    if bot.is_mcp() {
+        // 总线 S2d：MCP 渠道走自己的循环（连外部进程 → 协商入站方式 → 取消息 → 进桥）。
+        // 与内置渠道并列而不是嵌进它们：MCP 渠道没有平台凭证、没有 WS 长连接，
+        // 硬塞进 feishu 分支只会让那条分支到处判 kind。
+        if let Some(ch) = bot.mcp_channel.as_ref() {
+            let envs: Vec<(String, String)> = ch
+                .env
+                .iter()
+                .map(|e| (e.name.clone(), e.value.clone()))
+                .collect();
+            crate::mcp_channel_loop::run(
+                &key,
+                &ch.name,
+                &ch.command,
+                &ch.args,
+                &envs,
+                bridge,
+                stop,
+            )
+            .await;
+        } else {
+            // 理论上进不来（`messenger::build` 已经挡过），但这里**再挡一次**：
+            // 这条路径错了会导致「bot 在线但永不来消息」，比启动失败难查得多。
+            crate::log!("[bot:{key}] kind=mcp 但缺 mcp_channel，事件循环不启动");
+        }
+        crate::botstatus::clear(&key);
+        crate::log!("[bot:{key}] MCP 渠道循环退出");
+    } else if bot.is_dingtalk() {
         crate::dingtalk::stream_loop(bot.app_id.clone(), bot.app_secret.clone(), bridge, stop)
             .await;
         crate::botstatus::clear(&key);

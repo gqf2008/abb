@@ -38,6 +38,7 @@ mod mathrender;
 mod mcp_adapter;
 mod mcp_bus;
 mod mcp_channel;
+mod mcp_channel_loop;
 mod mcp_client;
 mod mcp_inbound;
 mod mcp_inbound_loop;

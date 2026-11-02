@@ -35,6 +35,9 @@ use crate::mcp_bus::{updated_uri, ChannelMessage, Inbound, TOOL_POLL};
 use crate::mcp_client::StdioChannelClient;
 
 /// 入站实现。
+///
+///  是为了能移进 （同步 client 的调用要挪到阻塞线程）。
+#[derive(Debug, Clone)]
 pub enum ChannelInbound {
     /// A：订阅若干 URI，等通知后 read。
     Subscribe {
