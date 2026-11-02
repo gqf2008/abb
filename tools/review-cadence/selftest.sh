@@ -293,5 +293,43 @@ expect_rc "mcp_thread：端点打不通 ⇒ 4（不得伪装成缺凭据）" 4 \
   env WALGIT_MCP_TOKEN=dummy WALGIT_MCP_URL=http://127.0.0.1:1/mcp \
   python3 "$MCP_PY" gqf2008/abb some-thread
 
+# ── lint：$var 紧跟全角字符（unbound variable，且被 EXIT trap 吞成 exit 0）──────
+# 这个坑在本仓已出现三次（pass / fail / mcp_rc 各一次）。它不只是笔误：
+#   · bash 会把紧随 $var 的多字节字符算进变量名 ⇒ "unbound variable"；
+#   · `set -u` 触发后 **EXIT trap 看到的状态是 0**，脚本于是以 0 退出 ——
+#     也就是「门禁内部出错，却对外报绿」。契约要求内部错误必须非零，所以要防复发。
+# 修法：写 ${var}）。扫描范围 = `git ls-files` 的已跟踪 shell 脚本（CI 稳定），
+# 跳过注释行（注释里提到该模式本身不算违规）。
+lint_out="$(git ls-files '*.sh' | python3 tools/review-cadence/lint_shell_vars.py)"
+if [ -z "$lint_out" ]; then
+  pass=$((pass + 1)); echo 'ok   (0) lint：无「$var 紧跟全角字符」（否则内部错误会退化成 exit 0）'
+else
+  fail=$((fail + 1)); echo 'FAIL lint：以下行的 $var 紧跟全角字符，会变成 unbound variable 且被 trap 吞成 exit 0：'
+  printf '%s\n' "$lint_out" | sed 's/^/     | /'
+fi
+
+# ── 内部错误不得伪装成绿（verdict_emitted 守卫）────────────────────────────
+# bash 在 `set -u` 这类内部错误后，EXIT trap 里看到的 `$?` 是 0 ⇒ 一个**崩掉**的门禁
+# 会对外报「通过」。脚本因此有一个显式凭据：只有真正打印了判定才允许 0 退出。
+# 这里把一份**注入了内部错误**的副本跑起来，断言它退 2 而不是 0。
+internal="$(mktemp -d)"
+mkdir -p "$internal/review-cadence"
+cp "$here/check.jq" "$internal/review-cadence/check.jq"
+python3 - "$check" "$internal/check.sh" <<'PYINJ'
+import sys
+src = open(sys.argv[1]).read()
+needle = 'verdict_emitted=1\nif [ -n "$json_input" ]'
+assert needle in src, "注入点没找到（脚本结构变了，请同步更新这条用例）"
+src = src.replace(
+    needle,
+    'echo "internal=$this_var_does_not_exist\\uff09" >/dev/null\n' + needle,
+)
+open(sys.argv[2], "w").write(src)
+PYINJ
+chmod +x "$internal/check.sh"
+expect_rc "内部错误（set -u）⇒ exit 2，不得伪装成绿" 2 \
+  "$internal/check.sh" --json "$samples/ok_basic.json" --contract-ts "$ts" --no-review-ts "$ts"
+rm -rf "$internal"
+
 echo "── pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

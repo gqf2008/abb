@@ -128,7 +128,12 @@ if [ -z "$json_input" ] && [ -z "$thread_id" ]; then
 fi
 
 tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
+# 「没走到判定就退 0」是这类守卫最危险的失效模式：bash 在 `set -u` 之类的内部错误后
+# 会让 EXIT trap 看到 `$?`=0，于是一个**崩掉**的门禁对外报「通过」。
+# 所以用一个显式凭据 `verdict_emitted`：只有真正打印了判定（通过/违规）才允许 0 退出；
+# 否则一律按工具错误（exit 2）处理。这让「内部错误」不可能再伪装成绿。
+verdict_emitted=0
+trap 'rc=$?; rm -f "$tmp"; if [ "$verdict_emitted" != "1" ] && [ "$rc" -eq 0 ]; then rc=2; fi; exit "$rc"' EXIT
 
 if [ -n "$json_input" ]; then
   if [ "$json_input" = "-" ]; then
@@ -152,14 +157,37 @@ else
   fetched=0
   source=""
   mcp_py="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/review-cadence/mcp_thread.py"
+  # 仓库名**从 origin 推导**，不要写死：主机会搬到服务器、路径可能变，写死会让门禁去查
+  # 另一个仓库的同名 thread —— 那是**静默假绿**（拿别人的数据判自己的卡）。
+  # 只在推导失败时退回本仓的规范名，并让调用方能用 WALGIT_REPO 覆盖。
+  if [ -n "${WALGIT_REPO:-}" ]; then
+    repo_slug="$WALGIT_REPO"
+  else
+    # 纯 bash 推导（**不依赖 python3/jq**：本脚本要在精简 PATH 下也能跑起来，
+    # 依赖解释器会让「无凭据 ⇒ fail-closed」那条路径变成 command-not-found）。
+    _url="$(git remote get-url origin 2>/dev/null || true)"
+    _url="${_url%.git}"
+    _url="${_url%/}"
+    case "$_url" in
+      *://*) : ;;                       # https://host/owner/repo
+      *:*)   _url="${_url%%:*}/${_url#*:}" ;;  # git@host:owner/repo
+    esac
+    _owner="${_url%/*}"; _owner="${_owner##*/}"
+    _repo="${_url##*/}"
+    if [ -n "$_owner" ] && [ -n "$_repo" ]; then
+      repo_slug="$_owner/$_repo"
+    else
+      repo_slug="gqf2008/abb"           # 推导失败才退回规范名
+    fi
+  fi
   if [ -n "${WALGIT_MCP_TOKEN:-}" ] && [ -f "$mcp_py" ]; then
-    if python3 "$mcp_py" "${WALGIT_REPO:-gqf2008/abb}" "$thread_id" > "$tmp" 2>"$tmp.err"; then
+    if python3 "$mcp_py" "$repo_slug" "$thread_id" > "$tmp" 2>"$tmp.err"; then
       source="MCP collab_thread"
     else
       mcp_rc=$?
       # 缺凭据（3）才回落；真的调用失败（4）不该被 CLI 悄悄盖过去。
       if [ "$mcp_rc" -ne 3 ]; then
-        echo "❌ MCP 取不到 thread '$thread_id'（mcp_thread.py rc=$mcp_rc）：" >&2
+        echo "❌ MCP 取不到 thread '$thread_id'（mcp_thread.py rc=${mcp_rc}）：" >&2
         cat "$tmp.err" >&2 || true
         echo "   ↳ 门禁不以 CLI 回落掩盖 MCP 失败（两者的数据源不同）。" >&2
         rm -f "$tmp.err"
@@ -221,7 +249,7 @@ fi
 if [ -n "$json_input" ]; then
   basis="外部 JSON（离线输入）"
 elif [ "${source:-}" = "MCP collab_thread" ]; then
-  basis="MCP collab_thread（服务端权威聚合）"
+  basis="MCP collab_thread @ ${repo_slug:-?}（服务端权威聚合）"
 elif [ "${fetched:-0}" = "1" ]; then
   basis="walgit CLI + 已同步 refs/collab/*（过渡路径）"
 else
@@ -235,12 +263,14 @@ echo "$result" | jq -r '
   + "历史跳过 \(.summary.skipped_historical) 条；merge_result(merged) \(.summary.merges) 条"'
 violations="$(echo "$result" | jq -r '.violations[]')"
 if [ -n "$violations" ]; then
+  verdict_emitted=1
   echo "❌ 违规："
   echo "$violations" | sed 's/^/  - /'
   exit 1
 fi
 # 只有「走 CLI 且没同步」这一种组合是 best-effort：MCP 读服务端、--json 由调用方负责，
 # 两者都不存在陈旧问题，必须打干净的 ✅（否则真绿也被降级，信噪比会崩）。
+verdict_emitted=1
 if [ -n "$json_input" ] || [ "${source:-}" = "MCP collab_thread" ] || [ "${fetched:-0}" = "1" ]; then
   echo "✅ 通过"
 else

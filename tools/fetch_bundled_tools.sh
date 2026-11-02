@@ -78,12 +78,12 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       ;;
     tar.gz)
       entry="$(tar -tzf "$file" | awk -v p="$inner_path" '$0==p || $0 ~ ("/" p "$") {print; exit}')"
-      [ -n "$entry" ] || { echo "包内找不到 $inner_path（$tool）" >&2; exit 1; }
+      [ -n "$entry" ] || { echo "包内找不到 ${inner_path}（${tool}）" >&2; exit 1; }
       tar -xOzf "$file" "$entry" >"$DEST/bin/$output_name"
       ;;
     zip)
       entry="$(unzip -Z1 "$file" | awk -v p="$inner_path" '$0==p || $0 ~ ("/" p "$") {print; exit}')"
-      [ -n "$entry" ] || { echo "包内找不到 $inner_path（$tool）" >&2; exit 1; }
+      [ -n "$entry" ] || { echo "包内找不到 ${inner_path}（${tool}）" >&2; exit 1; }
       unzip -p "$file" "$entry" >"$DEST/bin/$output_name"
       ;;
     source-tar)
@@ -104,7 +104,7 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       src="$build/$inner_path"
       if [ ! -x "$src" ]; then
         tail -120 "$build_log" >&2
-        echo "源码构建未产出 $inner_path（$tool）" >&2
+        echo "源码构建未产出 ${inner_path}（${tool}）" >&2
         exit 1
       fi
       cp "$src" "$DEST/bin/$output_name"
@@ -123,7 +123,7 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
         awk -F'\t' -v p="$provider" -v plat="$PLATFORM" '$2==p && ($3=="all" || $3==plat) {print $1}' tools/bundled-cli-tools.tsv
       }
       [ -n "$(names_for_platform)" ] || {
-        echo "$provider 在 tools/bundled-cli-tools.tsv 里没有任何名字（$PLATFORM）" >&2; exit 1;
+        echo "$provider 在 tools/bundled-cli-tools.tsv 里没有任何名字（${PLATFORM}）" >&2; exit 1;
       }
       mkdir -p "$tmp/extract/$tool"
       case "$package" in
@@ -155,7 +155,7 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
       #    Windows 宿主（MSYS/MinGW/Cygwin 的 bash）与 macOS 一样做真执行检查（下面统一做）。
       ;;
     *)
-      echo "不支持的 package 类型：$package（$tool）" >&2
+      echo "不支持的 package 类型：${package}（${tool}）" >&2
       exit 1
       ;;
   esac
@@ -206,14 +206,14 @@ while IFS=$'\t' read -r tool version platform package url sha256 inner_path outp
     rc=0
     "$target" </dev/null >/dev/null 2>&1 || rc=$?
     if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
-      echo "$name 不可执行（rc=$rc）" >&2; exit 1
+      echo "$name 不可执行（rc=${rc}）" >&2; exit 1
     fi
   done < "$tmp/check-names.txt"
 done < <(strip_cr < tools/tool-lock.tsv)
 
 # 计数 = lock 里该平台的**包**数（多调包一个包提供多个工具名，故不再与工具名数相等）。
 [ "$found" -eq "$(awk -F'\t' -v p="$PLATFORM" 'NR>1 && $3==p {n++} END {print n}' tools/tool-lock.tsv)" ] || {
-  echo "lock 中 $PLATFORM 的包数不符（found=$found）" >&2; exit 1;
+  echo "lock 中 $PLATFORM 的包数不符（found=${found}）" >&2; exit 1;
 }
 echo "  [tools] 已准备 $found 个工具到 $DEST"
 
