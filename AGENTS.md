@@ -28,8 +28,11 @@ entire runtime directory; empty means default); per-bot workspaces under
 - **两个面：MCP 是协作接口，CLI 要显式开门（D68）**。walgit **v0.13.0** 起 `walgit collab` /
   `walgit ci` 本地子命令**默认拒执行**（报错会直接说去用 MCP）：对外协作面是 MCP `/mcp`
   —— `collab_board` / `collab_thread` / `collab_report` / `collab_publish` / `ci_status` + 资源订阅。
-  但**签名只能在本地做**（MCP 从不代签，`collab_publish` 只收已签好的条目），本地闸门脚本读的也是
-  本检出里的 refs，所以**凡是要跑 CLI 的场合一律加 `WALGIT_LOCAL_COMMANDS=1`**：
+  但**签名在客户端做**（MCP 从不代签：`collab_publish` 只收已签好的条目，条目的 canonical 形式见
+  `walgit_wal::collab::entry_canonical`（对象键按字节排序、无空白）。签名器可以是 `walgit collab entry`，
+  **也可以是任何 ed25519 实现**——已实测用 Python 复刻 canonical + `openssl pkeyutl -sign -rawin`
+  签出的条目 `collab_publish` 后 `verified: true`）。本地闸门脚本读的是本检出里的 refs，
+  所以**凡是要跑 CLI 的场合一律加 `WALGIT_LOCAL_COMMANDS=1`**：
   `WALGIT_LOCAL_COMMANDS=1 walgit collab board` / `… collab entry …` / `… collab join …` / `… ci status`。
   本仓已按此改齐：`tools/check_review_cadence.sh`、`tools/check_collab_parents.sh`、
   `tools/run_ci_runner.sh` 与 `src/agent.rs` 的提示词（后者的断言钉在命令形态上，删掉 env 会红）。
@@ -74,8 +77,10 @@ entire runtime directory; empty means default); per-bot workspaces under
   **控制台只订 `walgit://collab/board/<owner>/<repo>` 一条**，`signals.wake=auto` + `minIntervalSeconds`
   限流。每条通知只带 URI，读到的 `_meta.version` 就是游标：**变了才处理，自己写下的那条按 head
   entry 的 `actor` 过滤掉**；重启后先读一次（订阅是进程内轮询、best-effort，不能把重启读成
-  「什么都没发生」）。写走 `collab_entry` / `collab_claim` 两个工具（`actor` 必须是 `--key`
-  绑定的 principal），重活（构建、测试、push）仍在工具调用之外跑，收尾只写一条 entry。
+  「什么都没发生」）。写走 MCP 的 **`collab_publish`**（`actor` 必须是认证调用者；工具**不代签**，
+  条目得先在客户端签好），claim 不是独立工具而是发一条 `kind: card_claim` 条目；
+  公钥注册/轮换用 `collab_register`。重活（构建、测试、push）仍在工具调用之外跑，收尾只写一条 entry。
+  （曾误写作 `collab_entry` / `collab_claim`——实测 `tools/list` 无此二工具。）
   **看板内容不要走 `read_resource`**：本项目 board 约 580 KB，而 ki 的读工具硬截断 20 KiB
   （拿到的是断掉的 JSON 残片）；唤醒后用 CLI 取全文 —— `WALGIT_LOCAL_COMMANDS=1 walgit collab board` / `… --format json`。
   同理 `walgit://refs/<owner>/<repo>` **不要订**：实测该仓库 4514 条 ref（`inbox` 3625、
