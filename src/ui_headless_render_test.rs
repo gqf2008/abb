@@ -4231,9 +4231,26 @@ fn share_icon_renders_actual_glyphs_not_tofu() {
     // 所以在这个环境里无论怎么断言都判不出「字形在不在」，只能显式 `[skip]` 并说清原因，
     // 而不是假装测过了（那正是本仓反复踩的「跳过式断言当验证」）。
     if known_good == 0 {
-        println!(
-            "[skip] 分享按钮字形探针：本 headless 台无 emoji 字体（📋 也是 0 墨点）⇒ \
-             判不出字形存在性；这条只能在真机确认（见卡 abb-syschat-share-session-20261102 验收 1）"
+        // **必须走既有的 `glyph_skip_notice`，不能自己 println + return**：
+        // 那会绕过 `strict_no_skip()`——CI / `ABB_TEST_NO_SKIP` 下本次跳过就变成
+        // 「门禁无声变绿」，正是仓里明令禁止的形态。走这个函数，严格模式会 panic。
+        // **不走 `glyph_skip_notice`**：它的 `[skip]` 文案是围绕「缺某个字形 + 一个复跑开关」
+        // 设计的（会印 `ABB_TEST_ASSUME_MISSING_GLYPH=<码位>`）。本用例缺的不是某一个字形，
+        // 而是**整台机器没有 emoji 字体**——照抄那个开关会给出一个根本不解决问题的复跑命令
+        // （这正是 `abb-glyph-probe-env-leak-20261029` 抓过的形态：印给用户的命令本身是坏的）。
+        //
+        // 所以自己打文案，但**保留严格模式语义**（CI / ABB_TEST_NO_SKIP 必须 panic）：
+        // 静默变绿是仓里明令禁止的，无论跳过原因是什么。
+        let why = "本 headless 台没有加载 emoji 字体（ASCII 'A' 有墨、📋/📤 均 0 墨点），\
+                   判不出字形存在性；只能在真机确认（卡 abb-syschat-share-session-20261102 验收 1）";
+        assert!(
+            !strict_no_skip(),
+            "分享按钮 📤 的像素断言需要 emoji 字形，但环境画不出：{why}\n\
+             （严格模式下不得跳过——若确属 CI 镜像字体变化，请当成环境变更处理）"
+        );
+        eprintln!("[skip] 分享按钮 📤 的像素断言：{why}");
+        eprintln!(
+            "[skip] 复跑方式：换一台有 emoji 字体的机器，或真机点 📤 目视（本用例无环境开关可解）"
         );
         return;
     }
@@ -5067,6 +5084,58 @@ fn strict_no_skip_reads_the_switches_from_the_environment() {
     env.unset("ABB_TEST_NO_SKIP");
     env.set("CI", "1");
     assert!(strict_no_skip(), "`CI` 存在 ⇒ 严格模式");
+}
+
+/// 分享字形探针的**两条语义**必须钉住，否则它要么变噪音、要么变假绿。
+///
+/// 背景：这条探针在无 emoji 字体的机器上只能 `[skip]`（卡 `abb-share-icon-glyph-probe-20261102`）。
+/// 一旦 `[skip]` 变成默认且无约束，就退化成本仓明令禁止的「跳过式断言当验证」。
+/// 所以用源码守卫钉两件事——它们是**行为契约**，不是实现细节：
+///
+/// 1. 严格模式（`CI` / `ABB_TEST_NO_SKIP`）必须 **panic**，不得静默跳过；
+/// 2. `[skip]` 文案**不得**印 `ABB_TEST_ASSUME_MISSING_GLYPH` 那个复跑开关
+///    （本用例缺的是整台机器没有 emoji 字体，那个开关按码位放行，解决不了问题、是坏指引）。
+///
+/// 为什么用源码守卫而不是跑两次测试：`strict_no_skip` 读的是**进程级 env**，
+/// 同一进程里改 env 会串到其它用例（`abb-glyph-probe-env-leak-20261029` 的教训）。
+#[test]
+fn share_glyph_probe_keeps_strict_semantics_and_honest_notice() {
+    let src = include_str!("ui_headless_render_test.rs");
+    // 只截本用例函数体：从函数名到下一个 `#[test]`。
+    let start = src
+        .find("fn share_icon_renders_actual_glyphs_not_tofu()")
+        .expect("找不到分享字形探针（改名了？请同步守卫）");
+    let body = &src[start..];
+    let body = match body.find("\n#[test]") {
+        Some(i) => &body[..i],
+        None => body,
+    };
+    // **必须剥注释**：本函数的注释里就写着 `glyph_skip_notice`（解释为什么不用它），
+    // 不剥的话守卫会被自己的说明文字顶红——第一版就因为这个假红过。
+    // （同族教训：源码守卫扫的是代码，不是注释里的叙述。）
+    let code: String = body
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body: &str = &code;
+
+    assert!(
+        body.contains("strict_no_skip()"),
+        "分享字形探针必须保留 `strict_no_skip()` 语义——否则 CI 下会静默变绿"
+    );
+    assert!(
+        body.contains("!strict_no_skip()"),
+        "必须显式断言 `!strict_no_skip()`（严格模式 panic），不能只引用函数名"
+    );
+    assert!(
+        !body.contains("glyph_skip_notice"),
+        "不得复用 `glyph_skip_notice`：它的 `[skip]` 文案会印 `ABB_TEST_ASSUME_MISSING_GLYPH`，\
+         而本用例缺的是整台机器没有 emoji 字体，那个开关解决不了（会变成坏指引）"
+    );
 }
 
 /// 宽松模式（本机）：缺字形 ⇒ 返回带 `[skip]` 与原因的说明（不 panic，其余断言照跑）。
