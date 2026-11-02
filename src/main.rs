@@ -36,6 +36,7 @@ mod lark_user;
 mod larkskills;
 mod mathrender;
 mod mcp_bus;
+mod mcp_client;
 mod mdblocks;
 mod mediaplay;
 mod messenger;
