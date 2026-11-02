@@ -144,6 +144,13 @@ pub fn read_all_turns(id: &str) -> Option<Vec<Turn>> {
     Some(store.read_history(id))
 }
 
+/// 供测试断言「界面模型会丢掉哪些轮」——生产代码不要用它（那只是在复刻 `recent_history`
+/// 的裁剪行为，见 `syschat_share` 的验收 3 用例）。
+#[cfg(test)]
+pub fn recent_history_for_test(history: &[Turn]) -> Vec<Turn> {
+    recent_history(history).to_vec()
+}
+
 /// 当前会话 id（分享按钮不带参时的目标）。
 pub fn current_session_id() -> Option<String> {
     let state = SessionStore::production().load();

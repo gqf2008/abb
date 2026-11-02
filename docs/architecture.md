@@ -111,11 +111,11 @@ $AGENT_BRIDGE_HOME 或 ~/.agent-bridge/        （main.rs:97 bridge_dir）
 |---|---|
 | `src/` 顶层 | 见下表 |
 | `src/runtime/`（从上游移植的会话层）**全目录 13727** | 主要 5 个：acp 4888 / harness 4332 / pool 2173 / queue 1536 / oneshot 571；其余 4 个小文件合计 227 |
-| `src/` 合计 | **114220** |
+| `src/` 合计 | **114264** |
 | `ui/app.slint` | 5904 |
-| GUI 三件合计（ui.rs + syschat.rs + 渲染台） | **25694** |
+| GUI 三件合计（ui.rs + syschat.rs + 渲染台） | **25701** |
 
-最大的六个文件：`ui.rs` 12442、`syschat.rs` 7664、`ui_headless_render_test.rs` 5588、
+最大的六个文件：`ui.rs` 12442、`syschat.rs` 7671、`ui_headless_render_test.rs` 5588、
 `task_run.rs` 4563、`platform.rs` 4096、`main.rs` 3444。
 
 > **重心在 GUI**：`ui.rs` + `syschat.rs` + 渲染台三件（见上表）比整个 `src/runtime/` 全目录还大。

@@ -188,6 +188,43 @@ mod tests {
         assert_eq!(total_chars(&[]), 0, "空会话应为 0");
     }
 
+    /// 卡的验收 3：分享必须覆盖**界面模型已经丢掉**的最早几轮。
+    ///
+    /// **这条是整卡的验收核心**：界面只保留 `HISTORY_KEEP_TURNS * 2` 条（喂模型的上界），
+    /// 若分享从界面模型反推，最早那几轮会**静默消失**。这里造 `keep + 10` 轮，
+    /// 断言分享结果里仍然包含第 0 轮。
+    ///
+    /// 注意判据要看**内容**而不是条数：条数对得上也可能是拿界面模型凑的。
+    #[test]
+    fn share_covers_turns_the_ui_model_has_already_dropped() {
+        let keep = crate::syschat::HISTORY_KEEP_TURNS * 2;
+        let n = keep + 10;
+        let mut turns: Vec<Turn> = (0..n)
+            .map(|i| turn("assistant", &format!("第{i}轮"), ""))
+            .collect();
+        turns[0].text = "最早那一轮".into();
+
+        // 先确认「界面模型确实会丢掉它」——否则这条用例什么都没证明。
+        let trimmed = crate::syschat::recent_history_for_test(&turns);
+        assert!(
+            !trimmed.iter().any(|t| t.text == "最早那一轮"),
+            "前提不成立：界面模型没丢掉第 0 轮（keep={keep}, n={n}）"
+        );
+
+        // 而分享必须包含它。
+        let share = share_blocks(&turns);
+        assert_eq!(share.len(), n, "分享必须全量：{n} 轮");
+        let first_text = share[0]
+            .blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<String>();
+        assert!(
+            first_text.contains("最早那一轮"),
+            "分享丢了界面模型已丢弃的最早一轮"
+        );
+    }
+
     #[test]
     fn malformed_jsonl_lines_are_skipped_not_fatal() {
         // jsonl 是追加写的：进程被杀可能留下半行。分享不该因为一行坏数据整段失败。
