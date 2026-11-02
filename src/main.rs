@@ -35,6 +35,7 @@ mod ki_config;
 mod lark_user;
 mod larkskills;
 mod mathrender;
+mod mcp_bus;
 mod mdblocks;
 mod mediaplay;
 mod messenger;

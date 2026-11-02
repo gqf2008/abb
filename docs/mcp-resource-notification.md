@@ -1,6 +1,17 @@
 # MCP 通知 / 资源读写：工作方式与实测拓扑
 
-本文记录 ABB 的 MCP 通知链（资源订阅 → 通知 → 读资源 → 上报 → 开回合）的实际工作方式。
+> ## ⚠️ 本文描述的是 2026-10-12 的旧模型，**当前不成立**
+>
+> 旧模型把 MCP 连接放在**执行层**（`abb-agent`），再用私有 ACP 通知
+> `_abb/unstable/resource/updated` 转发给 ABB。**2026-10-23 执行层换成 ki 之后，这一步没了**：
+> ki 遵守 ACP 标准、不认识这个私有通知（二进制里 `_abb/unstable` 零命中），
+> 它把通知收进自己的 `mcp.signals.inbox`，于是 ABB 侧第 ⑤ 层（节流→入站消息→开回合）
+> 代码完好却**永远收不到输入**。
+>
+> 所以下面「已实现并实测」指的是**当时**的 abb-agent，不是现在。
+> 目标架构见 `docs/mcp-bus-architecture.md`：**MCP 连接归 ABB 自己**，与执行层解耦。
+
+本文记录 ABB 的 MCP 通知链（资源订阅 → 通知 → 读资源 → 上报 → 开回合）的**历史**工作方式。
 结论来自 2026-10-12 的真机验证（真 `abb-agent` 二进制 + 真飞书 + 活着的 service），
 验证方式见文末「验证记录」。
 
@@ -88,7 +99,7 @@ ABB 收到 ④ 后：`dispatch_resource_update`（`src/runtime/acp.rs`）→
 
 | 方向 | 谁发起 | 走哪条链 | 现状 |
 |---|---|---|---|
-| ① 推（标准 MCP） | MCP server 自己（需先被 `subscribe`） | server → `notifications/resources/updated` → abb-agent read → `_abb/unstable/resource/updated` → ABB 节流 → 入站消息 → 开回合 → 回复飞书 | 已实现并实测 |
+| ① 推（标准 MCP） | MCP server 自己（需先被 `subscribe`） | server → `notifications/resources/updated` → abb-agent read → `_abb/unstable/resource/updated` → ABB 节流 → 入站消息 → 开回合 → 回复飞书 | **当时**已实现并实测（现已被 ki 取代，见顶部告示） |
 | ② 拉（ABB 私有） | agent 循环调工具 | `abb-events`（bridge 内置 stdio server）的 4 个工具：`events_subscribe` / `events_wait` / `events_list` / `events_unsubscribe` | **已删除**（2026-10-11，card `abb-mcp-declarer-only-20261011`） |
 | ③ 工具 | agent 调 `tools/call` | MCP **没有 `resources/write`**；要「写」只能通过工具 | 已实现并实测 |
 
