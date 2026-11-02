@@ -65,6 +65,13 @@ MUTATIONS = [
         # 判定「被咬住」要认它的标记，否则会被误判成「runner 起不来」。
         "fail_marker": "^(FAIL|FATAL|❌)|自测失败",
     },
+    {
+        "name": "M8 MCP 端点退回写死本机地址",
+        "file": "tools/review-cadence/mcp_thread.py",
+        "old": "    url, src = resolve_mcp_url()",
+        "new": '    url, src = os.environ.get("WALGIT_MCP_URL", "http://127.0.0.1:8081/mcp").strip(), "hardcoded"',
+        "why": "本机 walgit 服务退役后，写死 127.0.0.1 的端点必须被测试咬住（迁移即失效）",
+    },
 ]
 
 # 默认自测入口（没写 runner 的变异都用它）

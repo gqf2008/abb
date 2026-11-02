@@ -322,7 +322,7 @@ openssl pkeyutl -sign -inkey \"$gd/walgit/keys/<principal>.pem\" -rawin \
 
 **可达性：先探测，别硬写**：
 
-1. **MCP 凭据是主路径**：`WALGIT_MCP_URL`（默认 `http://127.0.0.1:8081/mcp`）与 `WALGIT_MCP_TOKEN`。
+1. **MCP 凭据是主路径**：`WALGIT_MCP_TOKEN`（必填）。端点 `WALGIT_MCP_URL` 不设时**从 `origin`\n   推导**（`<scheme>://<host>/mcp`）——本机 walgit 服务会退役，写死本机地址必然失效。
    没有凭据就**明确告诉用户「无法记账」**，把要记的内容留成文本，别假装记了。
 2. `walgit` 二进制**不再是必需**：主机会搬到服务器，本地将没有它。若本机恰好有
    （`command -v walgit` → `$HOME/.local/bin/walgit` → `/Applications/walgit-tray.app/Contents/Resources/walgit`），

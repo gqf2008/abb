@@ -14,9 +14,12 @@ MCP 的 `collab_thread` 返回的正是**服务端权威聚合**：按 parent �
 顺带解决另一件事：MCP 读的是服务端状态，不存在「本地 refs 陈旧」问题
 （`collab_publish` 不写本地 refs ⇒ 读本地 refs 会漏判）。
 
-## 凭据只从环境读
+## 端点与凭据
 
-  WALGIT_MCP_URL    默认 http://127.0.0.1:8081/mcp
+  WALGIT_MCP_URL    端点。**默认从 `origin` 的远程地址推导**（`<scheme>://<host>/mcp`），
+                    而不是写死 `127.0.0.1:8081`——本机 walgit 服务退役后那个地址就不存在了，
+                    而 `origin` 一定会跟着迁移一起改（否则 git push 先就不工作了）。
+                    推不出来（本地路径 / 没有 origin）就报错并给指引，**不猜**。
   WALGIT_MCP_TOKEN  Bearer token（必填；不要把 token 放进命令行，它会进 ps）
 
 ## 退出码
@@ -28,6 +31,7 @@ MCP 的 `collab_thread` 返回的正是**服务端权威聚合**：按 parent �
 
 import json
 import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -119,6 +123,43 @@ def fetch_thread(repo: str, thread_id: str, url: str, token: str) -> list[dict]:
     raise RuntimeError("MCP 没有返回 id=2 的结果")
 
 
+def derive_mcp_url(origin_url: str) -> str:
+    """从 git remote 地址推导 MCP 端点；推不出来返回空串（调用方据此 fail-closed）。"""
+    u = origin_url.strip()
+    if not u:
+        return ""
+    u = u[:-4] if u.endswith(".git") else u
+    u = u.rstrip("/")
+    if "://" in u:
+        scheme, rest = u.split("://", 1)
+        host = rest.split("/", 1)[0]
+        return f"{scheme}://{host}/mcp" if host else ""
+    # scp 形态 git@host:owner/repo
+    if "@" in u and ":" in u:
+        host = u.split("@", 1)[1].split(":", 1)[0]
+        return f"https://{host}/mcp" if host else ""
+    return ""  # 本地路径 / 其它形态：不猜
+
+
+def resolve_mcp_url() -> tuple[str, str]:
+    """返回 (url, 来源说明)。显式 env 优先，其次从 origin 推导。"""
+    explicit = os.environ.get("WALGIT_MCP_URL", "").strip()
+    if explicit:
+        return explicit, "WALGIT_MCP_URL"
+    try:
+        out = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10,
+        )
+        origin = out.stdout.strip() if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        origin = ""
+    url = derive_mcp_url(origin)
+    if url:
+        return url, f"origin={origin}"
+    return "", origin
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
         print(f"用法: {argv[0]} <owner>/<repo> <thread-id>", file=sys.stderr)
@@ -128,7 +169,15 @@ def main(argv: list[str]) -> int:
     if not token:
         print("缺 WALGIT_MCP_TOKEN（MCP 需要 Bearer 凭据）", file=sys.stderr)
         return 3
-    url = os.environ.get("WALGIT_MCP_URL", "http://127.0.0.1:8081/mcp").strip()
+    url, src = resolve_mcp_url()
+    if not url:
+        print(
+            "无法确定 MCP 端点：既没有 WALGIT_MCP_URL，也无法从 origin 推导"
+            + (f"（origin={src!r}）" if src else "（没有 origin remote）"),
+            file=sys.stderr,
+        )
+        print("  ↳ 显式设置：export WALGIT_MCP_URL=https://<host>/mcp", file=sys.stderr)
+        return 4
     try:
         entries = fetch_thread(repo, thread_id, url, token)
     except urllib.error.HTTPError as e:

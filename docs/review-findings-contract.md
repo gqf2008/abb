@@ -225,7 +225,8 @@ walgit 的协作面是「**纯 git + MCP**」，本地 `walgit` 二进制将不�
 | — | 都不可用 | — | **fail-closed（exit 2）** 并给配置指引 |
 
 MCP 取数由 `tools/review-cadence/mcp_thread.py` 完成，凭据只从环境读：
-`WALGIT_MCP_URL`（默认 `http://127.0.0.1:8081/mcp`）、`WALGIT_MCP_TOKEN`。
+`WALGIT_MCP_TOKEN`（必填）；端点 `WALGIT_MCP_URL` 不设时**从 `origin` 推导**
+（`<scheme>://<host>/mcp`），推不出来就 fail-closed 并要求显式设置。
 它读的是**服务端权威聚合**（parent 链已排好、每条带 `verified`），因此不存在
 「本地 refs 陈旧」问题；只有走 CLI 且跳过同步时才会降级为 best-effort 并打
 `⚠️ 通过（未同步…）`——两种状态在输出里可区分，判定依据那行会自报来源。

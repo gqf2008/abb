@@ -20,8 +20,10 @@ entire runtime directory; empty means default); per-bot workspaces under
 
 ## Walgit Collaboration
 
-- **Canonical development remote**: `origin` is the local walgit repository at
-  `http://127.0.0.1:8081/gqf2008/abb.git`; `github` is a mirror/release remote only.
+- **Canonical development remote**: `origin` is the walgit host; `github` is a mirror/release remote only.
+  **本机 walgit 服务正在退役**（只能远程访问）⇒ `origin` 迟早要改成远程地址。下面所有默认值都
+  **不写死主机**：MCP 端点从 `origin` 推导（`<scheme>://<host>/mcp`），推不出来就 fail-closed
+  并要求显式设 `WALGIT_MCP_URL`。所以迁移时**只需改 `origin`**，其余自动跟随。
 - **All work tracking lives in walgit**: create/update issues, patches, reviews,
   merge results and status transitions with collab entries under
   `refs/collab/*`. Do not open new GitHub issues or PRs for normal development.
@@ -58,7 +60,7 @@ entire runtime directory; empty means default); per-bot workspaces under
   refs ⇒ 评审用 MCP 发 `request_changes`、协调者本地跑门禁会**看不到它而判绿**。两道防线：
   `check_review_cadence.sh` 默认先同步、同步不成 **fail-closed**（`--no-fetch` 才降级为
   best-effort）；人手核对时也先 fetch。同步用 `git fetch` 即可，**不需要 walgit CLI**。
-- **The host standard is normative**: agents collaborate by this walgit host's `SKILL.md` (`http://walgit.localhost:8081/SKILL.md`, §0–§7). Where this file and that standard disagree, **the standard wins**; this section is a pointer, not a second source of truth.
+- **The host standard is normative**: agents collaborate by this walgit host's `SKILL.md` (`<host>/SKILL.md`, §0–§7). Where this file and that standard disagree, **the standard wins**; this section is a pointer, not a second source of truth.
 - **Identity first (§0/§0a)**: one principal per collaborator, one Ed25519 key, materialized **per worktree** by
   generating the seed with any ed25519 tool (`openssl genpkey -algorithm ed25519`) and registering the
   public half with MCP `collab_register` (the seed lands in that worktree's git dir;
@@ -98,7 +100,8 @@ entire runtime directory; empty means default); per-bot workspaces under
   the board to represent a state change.
 - **MCP lane (自动协作，本机 ki 会话)**: ki 的 `mcpServers` 读 `<cwd>/.ki/settings.json`
   （本机配置，含绝对路径与 token，已 gitignore）。本项目接入的是**服务端 `/mcp`**（HTTP）：
-  `{"url": "http://127.0.0.1:8081/mcp", "headers": {"Authorization": "Bearer wgt_…"}}`。
+  `{"url": "<host>/mcp", "headers": {"Authorization": "Bearer wgt_…"}}`
+  （本机服务退役后就把 url 换成远程；门禁脚本自己会从 `origin` 推导，不依赖这条配置）。
   ⚠️ **`walgit mcp` 子命令已不存在**（D68 后 `walgit mcp --allow-write --key …` 是失效指令，
   `walgit mcp --help` 直接 `unrecognized subcommand`）——不要再照旧文档启 stdio server。
   `/api` 车道也已全 404（只剩 `/api-browser`、`/api/v1`、`/mcp`）。

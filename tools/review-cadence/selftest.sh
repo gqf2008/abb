@@ -403,5 +403,75 @@ else
   fail=$((fail + 1)); echo 'FAIL rc=3 时没有回落 CLI（可用性被砍掉）'
 fi
 
+# ── MCP 端点从 origin 推导（本机 walgit 服务退役后的正确性）──────────────────
+# 背景：本机 walgit 服务正在退役，只能远程访问。若端点写死 `127.0.0.1:8081`，
+# 迁移那一刻门禁就不可用；而 `origin` 一定会跟着迁移改（否则 git push 先就不工作了），
+# 所以**从 origin 推导端点**是唯一自洽的默认值。
+# 这里锁住三件事：① 各种 remote 形态推导正确；② 推不出来时 fail-closed（不猜）；
+# ③ 显式 WALGIT_MCP_URL 优先于推导。
+mcp_derive_out="$(python3 - "$MCP_PY" <<'PYDERIVE'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("m", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+cases = [
+    # (origin, 期望端点)
+    ("http://127.0.0.1:8081/gqf2008/abb.git", "http://127.0.0.1:8081/mcp"),
+    ("https://walgit.example.com/gqf2008/abb.git", "https://walgit.example.com/mcp"),
+    ("https://walgit.example.com:8443/gqf2008/abb", "https://walgit.example.com:8443/mcp"),
+    ("git@walgit.example.com:gqf2008/abb.git", "https://walgit.example.com/mcp"),
+    ("/local/path/repo.git", ""),
+    ("", ""),
+]
+bad = []
+for origin, want in cases:
+    got = m.derive_mcp_url(origin)
+    if got != want:
+        bad.append(f"{origin!r} → {got!r}（期望 {want!r}）")
+print("\n".join(bad))
+PYDERIVE
+)"
+if [ -z "$mcp_derive_out" ]; then
+  pass=$((pass + 1)); echo 'ok   (0) MCP 端点推导：http/https/端口/ssh 形态均正确，本地路径不猜'
+else
+  fail=$((fail + 1)); echo 'FAIL MCP 端点推导有误：'
+  printf '%s\n' "$mcp_derive_out" | sed 's/^/     | /'
+fi
+
+# 推不出来时必须 fail-closed：给一个没有 origin 的临时仓，且不设 WALGIT_MCP_URL
+noorig="$(mktemp -d)"
+( cd "$noorig" && git init -q . ) >/dev/null 2>&1
+# 只看 rc=4 不够：若默认值退回「写死本机地址」，本机恰好有服务时它会因为
+# 「仓库不存在」也返回 4 —— 两种原因撞在一起，测试就分不清了（变异实测逃逸）。
+# 所以还要断言**报因**是「无法确定端点」，而不是「MCP 调用失败」。
+noorig_out="$(env -u WALGIT_MCP_URL WALGIT_MCP_TOKEN=dummy \
+  sh -c "cd '$noorig' && python3 '$MCP_PY' owner/repo some-thread" 2>&1)"
+noorig_rc=$?
+if [ "$noorig_rc" -eq 4 ] && printf '%s' "$noorig_out" | grep -q '无法确定 MCP 端点'; then
+  pass=$((pass + 1)); echo 'ok   (4) 无 origin 且未设 WALGIT_MCP_URL ⇒ 4 且报因是「无法确定端点」'
+else
+  fail=$((fail + 1)); echo "FAIL 无 origin 时应 fail-closed 且报「无法确定端点」（rc=${noorig_rc}）"
+  printf '%s\n' "$noorig_out" | head -3 | sed 's/^/     | /'
+fi
+rm -rf "$noorig"
+
+# 显式 WALGIT_MCP_URL 必须优先于推导（否则迁移时无法覆盖推导结果）
+urltest="$(mktemp -d)"
+( cd "$urltest" && git init -q . && git remote add origin https://derive-me.invalid/o/r.git ) >/dev/null 2>&1
+# 直接问 resolve_mcp_url() 返回什么，而不是看错误文本（错误文本里可能不含 URL）
+override_out="$(cd "$urltest" && WALGIT_MCP_URL=http://127.0.0.1:1/mcp python3 - "$MCP_PY" <<'PYOVR'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("m", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+url, src = m.resolve_mcp_url()
+print(url)
+PYOVR
+)"
+if [ "$override_out" = "http://127.0.0.1:1/mcp" ]; then
+  pass=$((pass + 1)); echo 'ok   (0) 显式 WALGIT_MCP_URL 优先于 origin 推导'
+else
+  fail=$((fail + 1)); echo "FAIL 显式 WALGIT_MCP_URL 没有优先（拿到 ${override_out:-空}）"
+fi
+rm -rf "$urltest"
+
 echo "── pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
