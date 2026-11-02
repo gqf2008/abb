@@ -47,10 +47,15 @@ cd "$repo_root" || exit 2
 
 mode="scan"
 json=0
+# 陈旧数据防护（card abb-d68-local-commands-20261102）——与 check_review_cadence.sh
+# 同一类缺陷：MCP 的 `collab_publish` **只写服务端** refs/collab/inbox/*，不写本地
+# refs；本守卫读本地 refs，不同步就看不见新条目，会把「有新坏 parent」判成合规。
+skip_fetch="${ABB_CADENCE_SKIP_FETCH:-0}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --self-test) mode="self-test" ;;
     --json) json=1 ;;
+    --no-fetch) skip_fetch=1 ;;
     -h|--help)
       # 打印文件头的注释块（第一条非注释行之前），不依赖固定行号
       awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
@@ -62,6 +67,21 @@ while [ $# -gt 0 ]; do
 done
 
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "check_collab_parents: 不是 git 仓库" >&2; exit 2; }
+
+# 同步失败即 fail-closed（exit 2，宁红不假绿）；--no-fetch / ABB_CADENCE_SKIP_FETCH=1 显式降级。
+fetched=0
+if [ "$mode" = "scan" ] && [ "$skip_fetch" != "1" ]; then
+  if ! git fetch --quiet origin 'refs/collab/inbox/*:refs/collab/inbox/*' 2>/dev/null; then
+    if [ "$json" = "1" ]; then
+      printf '{"fetched":false,"error":"无法从 origin 同步 refs/collab/*（MCP 发布不写本地 refs，陈旧数据会漏判）"}\n'
+    else
+      echo "❌ 无法从 origin 同步 refs/collab/inbox/*（MCP 发布不写本地 refs，陈旧数据会漏判新条目）：" >&2
+      echo "   ↳ 确认要扫陈旧 refs 再显式加 --no-fetch（此时结论 best-effort）。" >&2
+    fi
+    exit 2
+  fi
+  fetched=1
+fi
 
 # 单条检查：输出「状态<TAB>说明」；状态为 ok / bad。
 check_one() {
@@ -236,8 +256,8 @@ scan_self_test() {
     git update-ref refs/collab/inbox/0010-broken "$broken"
   ) >/dev/null 2>&1
   local text json tstatus jstatus tcount jcount
-  text=$(bash "$tmp/tools/check_collab_parents.sh" 2>/dev/null); tstatus=$?
-  json=$(bash "$tmp/tools/check_collab_parents.sh" --json 2>/dev/null); jstatus=$?
+  text=$(bash "$tmp/tools/check_collab_parents.sh" --no-fetch 2>/dev/null); tstatus=$?
+  json=$(bash "$tmp/tools/check_collab_parents.sh" --no-fetch --json 2>/dev/null); jstatus=$?
   tcount=$(printf '%s\n' "$text" | grep -cE '^  [0-9a-f]{10}' || true)
   jcount=$(printf '%s\n' "$json" | grep -c '"entry"' || true)
   # 期望：shape 1 + missing 1 + type 5（69/0/null/true/[]）+ parse 1 = 8
@@ -258,13 +278,33 @@ scan_self_test() {
       git update-ref -d "refs/collab/inbox/$n"
     done ) >/dev/null 2>&1
   local okstatus
-  bash "$tmp/tools/check_collab_parents.sh" >/dev/null 2>&1; okstatus=$?
+  bash "$tmp/tools/check_collab_parents.sh" --no-fetch >/dev/null 2>&1; okstatus=$?
   if [ "$okstatus" -eq 0 ]; then
     echo "  ✅ 扫描路径（全合规仓库）⇒ exit 0"
   else
     echo "  ❌ 扫描路径（全合规仓库）被误判为异常（exit=${okstatus}）"
     bad=1
   fi
+  # ── 陈旧数据防护：MCP 发布不写本地 refs，本守卫读本地 refs ────────────────
+  # 临时仓没有 origin ⇒ 同步必失败 ⇒ 必须 fail-closed（exit 2），不许拿陈旧 refs
+  # 判「全部合规」（card abb-d68-local-commands-20261102）。
+  local nfstatus dstatus
+  bash "$tmp/tools/check_collab_parents.sh" >/dev/null 2>&1; nfstatus=$?
+  if [ "$nfstatus" -eq 2 ]; then
+    echo "  ✅ 无 origin 时同步失败 ⇒ exit 2（不许用陈旧 refs 判合规）"
+  else
+    echo "  ❌ 无 origin 时没有 fail-closed（exit=${nfstatus}）"
+    bad=1
+  fi
+  # 显式 --no-fetch 必须能降级（否则离线/自测场景不可用）
+  bash "$tmp/tools/check_collab_parents.sh" --no-fetch >/dev/null 2>&1; dstatus=$?
+  if [ "$dstatus" -eq 0 ]; then
+    echo "  ✅ --no-fetch 显式降级后可离线扫描（exit 0）"
+  else
+    echo "  ❌ --no-fetch 未能降级（exit=${dstatus}）"
+    bad=1
+  fi
+
   # ── 畸形编码：lone surrogate（JSON 合法但无法 UTF-8 编码）────────────────────
   # 旧实现 print 抛 UnicodeEncodeError ⇒ 整轮 exit 2，该条既不算异常、其余行也丢失。
   # 现在必须 exit 1、恰好记这一条，且文本与 JSON 条数一致。
@@ -272,8 +312,8 @@ scan_self_test() {
   sur=$( cd "$tmp" && printf '{"id":"t","kind":"comment","parent":"\\ud800"}' \
         | git hash-object -w --stdin ) || sur=""
   ( cd "$tmp" && git update-ref refs/collab/inbox/0011-surrogate "$sur" ) >/dev/null 2>&1
-  stext=$(bash "$tmp/tools/check_collab_parents.sh" 2>/dev/null); sstatus=$?
-  sjson=$(bash "$tmp/tools/check_collab_parents.sh" --json 2>/dev/null); sjstatus=$?
+  stext=$(bash "$tmp/tools/check_collab_parents.sh" --no-fetch 2>/dev/null); sstatus=$?
+  sjson=$(bash "$tmp/tools/check_collab_parents.sh" --no-fetch --json 2>/dev/null); sjstatus=$?
   stcount=$(printf '%s\n' "$stext" | grep -cE '^  [0-9a-f]{10}' || true)
   sjcount=$(printf '%s\n' "$sjson" | grep -c '"entry"' || true)
   if [ "$sstatus" -eq 1 ] && [ "$sjstatus" -eq 1 ] && [ "$stcount" -eq 1 ] && [ "$sjcount" -eq 1 ] \
@@ -291,7 +331,7 @@ scan_self_test() {
   mkdir -p "$fakewc"
   printf '#!/bin/sh\nexit 1\n' > "$fakewc/wc"
   chmod +x "$fakewc/wc"
-  wout=$(PATH="$fakewc:$PATH" bash "$tmp/tools/check_collab_parents.sh" 2>/dev/null); wst=$?
+  wout=$(PATH="$fakewc:$PATH" bash "$tmp/tools/check_collab_parents.sh" --no-fetch 2>/dev/null); wst=$?
   if [ "$wst" -eq 2 ] && ! printf '%s' "$wout" | grep -q '✅'; then
     echo "  ✅ 阴性对照（wc 失败导致引用数不可得）⇒ exit 2，未误报合规"
   else
@@ -305,7 +345,7 @@ scan_self_test() {
   # N1：python3 启动即失败（等价于解析器坏了）
   printf '#!/bin/sh\nexit 1\n' > "$fake/python3"
   chmod +x "$fake/python3"
-  nout=$(PATH="$fake:$PATH" bash "$tmp/tools/check_collab_parents.sh" 2>/dev/null); nst=$?
+  nout=$(PATH="$fake:$PATH" bash "$tmp/tools/check_collab_parents.sh" --no-fetch 2>/dev/null); nst=$?
   if [ "$nst" -eq 2 ] && ! printf '%s' "$nout" | grep -q '✅'; then
     echo "  ✅ 阴性对照（python3 启动失败）⇒ exit 2，未误报合规"
   else
@@ -315,7 +355,7 @@ scan_self_test() {
   # N2：python3 静默成功但什么都不输出（经典 fail-open：空输出 ≠ 全合规）
   printf '#!/bin/sh\ncat >/dev/null\nexit 0\n' > "$fake/python3"
   chmod +x "$fake/python3"
-  nout=$(PATH="$fake:$PATH" bash "$tmp/tools/check_collab_parents.sh" 2>/dev/null); nst=$?
+  nout=$(PATH="$fake:$PATH" bash "$tmp/tools/check_collab_parents.sh" --no-fetch 2>/dev/null); nst=$?
   if [ "$nst" -eq 2 ] && ! printf '%s' "$nout" | grep -q '✅'; then
     echo "  ✅ 阴性对照（python3 静默空输出）⇒ exit 2，未误报合规"
   else
@@ -330,7 +370,7 @@ printf -- '--TOTAL--\t1\n'
 exit 0
 FAKE
   chmod +x "$fake/python3"
-  nout=$(PATH="$fake:$PATH" bash "$tmp/tools/check_collab_parents.sh" 2>/dev/null); nst=$?
+  nout=$(PATH="$fake:$PATH" bash "$tmp/tools/check_collab_parents.sh" --no-fetch 2>/dev/null); nst=$?
   if [ "$nst" -eq 2 ] && ! printf '%s' "$nout" | grep -q '✅'; then
     echo "  ✅ 阴性对照（扫描数 1 ≠ ref 数 2）⇒ exit 2，未误报合规"
   else
@@ -358,7 +398,7 @@ exec '$real_py' "\$@"
 FAKE
     chmod +x "$fakejson/python3"
     rm -f "$jsonmarker"
-    jout=$(PATH="$fakejson:$PATH" bash "$tmp/tools/check_collab_parents.sh" --json 2>/dev/null); jst=$?
+    jout=$(PATH="$fakejson:$PATH" bash "$tmp/tools/check_collab_parents.sh" --no-fetch --json 2>/dev/null); jst=$?
     if [ "$jst" -eq 2 ] && ! printf '%s' "$jout" | grep -q '✅'; then
       echo "  ✅ 阴性对照（真实扫描 + JSON 转换失败）⇒ exit 2，未误报合规"
     else
