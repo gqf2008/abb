@@ -212,8 +212,26 @@ tools/check_review_cadence.sh --json tools/review-cadence/samples/ok_basic.json 
 
 退出码：`0` 通过；`1` 违规；`2` 用法/工具错误（缺 jq、thread 取不到、JSON 非法）。
 
-守卫自身的自测（合规 + 违规 + 守卫失效模式，共 83 例）随仓提交，并在
-`.walgit/ci.toml` 的 `review-cadence-selftest` 任务里执行：
+### thread 数据从哪来（2026-11-02 起）
+
+walgit 的协作面是「**纯 git + MCP**」，本地 `walgit` 二进制将不再部署，所以本守卫
+**不把 CLI 当唯一来源**。数据源优先级：
+
+| 顺序 | 来源 | 何时用 | 输出标记 |
+|---|---|---|---|
+| 1 | `--json <file\|->` | 自测 / CI / 已有导出 | `外部 JSON（离线输入）` |
+| 2 | **MCP `collab_thread`** | 常规（需 `WALGIT_MCP_TOKEN`） | 干净 `✅ 通过` |
+| 3 | `walgit collab thread` | 本机恰好还有二进制（过渡）；**默认先 `git fetch refs/collab/*`** | 干净 `✅ 通过` |
+| — | 都不可用 | — | **fail-closed（exit 2）** 并给配置指引 |
+
+MCP 取数由 `tools/review-cadence/mcp_thread.py` 完成，凭据只从环境读：
+`WALGIT_MCP_URL`（默认 `http://127.0.0.1:8081/mcp`）、`WALGIT_MCP_TOKEN`。
+它读的是**服务端权威聚合**（parent 链已排好、每条带 `verified`），因此不存在
+「本地 refs 陈旧」问题；只有走 CLI 且跳过同步时才会降级为 best-effort 并打
+`⚠️ 通过（未同步…）`——两种状态在输出里可区分，判定依据那行会自报来源。
+
+守卫自身的自测（合规 + 违规 + 守卫失效模式 + 数据源契约，共 98 例）随仓提交，并在
+`.walgit/ci.toml` 的 `review-cadence-selftest` 任务里执行（不依赖网络）：
 
 ```sh
 tools/review-cadence/selftest.sh
