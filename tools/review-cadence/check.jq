@@ -319,6 +319,57 @@ def label_counts:
                  and (.e.ts // 0) >= $contract_ts)
         | "\(.oid): \(.e.kind) 条目签名验不过（verified=false）⇒ 不得据它合并" ),
 
+      # (h) `decisions` 字段形状（AGENTS.md 触发清单 T1–T5 的落地判据）。
+      #
+      # 为什么需要（2026-11-02 实证）：AGENTS.md 写着「有取舍先问 Jev」，而我整轮
+      # **一次都没问**——因为我把「替产品做的决定」归类成了技术判断。规则只用散文写，
+      # 落不到具体时刻；于是改成 `patch` 条目带结构化 `decisions`，门禁能查形状。
+      #
+      # 只判**三条确定性的事实**，不判「该不该问」（那需要读懂语义，判不准）：
+      #
+      #   A1 `rid` 必须像真的：`^gen-dec-<数字>-<字母数字>$`。编不出这个格式 ⇒
+      #      说明在假装问过（比不问更坏：它让审计链看起来有痕迹）。
+      #   A2 `self_decided` 不得命中 T1–T4 的信号词：那些本该问却被记成自决。
+      #      命中即红——这是本判据唯一的"语义"判断，但只查**固定词表**，不猜意图。
+      #   A3 低置信（`conf < 0.6`）必须被如实转述：`q` 里要出现「不确定」。
+      #      Jev 是概率决策器，把 p=0.7 说成定论是失真（AGENTS.md 明确要求带分布+置信）。
+      #
+      # **不判「asked 为空」**：纯技术活真的可以不问。字段在，人一眼能看出
+      # 「这轮拍了 N 个、问了 0 个」——异常可见就够了，不制造误红。
+      #
+      # 历史条目无此字段：只对 `ts >= $contract_ts` 的 patch 判，不追溯。
+      ( $items[]
+        | select(.e.kind == "patch" and (.e.ts // 0) >= $contract_ts)
+        | .e.body.decisions as $d
+        | select($d != null)
+        | if ($d | type) != "object" then
+            "\(.oid): decisions 必须是对象（{asked:[…], self_decided:[…]}）"
+          else
+            ( ( $d.asked // [] ) as $asked
+            | ( $d.self_decided // [] ) as $self
+            # A1 形状
+            | ( $asked[]
+                | select((.rid | type) == "string"
+                         and (.rid | test("^gen-dec-[0-9]+-[A-Za-z0-9]+$")) | not)
+                | "\(.rid // "?"): decisions.asked 的 rid 不像真的 Jev request_id"
+                  + "（应形如 gen-dec-1793630641-f00bippeCVxQdUiNrRjA）⇒ 不得假装问过" ),
+              # A2 自决越界
+              ( $self[]
+                | select(
+                    ((.what // "") + " " + (.why // ""))
+                    | test("默认值|阈值|上限|文案|用户看到|产品决定|按惯例")
+                  )
+                | "\(.what // "?"): 这一项命中了触发清单（T1–T4 的信号词）却记成 self_decided"
+                  + " ⇒ 应先问 Jev 再落；口径见 docs/decision-defaults.md" ),
+              # A3 低置信失真
+              ( $asked[]
+                | select((.conf // 1) < 0.6)
+                | select(((.q // "") | test("不确定")) | not)
+                | "\(.rid): conf=\(.conf) < 0.6（Jev 自己也不确定），但 q 里没如实写成不确定"
+                  + " ⇒ 不得把概率判断包装成强结论" )
+            )
+          end ),
+
       # (g) 「合并于本判据之后，却一条判决类 review 都没有」⇒ 判红。
       #
       # 为什么需要：判据 (c) 的实现是 `( $post | final_judged )[]`，jq 对空数组的 `[]`

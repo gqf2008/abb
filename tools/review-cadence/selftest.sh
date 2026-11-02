@@ -183,6 +183,35 @@ case "$merged_msg" in
      printf '%s\n' "$merged_msg" | head -4 | sed 's/^/     | /' ;;
 esac
 
+# ── 判据 (h)：`decisions` 字段形状（AGENTS.md 触发清单 T1–T5 的落地判据）──────────
+#    为什么需要（2026-11-02 实证）：AGENTS.md 写着「有取舍先问 Jev」，而协调者整轮
+#    **一次都没问**——因为把「替产品做的决定」归类成了技术判断。散文规则落不到具体时刻，
+#    所以改成结构化字段 + 门禁查形状。
+#    三红三绿的分工：假 rid / 自决越界 / 低置信包装成定论 各红一条；
+#    纯技术自决、真问过且如实写明、无字段（纯技术卡）各绿一条（防误红）。
+for s in bad_decisions_fake_rid bad_decisions_self_decided_crosses_trigger \
+         bad_decisions_low_confidence_not_stated; do
+  expect_rc "(h) 违规：$s" 1 \
+    "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
+done
+for s in ok_decisions_self_decided_technical_only \
+         ok_decisions_asked_with_low_confidence_stated ok_decisions_absent; do
+  expect_rc "(h) 合规：$s" 0 \
+    "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
+done
+# 报因要指对地方（否则被别的原因顶住，对这条判据零判别力）
+for pair in "bad_decisions_fake_rid 假装问过" \
+            "bad_decisions_self_decided_crosses_trigger 触发清单" \
+            "bad_decisions_low_confidence_not_stated 包装成强结论"; do
+  set -- $pair
+  msg="$("$check" --json "$samples/$1.json" --contract-ts "$ts" --no-review-ts "$ts" 2>&1 || true)"
+  case "$msg" in
+    *"$2"*) pass=$((pass + 1)); echo "ok   (1) (h) 报因含「$2」" ;;
+    *) fail=$((fail + 1)); echo "FAIL (h) $1 的报因没含「$2」"
+       printf '%s\n' "$msg" | head -3 | sed 's/^/     | /' ;;
+  esac
+done
+
 # ── 违规**条数**：判据 (e) 也是逐条 merge 判（abb-worker-78 的同类洞）──────────────
 #    只判某一条 merge ⇒ 一条 ts 回溯的尾部 merge 就能洗白「终审 = 合并者」。
 #    所以两个用例：回溯尾部那条**遮不住**真违规（仍 1 条），两条 merge 同人则**各报一条**（2 条）。
