@@ -147,6 +147,42 @@ for pair in "ok_merged_before_no_review_ts 0" "bad_merged_two_violations 2" \
   expect_violations "违规条数：$1" "$2" "$check" --json "$samples/$1.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 
+# ── 判据 (c) 补：终审之后不得再有 patch（卡 abb-cadence-approve-then-patch-20261102）──
+#    2026-11-02 的真实代价：评审 approve 了 head A，作者随后又推 B，而 (c) 只看
+#    「最后一条是不是 approve」⇒ 门禁会把「从未被那轮评审看过的 head」放行。
+#    三例各有分工，缺一不可：
+#      ① 违规必须红（否则新判据是摆设）
+#      ② approve 之后没有新 patch 必须绿（否则把正常工作流判红）
+#      ③ 已合并的不追溯判红（(c) 是合并前闸门；追溯判红改不了事实，只会训练人忽略门禁），
+#         但必须打一条 ⚠️ 告警——登记了不打印等于没登记。
+expect_rc "终审后有 patch（未合并）⇒ 红" 1 \
+  "$check" --json "$samples/bad_patch_after_approve.json" --contract-ts "$ts" --no-review-ts "$ts"
+expect_rc "终审后无 patch ⇒ 绿（防误红）" 0 \
+  "$check" --json "$samples/ok_no_patch_after_approve.json" --contract-ts "$ts" --no-review-ts "$ts"
+expect_rc "已合并的过期终审不追溯 ⇒ 绿" 0 \
+  "$check" --json "$samples/ok_merged_stale_review_not_retroactive.json" --contract-ts "$ts" --no-review-ts "$ts"
+# 报因要指名「终审早于最后改动」，而不是笼统地变成别的错——否则新判据被别的原因顶住，
+# 用例还是会"红"，但对这条判据零判别力。
+# 注意：本脚本是 `set -uo pipefail`（第 18 行）——违规样本让 $check 返回 1，
+# 直接写 `$check ... | grep -q` 时 pipefail 会把整条 pipeline 判成失败，
+# 于是**即使 grep 匹配到也走 else**（实测：这两条用例曾因此假红）。
+# 所以先捕获文本，再判内容，不依赖 pipeline 的退出码。
+stale_msg="$("$check" --json "$samples/bad_patch_after_approve.json" \
+             --contract-ts "$ts" --no-review-ts "$ts" 2>&1 || true)"
+case "$stale_msg" in
+  *"终审早于最后改动"*) pass=$((pass + 1)); echo 'ok   (1) 报因指名「终审早于最后改动」' ;;
+  *) fail=$((fail + 1)); echo 'FAIL 报因没指名「终审早于最后改动」'
+     printf '%s\n' "$stale_msg" | head -4 | sed 's/^/     | /' ;;
+esac
+# 已合并的过期终审要看得见（不阻塞但可审计）
+merged_msg="$("$check" --json "$samples/ok_merged_stale_review_not_retroactive.json" \
+              --contract-ts "$ts" --no-review-ts "$ts" 2>&1 || true)"
+case "$merged_msg" in
+  *"已合并的过期终审"*) pass=$((pass + 1)); echo 'ok   (0) 已合并的过期终审有可见告警' ;;
+  *) fail=$((fail + 1)); echo 'FAIL 已合并的过期终审没有告警行（登记了看不见=没登记）'
+     printf '%s\n' "$merged_msg" | head -4 | sed 's/^/     | /' ;;
+esac
+
 # ── 违规**条数**：判据 (e) 也是逐条 merge 判（abb-worker-78 的同类洞）──────────────
 #    只判某一条 merge ⇒ 一条 ts 回溯的尾部 merge 就能洗白「终审 = 合并者」。
 #    所以两个用例：回溯尾部那条**遮不住**真违规（仍 1 条），两条 merge 同人则**各报一条**（2 条）。

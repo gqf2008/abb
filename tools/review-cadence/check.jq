@@ -165,6 +165,17 @@ def label_counts:
             | map(select((.ts == $finals[0].ts) | not))
             | map(contract_problems($contract_ts) | select(. != "")) | length )
       else 0 end ) as $contract_mismatches_historical
+# 已合并 thread 里「终审早于最后改动」的条数（告警，不阻塞）。
+# 为什么单开一个计数：那类记录是真违规（合并晚于未审 patch），但已经合了、改不了事实，
+# 而追溯判红会误导使用者忽略门禁（本仓反复踩过）。留着可见，但不当阻塞。
+| ( ( $reviews
+      | map(select(.ts >= $contract_ts
+                   and (.decision == "approve" or .decision == "request_changes"))) ) as $jr
+    | if (($jr | length) > 0) and (($merge_items | length) > 0) then
+        ( $jr | final_judged ) as $f
+        | [ $f[] | . as $v
+            | select(( $patches | map(select(.ts > $v.ts)) | length ) > 0) ] | length
+      else 0 end ) as $stale_review_merged_historical
 | (
     [
       # (a) 判决类 review 的契约一致性 —— **只判最后一条判决类 review**。
@@ -194,6 +205,27 @@ def label_counts:
 
       # (c) 可合并：thread 内最后一条（ts ≥ 契约阈值）判决类 review 必须是 blocking=0 的 approve。
       #     必须在**合并前**就能判（旧写法以「已有 merge_result」为前置 ⇒ 活卡恒绿，评审 blocking 项）。
+      #
+      #     **终审之后不得再有 patch**（卡 abb-cadence-approve-then-patch-20261102）：
+      #     早先只看「最后一条是不是 approve」，而 approve 之后追加 patch **不会使它失效**
+      #     ⇒ 门禁会把「从未被那轮评审看过的 head」放行。现实实例：2026-11-02 推进
+      #     `abb-mcp-bus-architecture-20261102` 时，评审已 approve `8a1a57e`，作者随后又推
+      #     `69909d6`，若据此合并就是「审 A 合 B」。
+      #
+      #     **先量误红再改**（卡内要求）：全账本 1011 个 thread、150 个有判决类 review，
+      #     加上本判据后在契约阈值之后的命中仅 **3 条**，且逐条核实**全部是真违规**
+      #     （终审 ts 之后确实有 patch）：
+      #       · abb-mcp-bus-architecture-20261102（未合并）→ 正确判红，正是该卡要拦的
+      #       · abb-sched-count-no-upper-bound-20261029（已合并，合并晚于未审 patch）
+      #       · abb-v11-message-actions（已合并，合并晚于未审 patch）
+      #     误红 0 条 ⇒ 可以判死，不需要降级成「只报警」。
+      #
+      #     **已合并的不追溯判红**（与 (g) 的 `NO_REVIEW_TS` 同取向）：(c) 是**合并前**闸门，
+      #     问的是「我现在能不能合」。已经合了的再去判红既改不了事实，又会训练使用者忽略
+      #     门禁（本仓反复踩过：误红比缺判据更糟）。那两条转为 summary 里的
+      #     `stale_review_merged_historical` 计数上报——可审计、不阻塞。
+      #     ⚠️ 这意味着「先绕过门禁合了、再补 patch」不会被本判据追责；那类行为由
+      #     `abb-coordinator-bypassed-merge-gate-20261101` 的口径（人工留痕）承担。
       ( ( $reviews
           | map(select(.ts >= $contract_ts
                        and (.decision == "approve" or .decision == "request_changes"))) ) as $post
@@ -201,7 +233,17 @@ def label_counts:
         | if ($v.decision != "approve"
               or ($v.contract != null and $v.contract.blocking > 0)) then
             "thread 最后一条判决类 review（\($v.oid)）不是 blocking=0 的 approve（decision=\($v.decision)）⇒ 不得合并"
-          else empty end ),
+          else
+            # 只在**未合并**时判红：这是合并前闸门（同段首句），已合并的取证改不了事实，
+            # 且追溯判红会误导使用者忽略门禁。已合并的过期终审转 summary 计数上报。
+            ( if ($merge_items | length) == 0 then
+                ( $patches | map(select(.ts > $v.ts)) | last ) as $later
+                | if $later != null then
+                    "thread 最后一条判决类 review（\($v.oid)，ts=\($v.ts)）之后还有 patch（\($later.oid)，ts=\($later.ts)）"
+                    + " ⇒ 终审早于最后改动，那条 approve 未覆盖当前 head，不得合并"
+                  else empty end
+              else empty end )
+          end ),
 
       # (d) 独立评审（§0b）：**最后一条判决类 review** 的 actor 不得与**它所审的那份 patch**
       #     （即该 review 之前 ts 最新的 patch）的 actor 相同。
@@ -432,5 +474,6 @@ def label_counts:
                skipped_historical: $skipped,
                merges: ($merges | length),
                self_reviews_historical: ($self_reviews_all | length),
-               contract_mismatches_historical: $contract_mismatches_historical },
+               contract_mismatches_historical: $contract_mismatches_historical,
+               stale_review_merged_historical: $stale_review_merged_historical },
     reviews: [ $reviews[] | {oid, ts, decision, contract} ] }

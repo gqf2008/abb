@@ -229,6 +229,13 @@ echo "$result" | jq -r '
   "review 条目 \(.summary.reviews) 条（其中判决类 \(.summary.judged_reviews) 条）；"
   + "blocking 轮数 \(.summary.blocking_rounds)；"
   + "历史跳过 \(.summary.skipped_historical) 条；merge_result(merged) \(.summary.merges) 条"'
+# 已合并的「终审早于最后改动」只告警不阻塞（理由见 check.jq 里 (c) 的注释：这是合并前
+# 闸门，已合并的追溯判红改不了事实，反而会训练使用者忽略门禁）。**但必须可见**——
+# 登记了不打印等于没登记，那正是本仓反复踩的「沉默假绿」。
+stale_merged="$(echo "$result" | jq -r '.summary.stale_review_merged_historical // 0')"
+if [ "${stale_merged:-0}" -gt 0 ] 2>/dev/null; then
+  echo "⚠️  已合并的过期终审 ${stale_merged} 条（终审早于最后改动；不阻塞，仅告警）"
+fi
 violations="$(echo "$result" | jq -r '.violations[]')"
 if [ -n "$violations" ]; then
   echo "❌ 违规："
