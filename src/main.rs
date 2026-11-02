@@ -35,6 +35,7 @@ mod ki_config;
 mod lark_user;
 mod larkskills;
 mod mathrender;
+mod mcp_adapter;
 mod mcp_bus;
 mod mcp_channel;
 mod mcp_client;
