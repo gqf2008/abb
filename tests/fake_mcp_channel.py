@@ -32,6 +32,10 @@ STATE = {
          "sender_name": "A", "text": "第三条", "ts": 1793600003},
     ],
     "sent": [],
+    # 被 `resources/read` 调用的次数。**必须暴露给测试**：
+    # 「重复通知只 read 一次」这条断言如果只看消息条数，会因为
+    # read 后清空而永远成立（第二次 read 返回空 ⇒ 总数不变）⇒ 空断言。
+    "reads": 0,
 }
 
 
@@ -43,8 +47,10 @@ def log(msg):
 def tools_list():
     if MODE == "poll":
         # 轮询模式下**不暴露 resources**：验证 ABB 会正确退到 B 方案
-        return {"tools": [{"name": "send_text"}, {"name": "poll"}]}
-    return {"tools": [{"name": "send_text"}, {"name": "send_thread_reply"}]}
+        return {"tools": [{"name": "send_text"}, {"name": "poll"},
+                          {"name": "debug_stats"}]}
+    return {"tools": [{"name": "send_text"}, {"name": "send_thread_reply"},
+                      {"name": "debug_stats"}]}
 
 
 def resources_list():
@@ -65,6 +71,10 @@ def call_tool(params):
     if name == "send_thread_reply":
         log(f"send_thread_reply → {args}")
         return {"content": [{"type": "text", "text": "ok"}]}
+    if name == "debug_stats":
+        # 测试用：让 ABB 侧能读到 read 次数 / 收到的出站内容。
+        return {"content": [{"type": "text", "text": json.dumps(
+            {"reads": STATE["reads"], "sent": STATE["sent"]})}]}
     if name == "poll":
         # 游标语义：只推进不倒退；取完返回空
         cur = int(args.get("cursor") or 0)
@@ -80,6 +90,8 @@ def read_resource(params):
     uri = params.get("uri")
     if uri != "channel://inbox":
         return None
+    STATE["reads"] += 1
+    log(f"resources/read #{STATE['reads']}")
     # A 方案：一次把待取消息放进 contents[0].text（JSON 数组），然后清空
     msgs = STATE["pending"]
     STATE["pending"] = []

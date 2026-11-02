@@ -124,6 +124,12 @@ impl McpChannelMessenger {
         }
     }
 
+    /// 取回内部 client（端到端测试用：同一个进程继续问统计）。
+    #[cfg(test)]
+    pub fn into_client_for_test(self) -> crate::mcp_client::StdioChannelClient {
+        self.client.into_inner().expect("测试里不该中毒")
+    }
+
     /// 调一个工具，返回文本结果。
     ///
     /// MCP 的工具结果形状是 `{content: [{type:"text", text:"…"}, …]}`。

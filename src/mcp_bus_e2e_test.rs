@@ -59,6 +59,27 @@ fn spawn(mode: &str) -> Option<crate::mcp_client::StdioChannelClient> {
     }
 }
 
+/// 问假 server 要运行时统计（它暴露了 `debug_stats` 工具）。
+///
+/// 为什么需要它：有些断言（例如「只 read 一次」）**只看结果数据是证明不了的**——
+/// read 后清空会让总数不变，于是断言恒真。必须直接观测调用次数。
+fn call_stats(client: &mut crate::mcp_client::StdioChannelClient) -> serde_json::Value {
+    let resp = client
+        .call(
+            "tools/call",
+            serde_json::json!({"name":"debug_stats","arguments":{}}),
+        )
+        .expect("debug_stats 应当可用");
+    let text = resp
+        .get("content")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|s| s.get("text"))
+        .and_then(|v| v.as_str())
+        .expect("debug_stats 返回文本");
+    serde_json::from_str(text).expect("debug_stats 文本应是 JSON")
+}
+
 /// A 方案端到端：订阅 → 收通知 → read → 翻译成 `Ev`。
 #[test]
 fn subscribe_end_to_end_reaches_ev() {
@@ -114,6 +135,17 @@ fn subscribe_end_to_end_reaches_ev() {
         msgs.len()
     );
     assert_eq!(msgs[0].text, "第一条");
+
+    // **关键**：光看消息条数证明不了「只 read 一次」——假 server 的 read 是读后清空，
+    // 第二次 read 返回空，总数照样是 3。必须问 server 要**调用次数**。
+    // （评审抓出来的：原来的断言恒真，去掉去重也不红 = 没测。）
+    let stats = call_stats(&mut client);
+    assert_eq!(
+        stats["reads"].as_u64(),
+        Some(1),
+        "两条重复通知应当只触发 1 次 resources/read，实际 {} 次",
+        stats["reads"]
+    );
 
     // 翻译成 Ev：真实链路最后一环
     let ev = crate::mcp_adapter::to_ev(&msgs[0]).expect("应当能翻译");
@@ -203,4 +235,19 @@ fn send_text_end_to_end_reaches_the_server() {
             .await
             .expect("send_thread_reply 应当成功");
     });
+
+    // **真的送达了吗**：`send_text` 返回 Ok 证明不了内容到了对端——
+    // 本仓 `send_attachment` 的旧默认实现就是「返回 Ok 但什么都没发」。
+    // 所以必须问 server 拿到了什么。
+    let mut c = m.into_client_for_test();
+    let stats = call_stats(&mut c);
+    let sent = stats["sent"].as_array().expect("sent 应是数组");
+    assert_eq!(
+        sent.len(),
+        1,
+        "服务端应当收到 1 条 send_text，实际 {}",
+        sent.len()
+    );
+    assert_eq!(sent[0]["chat_id"].as_str(), Some("mcp-chat"));
+    assert_eq!(sent[0]["text"].as_str(), Some("端到端测试"));
 }
