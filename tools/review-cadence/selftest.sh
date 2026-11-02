@@ -194,13 +194,14 @@ esac
 # Jev 判 `fix_jq_wordlist` p=1.0/conf=1.0、`gate_false_positive` p=0.95/conf=0.92。
 # 所以两条并排钉住**收窄后仍有效**：改界面文案 ⇒ 红；改跳过提示 ⇒ 绿。
 for s in bad_decisions_fake_rid bad_decisions_self_decided_crosses_trigger \
-         bad_decisions_low_confidence_not_stated bad_decisions_ui_wording; do
+         bad_decisions_low_confidence_not_stated bad_decisions_ui_wording \
+         bad_decisions_affirmative_mention; do
   expect_rc "(h) 违规：$s" 1 \
     "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
 for s in ok_decisions_self_decided_technical_only \
          ok_decisions_asked_with_low_confidence_stated ok_decisions_absent \
-         ok_decisions_debug_output_wording; do
+         ok_decisions_debug_output_wording ok_decisions_negated_mention; do
   expect_rc "(h) 合规：$s" 0 \
     "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
@@ -208,7 +209,8 @@ done
 for pair in "bad_decisions_fake_rid 假装问过" \
             "bad_decisions_self_decided_crosses_trigger 触发清单" \
             "bad_decisions_low_confidence_not_stated 包装成强结论" \
-            "bad_decisions_ui_wording 触发清单"; do
+            "bad_decisions_ui_wording 触发清单" \
+            "bad_decisions_affirmative_mention 触发清单"; do
   set -- $pair
   msg="$("$check" --json "$samples/$1.json" --contract-ts "$ts" --no-review-ts "$ts" 2>&1 || true)"
   case "$msg" in
