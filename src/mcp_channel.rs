@@ -106,6 +106,24 @@ impl McpChannelMessenger {
         &self.caps
     }
 
+    /// 用一个**已经连好**的 client 组装（端到端测试用）。
+    ///
+    /// 为什么不复用 [`Self::connect`]：那条会自己 spawn 进程并做能力校验，
+    /// 而测试需要「用同一个已握手的 client 既走协议层又走 Messenger 层」——
+    /// 否则验的是两个不同进程，说明不了链路一致。
+    #[cfg(test)]
+    pub fn from_client_for_test(
+        client: crate::mcp_client::StdioChannelClient,
+        name: &str,
+        caps: ChannelCapabilities,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            client: Mutex::new(client),
+            caps,
+        }
+    }
+
     /// 调一个工具，返回文本结果。
     ///
     /// MCP 的工具结果形状是 `{content: [{type:"text", text:"…"}, …]}`。
