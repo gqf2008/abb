@@ -25,24 +25,32 @@ entire runtime directory; empty means default); per-bot workspaces under
 - **All work tracking lives in walgit**: create/update issues, patches, reviews,
   merge results and status transitions with collab entries under
   `refs/collab/*`. Do not open new GitHub issues or PRs for normal development.
-- **两个面：MCP 是协作接口，CLI 要显式开门（D68）**。walgit **v0.13.0** 起 `walgit collab` /
-  `walgit ci` 本地子命令**默认拒执行**（报错会直接说去用 MCP）：对外协作面是 MCP `/mcp`
-  —— `collab_board` / `collab_thread` / `collab_report` / `collab_publish` / `ci_status` + 资源订阅。
-  但**签名在客户端做**（MCP 从不代签：`collab_publish` 只收已签好的条目，条目的 canonical 形式见
-  `walgit_wal::collab::entry_canonical`（对象键按字节排序、无空白）。签名器可以是 `walgit collab entry`，
-  **也可以是任何 ed25519 实现**——已实测用 Python 复刻 canonical + `openssl pkeyutl -sign -rawin`
-  签出的条目 `collab_publish` 后 `verified: true`）。本地闸门脚本读的是本检出里的 refs，
-  所以**凡是要跑 CLI 的场合一律加 `WALGIT_LOCAL_COMMANDS=1`**：
-  `WALGIT_LOCAL_COMMANDS=1 walgit collab board` / `… collab entry …` / `… collab join …` / `… ci status`。
-  本仓已按此改齐：`tools/check_review_cadence.sh`、`tools/check_collab_parents.sh`、
-  `tools/run_ci_runner.sh` 与 `src/agent.rs` 的提示词（后者的断言钉在命令形态上，删掉 env 会红）。
+- **MCP 是协作接口；CLI 只剩运维（D68）**。walgit **v0.13.0** 起 `walgit collab` / `walgit ci` /
+  `walgit principal` 本地子命令**默认拒执行**（`hide = true`，报错直接指路到对应 MCP 工具），
+  `/{o}/{r}/api/…` 车道也全 404（实测；只剩 `/api-browser`、`/api/v1`、`/mcp`）。
+  **协作的读写全部走 MCP**，工具面实测共 23 个，协作相关就这六个：
+  `collab_board` / `collab_thread` / `collab_report` / `collab_publish` / `collab_register` / `ci_status`
+  （+ `repo_*` 与 `wal_ls`）。claim / status / patch / review / merge_result **都不是独立工具**，
+  而是发一条对应 `kind` 的条目走 `collab_publish`。
+- **签名在客户端，不是「MCP 做不到」**。`collab_publish` 从不代签（hold 不到 key），条目得先签好；
+  要签的字节是 `entry_canonical`：**去掉 `sig` 后对象键按字节排序、无空白**（一句规则）。
+  **任何 ed25519 实现都行**，不必是 walgit CLI——已实测 Python 复刻 canonical +
+  `openssl pkeyutl -sign -rawin`（32 字节 seed → PKCS8 DER）签出的条目 `collab_publish` 后
+  `verified: true`。密钥永不上行是**安全边界**，不是能力缺口。
+- **CLI 仍独占的是运维动作**（不是协作）：`collab gc`（inbox fold）、repo ops
+  （fsck/gc/repair/compact/rev-index/checkpoint，`repo_ops` 明写启动它们是操作员行为）、
+  `ci run`（runner 本体，`ci_status` 只能读）、`watch`。要跑它们（或调试本地 refs）时
+  显式加 **`WALGIT_LOCAL_COMMANDS=1`**——walgit 自己的文案就把它定义为
+  「survives for scripts and emergencies」。本仓已按此改齐：`tools/check_review_cadence.sh`、
+  `tools/check_collab_parents.sh`、`tools/run_ci_runner.sh` 与 `src/agent.rs` 的提示词
+  （后者的断言钉在命令形态上，删掉 env 会红）。
   **注意参数校验在门控之前**：`walgit collab thread`（缺 id）报的是 clap 的参数错，不是门被开。
-- **MCP 发布不写本地 refs（陈旧即假绿）**：`collab_publish` 只落在服务端 `refs/collab/inbox/*`，本地
-  检出不会自动更新。而本仓的合并门禁读**本地** refs ⇒ 评审用 MCP 发 `request_changes`、协调者本地跑
-  门禁就**看不到它而判绿**。实证：MCP 发布一条 comment 后本地 `collab thread` 只有 4 条（服务端 5 条），
-  `git fetch origin 'refs/collab/inbox/*:refs/collab/inbox/*'` 后变 5。两道防线：
-  `check_review_cadence.sh` 默认先同步、同步不成 fail-closed（`--no-fetch` 才降级为 best-effort）；
-  人手核对时也先 fetch。`git fetch` 不需要 walgit CLI。
+- **陈旧即假绿：MCP 发布不写本地 refs**。`collab_publish` 只落在**服务端** `refs/collab/inbox/*`，
+  本地检出不会自动更新（实证：MCP 发一条 comment 后本地 `collab thread` 只见 4 条、服务端 5 条；
+  `git fetch origin 'refs/collab/inbox/*:refs/collab/inbox/*'` 后变 5）。而本仓合并门禁读**本地**
+  refs ⇒ 评审用 MCP 发 `request_changes`、协调者本地跑门禁会**看不到它而判绿**。两道防线：
+  `check_review_cadence.sh` 默认先同步、同步不成 **fail-closed**（`--no-fetch` 才降级为
+  best-effort）；人手核对时也先 fetch。同步用 `git fetch` 即可，**不需要 walgit CLI**。
 - **The host standard is normative**: agents collaborate by this walgit host's `SKILL.md` (`http://walgit.localhost:8081/SKILL.md`, §0–§7). Where this file and that standard disagree, **the standard wins**; this section is a pointer, not a second source of truth.
 - **Identity first (§0/§0a)**: one principal per collaborator, one Ed25519 key, materialized **per worktree** by
   `WALGIT_LOCAL_COMMANDS=1 walgit collab join --principal <proj>-<role>-N --push origin` (the seed lands in that worktree's git dir;
@@ -78,8 +86,11 @@ entire runtime directory; empty means default); per-bot workspaces under
   the tested tree. Move cards only by appending a signed `status` entry; never edit
   the board to represent a state change.
 - **MCP lane (自动协作，本机 ki 会话)**: ki 的 `mcpServers` 读 `<cwd>/.ki/settings.json`
-  （本机配置，含绝对路径与私钥路径，已 gitignore）。本项目启一个 `walgit` stdio server：
-  `walgit mcp --repo <检出> --allow-write --key <本 worktree 的 principal seed>`，
+  （本机配置，含绝对路径与 token，已 gitignore）。本项目接入的是**服务端 `/mcp`**（HTTP）：
+  `{"url": "http://127.0.0.1:8081/mcp", "headers": {"Authorization": "Bearer wgt_…"}}`。
+  ⚠️ **`walgit mcp` 子命令已不存在**（D68 后 `walgit mcp --allow-write --key …` 是失效指令，
+  `walgit mcp --help` 直接 `unrecognized subcommand`）——不要再照旧文档启 stdio server。
+  `/api` 车道也已全 404（只剩 `/api-browser`、`/api/v1`、`/mcp`）。
   **控制台只订 `walgit://collab/board/<owner>/<repo>` 一条**，`signals.wake=auto` + `minIntervalSeconds`
   限流。每条通知只带 URI，读到的 `_meta.version` 就是游标：**变了才处理，自己写下的那条按 head
   entry 的 `actor` 过滤掉**；重启后先读一次（订阅是进程内轮询、best-effort，不能把重启读成
@@ -88,7 +99,8 @@ entire runtime directory; empty means default); per-bot workspaces under
   公钥注册/轮换用 `collab_register`。重活（构建、测试、push）仍在工具调用之外跑，收尾只写一条 entry。
   （曾误写作 `collab_entry` / `collab_claim`——实测 `tools/list` 无此二工具。）
   **看板内容不要走 `read_resource`**：本项目 board 约 580 KB，而 ki 的读工具硬截断 20 KiB
-  （拿到的是断掉的 JSON 残片）；唤醒后用 CLI 取全文 —— `WALGIT_LOCAL_COMMANDS=1 walgit collab board` / `… --format json`。
+  （拿到的是断掉的 JSON 残片）；唤醒后用 CLI 取全文 —— `WALGIT_LOCAL_COMMANDS=1 walgit collab board` / `… --format json`
+  （或 MCP `collab_board` 工具本身，它不走 20 KiB 截断）。
   同理 `walgit://refs/<owner>/<repo>` **不要订**：实测该仓库 4514 条 ref（`inbox` 3625、
   `ci-artifacts` 516、tag 166、`refs/heads` 1），摘要按字典序预算 464 条**全部**是
   `refs/collab/ci-artifacts/*`，分支/inbox 一条不回；而它的 `_meta.version` 是全量 ref 的流式

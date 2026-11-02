@@ -271,22 +271,30 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 - **合并** `merge_result` **一条**（body 里带 `merged: true` 与合并点 `oid`，它同时把卡片移到 merged）；优先 fast-forward
 - **收尾** `status: closed`；看板卡片只能靠追加 `status` 条目移动，别改看板文件
 
-命令形态（下面的 `$WALGIT` 指**探测到的 walgit 可执行路径**；`--parent` 必须取上一条命令
-返回的 oid；中文 body 用 python3 生成 JSON 再 `--body \"$(cat f)\"`，别在 shell 里手写转义）：
+命令形态（两条路：**MCP 是协作接口，CLI 只剩运维**。下面的 `$WALGIT` 指**探测到的 walgit
+可执行路径**；`--parent` 必须取上一条命令返回的 oid；中文 body 用 python3 生成 JSON 再
+`--body \"$(cat f)\"`，别在 shell 里手写转义）：
 
-> **D68：`walgit collab` / `walgit ci` 本地子命令默认拒执行**，对外协作面是 MCP `/mcp`
-> （`collab_board` / `collab_thread` / `collab_report` / `collab_publish` / `ci_status` + 资源订阅）。
-> 它们还能本地跑，但**必须显式带 `WALGIT_LOCAL_COMMANDS=1`**——这是 walgit 给脚本/运维留的门。
-> 记账仍要签名，而 MCP 从**不**代签（`collab_publish` 只收已签好的条目），所以本地签名这步用 CLI：
+> **D68：`walgit collab` / `walgit ci` 本地子命令默认拒执行**（`/<owner>/<repo>/api/…` 车道也全 404），
+> 协作的读写面是 MCP `/mcp`：`collab_board` / `collab_thread` / `collab_report` /
+> `collab_publish` / `collab_register` / `ci_status`。`collab_publish` **从不代签**，条目要先签好；
+> 要签的字节是「去 `sig` 后对象键按字节排序、无空白」，**任何 ed25519 实现都行**（不必是 walgit）。
+> 本地子命令仍可用（脚本/签名/`gc`/`ci run`），但**必须显式带 `WALGIT_LOCAL_COMMANDS=1`**：
 
 ```sh
+# 路径 A（本机有 walgit CLI 时最省事）：本地签名 + 推送一条 patch
 WALGIT_LOCAL_COMMANDS=1 \"$WALGIT\" --config ~/.walgit/walgit.toml collab entry --kind patch --id <线程> \
     --actor <你的 principal> --parent <上一条 oid> --body \"$(cat body.json)\" \
     --base refs/heads/main --head refs/heads/<branch> \
   --push origin
 # 身份：每个 worktree 一个 principal（`WALGIT_LOCAL_COMMANDS=1 walgit collab join --principal <proj>-<role>-N --push origin`
 # 生成密钥到该 worktree 的 git dir，不共享、不代签）；有本地身份后 --actor/--key 自动解析。
+#
+# 路径 B（没有 CLI 也行）：自己构造 entry + 任何 ed25519 签 canonical，再 MCP `collab_publish`。
 ```
+
+**发布完要 fetch**：MCP/远端发布**不写本地 refs**，读本地 refs 的闸门会看到陈旧数据（假绿）：
+`git fetch origin 'refs/collab/inbox/*:refs/collab/inbox/*'`（`git fetch` 不需要 walgit CLI）。
 
 **谁签什么**：**实现者**签自己的 `comment`/`patch` 与**实现侧的 `status` 流转**
 （`in-progress` / `needs-review` / `request_changes` 退回 in-progress）；**审查者**签自己的
@@ -1424,7 +1432,14 @@ mod tests {
             assert!(
                 text.contains("WALGIT_LOCAL_COMMANDS=1 \"$WALGIT\" --config")
                     && text.contains("WALGIT_LOCAL_COMMANDS=1 walgit collab join")
-                    && text.contains("collab entry"),
+                    && text.contains("collab entry")
+                    // D68 后协作面是 MCP；提示词必须点名工具与「不代签」，否则 agent
+                    // 会以为记账只能靠 CLI。两条路径都要在：CLI 可用时最省事、不可用也能做。
+                    && text.contains("collab_publish")
+                    && text.contains("从不代签")
+                    && text.contains("路径 B")
+                    // MCP/远端发布不写本地 refs ⇒ 读本地 refs 的闸门会假绿，必须提醒 fetch。
+                    && text.contains("refs/collab/inbox/*:refs/collab/inbox/*"),
                 "{name} 缺 walgit 的本地命令门（D68：WALGIT_LOCAL_COMMANDS=1 未进命令形态）"
             );
             assert!(

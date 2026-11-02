@@ -102,7 +102,7 @@ screencapture -x -o -l<id> /tmp/shot.png                   # 按 id 抓图（不
    **引号里的串**或函数名（`grep -n '<串>' <file>` 一次定位）；确实要写行号时必须**同时**写
    「写于哪个 commit」，否则下一个读者会照着错行号去读别的代码。上游 crate（winit / i-slint-*）
    的行号可留：它们按版本锁定，不随本仓漂。
-6. **walgit 协作**：卡 = `walgit collab entry`；`--parent` **必须是上一条条目的真实 oid**（拿 issue oid 当 parent 会造分叉）。
+6. **walgit 协作**：卡 = 一条 collab 条目（D68 后接口是 MCP `collab_publish`；本地 CLI 要 `WALGIT_LOCAL_COMMANDS=1`）；`--parent` **必须是上一条条目的真实 oid**（拿 issue oid 当 parent 会造分叉）。发布后 `git fetch 'refs/collab/inbox/*:refs/collab/inbox/*'`——MCP 发布不写本地 refs，不 fetch 会让读本地 refs 的门禁假绿。
 7. **提交信息不要用反引号**（bash 会当命令替换执行）⇒ 用 `git commit -F <file>`。
 8. **owner 已把单条开发的门禁+评审降档**：单条只跑 `cargo build` + 定向隔离测试；**批量交付/上线前**再统一跑四门禁（fmt / clippy `-D warnings` / `build --locked` / 隔离门禁）与独立评审。
 9. **clippy 门禁是绝对量，不再接受「零新增」**：工具链已钉在 `rust-toolchain.toml`（1.99.0），`cargo clippy --all-targets -- -D warnings` 必须 **exit 0**。历史：2026-10-11 修绿 → 10-14～10-17 又攒出 25 条 → 期间每张卡自述「零新增 lint」，红色因此只累积不清（卡 `abb-clippy-gate-red-on-main-20261022`）。「零新增」是相对量，只能证明「没更差」，不能证明「门禁是绿的」。
