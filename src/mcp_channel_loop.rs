@@ -44,10 +44,18 @@ use crate::mcp_inbound_loop::{deliver_batch, InboundSink, InboundState};
 
 /// 重连退避的起始与上限。
 pub const BACKOFF_START: std::time::Duration = std::time::Duration::from_secs(2);
-pub const BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+/// 退避封顶。**问过 Jev**：`cap_15` p=0.54 / `keep_60` p=0.45
+/// （conf=0.31——**它自己也不确定，基本是抛硬币**）。选 15s 的实际理由：
+/// 封顶即「服务恢复后最多等这么久才重新取消息」，IM 场景 60s 太迟；
+/// 代价只是长故障期间每分钟 4 次请求而不是 1 次（子进程本地调用，可忽略）。
+pub const BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// 连续失败多少次后放弃。**必须有上限**：一个永远起不来的配置
 /// 无限重连会刷爆日志，而日志是排障唯一线索。
+///
+/// **问过 Jev**：`keep`(10 次) p=0.58 / conf=0.44——**它自己也不确定**
+/// （`raise_to_30` 有 0.21）。保持 10 的好处是配合 15s 封顶，
+/// 最坏约 2 分钟内暴露配置错误，而不是让用户等半天才发现连不上。
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 10;
 
 /// 下一轮退避时长（指数增长，封顶）。
