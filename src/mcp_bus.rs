@@ -280,3 +280,258 @@ mod tests {
         assert_eq!(serde_json::from_str::<ChannelAttachment>(&s).unwrap(), a);
     }
 }
+
+// ── JSON-RPC 2.0 帧（MCP 传输层用）───────────────────────────────────────────
+//
+// 为什么手写而不引 rmcp：root 包已有手写的 ACP JSON-RPC（`src/runtime/acp.rs`），
+// 风格一致；MCP 客户端侧只需要 initialize / tools/list / tools/call /
+// resources/list / resources/subscribe / resources/read 六个方法与一种通知，
+// 为这点东西在 11 万行的二进制里摊一棵新依赖树不划算。
+// （`crates/abb-agent` 那份用 rmcp 是因为它是独立包 + 已有依赖。）
+
+/// JSON-RPC 错误。每条都要能讲给用户听——ABB 有「告知怎么配」的义务。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcError {
+    /// 响应里带 `error` 对象。
+    Remote { code: i64, message: String },
+    /// 响应既没有 `result` 也没有 `error`。
+    Malformed(&'static str),
+    /// 服务端没按契约回形状（例如 `tools` 不是数组）。
+    UnexpectedShape(String),
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Remote { code, message } => write!(f, "渠道服务报错（{code}）：{message}"),
+            Self::Malformed(what) => write!(f, "渠道服务回了不合规的响应：缺 {what}"),
+            Self::UnexpectedShape(detail) => write!(f, "渠道服务响应形状不符契约：{detail}"),
+        }
+    }
+}
+
+/// 构造一条请求（带 id，期待响应）。
+pub fn build_request(id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    })
+}
+
+/// 构造一条通知（无 id，不期待响应）。
+pub fn build_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    })
+}
+
+/// 从一条响应报文里取出 `result`；`error` 或畸形都判错。
+///
+/// **不看 id**：id 匹配由传输层做（它才知道自己发的哪个 id）。
+/// 这里只判断「这条报文作为响应是否合规」。
+pub fn parse_response(msg: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
+    if let Some(err) = msg.get("error") {
+        let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+        let message = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("（服务端未给出错误信息）")
+            .to_string();
+        return Err(RpcError::Remote { code, message });
+    }
+    match msg.get("result") {
+        Some(r) => Ok(r.clone()),
+        None => Err(RpcError::Malformed("result / error 二者之一")),
+    }
+}
+
+/// 从 `tools/list` + `resources/list` 的**响应体**归纳渠道能力。
+///
+/// 这是「只信服务实际暴露的，不信配置里写的」这条原则的落点：
+/// 两个入参都是服务端原始响应，不是我们的推断。
+pub fn capabilities_from(
+    tools_list: &serde_json::Value,
+    resources_list: &serde_json::Value,
+) -> Result<ChannelCapabilities, RpcError> {
+    let tools = tools_list
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| RpcError::UnexpectedShape("tools/list 缺 tools 数组".into()))?;
+    let has = |name: &str| {
+        tools
+            .iter()
+            .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+    };
+
+    // resources/list 缺 resources 不算错：很多 server 根本不实现资源面。
+    // 但**有**却不是数组就是形状错。
+    let resources: &[serde_json::Value] = match resources_list.get("resources") {
+        Some(v) => v.as_array().map(|a| a.as_slice()).ok_or_else(|| {
+            RpcError::UnexpectedShape("resources/list 的 resources 不是数组".into())
+        })?,
+        None => &[],
+    };
+    let inbox_uris: Vec<String> = resources
+        .iter()
+        .filter_map(|r| r.get("uri").and_then(|v| v.as_str()))
+        .filter(|u| u.starts_with(INBOX_URI_PREFIX))
+        .map(|u| u.to_string())
+        .collect();
+
+    Ok(ChannelCapabilities {
+        has_send_text: has(TOOL_SEND_TEXT),
+        has_send_thread_reply: has(TOOL_SEND_THREAD_REPLY),
+        has_poll: has(TOOL_POLL),
+        inbox_uris,
+    })
+}
+
+/// 从 `notifications/resources/updated` 取出被更新的 URI。
+///
+/// 形状：`params: { "uri": "channel://inbox" }`。其它形状返回 `None`
+/// （不是我们的通知、或服务端用了未定义的变体）——**丢弃而不猜**。
+pub fn updated_uri(params: &serde_json::Value) -> Option<&str> {
+    params.get("uri").and_then(|v| v.as_str())
+}
+
+#[cfg(test)]
+mod rpc_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_and_notification_shapes_differ_only_by_id() {
+        // 带 id = 期待响应；无 id = 通知。传输层靠这个区别分流，
+        // 所以形状必须逐字段钉住（多了少了 id 都会让分流错位）。
+        let req = build_request(7, "tools/list", json!({}));
+        assert_eq!(req["jsonrpc"], "2.0");
+        assert_eq!(req["id"], 7);
+        assert_eq!(req["method"], "tools/list");
+        assert!(req.get("params").is_some());
+
+        let note = build_notification("notifications/initialized", json!({}));
+        assert_eq!(note["jsonrpc"], "2.0");
+        assert_eq!(note["method"], "notifications/initialized");
+        assert!(note.get("id").is_none(), "通知不得带 id");
+    }
+
+    #[test]
+    fn response_with_result_is_ok() {
+        let got = parse_response(&json!({"jsonrpc":"2.0","id":1,"result":{"tools":[]}})).unwrap();
+        assert_eq!(got["tools"], json!([]));
+    }
+
+    #[test]
+    fn response_with_error_carries_code_and_message() {
+        // 报因必须能把话说给用户听，所以 code/message 都得留下。
+        let err = parse_response(&json!({
+            "jsonrpc":"2.0","id":1,
+            "error":{"code":-32601,"message":"Method not found"}
+        }))
+        .unwrap_err();
+        let RpcError::Remote { code, message } = err else {
+            panic!("应为 Remote，实得 {err:?}");
+        };
+        assert_eq!(code, -32601);
+        assert_eq!(message, "Method not found");
+    }
+
+    #[test]
+    fn error_without_message_field_still_explains_itself() {
+        // 服务端不回 message 时不得吐出空串——那等于什么也没说。
+        let err = parse_response(&json!({"error":{"code":-1}})).unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert!(err.to_string().contains("未给出"), "实得：{err}");
+    }
+
+    #[test]
+    fn response_with_neither_result_nor_error_is_rejected() {
+        // 既无 result 也无 error 的报文不能当成功——否则传输层会把僵帧当结果。
+        assert!(matches!(
+            parse_response(&json!({"jsonrpc":"2.0","id":1})),
+            Err(RpcError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn capabilities_read_the_actual_exposed_surface() {
+        // 契约的核心：判据只看服务真暴露了什么。
+        let tools = json!({"tools":[
+            {"name":"send_text"},
+            {"name":"poll"},
+            {"name":"something_else"}
+        ]});
+        let resources = json!({"resources":[
+            {"uri":"channel://inbox"},
+            {"uri":"file:///other"}
+        ]});
+        let caps = capabilities_from(&tools, &resources).unwrap();
+        assert!(caps.has_send_text);
+        assert!(caps.has_poll);
+        assert!(!caps.has_send_thread_reply, "未声明的可选能力不得被当成有");
+        // 非 channel:// 前缀的资源不进入站候选
+        assert_eq!(caps.inbox_uris, vec!["channel://inbox".to_string()]);
+        assert_eq!(
+            caps.inbound(),
+            Some(Inbound::Subscribe(vec!["channel://inbox".to_string()]))
+        );
+    }
+
+    #[test]
+    fn capabilities_without_resources_falls_back_to_poll() {
+        // server 不实现资源面是**正常**的，不该报错；此时应落到 poll。
+        let caps = capabilities_from(
+            &json!({"tools":[{"name":"send_text"},{"name":"poll"}]}),
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(caps.inbound(), Some(Inbound::Poll));
+        caps.validate().expect("send_text + poll 应可用");
+    }
+
+    #[test]
+    fn capabilities_without_inbound_surface_fails_validation() {
+        // 不静默降级：没有入站就判不可用。
+        let caps = capabilities_from(
+            &json!({"tools":[{"name":"send_text"}]}),
+            &json!({"resources":[]}),
+        )
+        .unwrap();
+        assert_eq!(caps.validate(), Err(ContractError::NoInbound));
+    }
+
+    #[test]
+    fn malformed_tools_list_is_an_error_not_an_empty_capability_set() {
+        // 关键：形状错不等于「啥也没有」。若当成空集，会得到
+        // 「缺 send_text」这种误导性的报因，掩盖真正的起因（服务端回了怪东西）。
+        let err = capabilities_from(&json!({"oops":1}), &json!({})).unwrap_err();
+        assert!(matches!(err, RpcError::UnexpectedShape(_)));
+        assert!(err.to_string().contains("tools"), "报因要指名缺哪个：{err}");
+    }
+
+    #[test]
+    fn non_array_resources_is_rejected() {
+        let err = capabilities_from(
+            &json!({"tools":[{"name":"send_text"}]}),
+            &json!({"resources":"nope"}),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RpcError::UnexpectedShape(_)));
+    }
+
+    #[test]
+    fn updated_uri_only_accepts_the_documented_shape() {
+        assert_eq!(
+            updated_uri(&json!({"uri":"channel://inbox"})),
+            Some("channel://inbox")
+        );
+        // 未定义变体一律丢弃而不猜（猜错会让 ABB 去读错资源）
+        assert_eq!(updated_uri(&json!({"url":"channel://inbox"})), None);
+        assert_eq!(updated_uri(&json!({})), None);
+        assert_eq!(updated_uri(&json!({"uri":42})), None);
+    }
+}
