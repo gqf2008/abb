@@ -353,7 +353,10 @@ chmod +x "$iso/check.sh"
 isos="$(mktemp -d)"
 printf '#!/bin/sh\ntouch "%s/called"\necho "[]"\n' "$isos" > "$isos/walgit"
 chmod +x "$isos/walgit"
-iso_out="$(WALGIT_MCP_TOKEN=dummy PATH="$isos:$PATH" "$iso/check.sh" some-thread \
+# 必须带 ABB_CADENCE_SKIP_FETCH=1：本用例要测的是「MCP 失败会不会回落 CLI」，
+# 若允许 fetch，在无 origin 的环境里变异版会因 fetch 失败而 rc=2，**碰巧**满足
+# 「rc=2」这一条断言 —— 于是变异逃逸（评审 NB-a 指出，实测确实如此）。
+iso_out="$(WALGIT_MCP_TOKEN=dummy ABB_CADENCE_SKIP_FETCH=1 PATH="$isos:$PATH" "$iso/check.sh" some-thread \
   --contract-ts "$ts" --no-review-ts "$ts" 2>&1)"
 iso_rc=$?
 expect_rc_is() {  # 保持与 expect_rc 一致的口径，但复用已跑出的 rc/输出

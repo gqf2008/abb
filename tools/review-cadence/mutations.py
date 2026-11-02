@@ -61,6 +61,9 @@ MUTATIONS = [
         "why": "读到陈旧 refs 时不许判「全部合规」（与本卡门禁同源的陈旧假绿）",
         # 这个守卫的自测入口与 review-cadence 不同；跑错文件会让它永远"逃逸"。
         "runner": "tools/check_collab_parents.sh --self-test",
+        # 这个 runner 的失败行用的是 `❌ …` / `── 自测失败`，没有 FAIL/FATAL 字样。
+        # 判定「被咬住」要认它的标记，否则会被误判成「runner 起不来」。
+        "fail_marker": "^(FAIL|FATAL|❌)|自测失败",
     },
 ]
 
@@ -71,4 +74,4 @@ DEFAULT_RUNNER = "tools/review-cadence/selftest.sh"
 if __name__ == "__main__":
     # 供 shell 驱动：每行 `name<TAB>file<TAB>why`
     for m in MUTATIONS:
-        print(f"{m['name']}\t{m['file']}\t{m.get('runner', DEFAULT_RUNNER)}")
+        print(f"{m['name']}\t{m['file']}\t{m.get('runner', DEFAULT_RUNNER)}\t{m.get('fail_marker', '')}")
