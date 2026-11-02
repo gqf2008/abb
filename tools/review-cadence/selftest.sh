@@ -281,5 +281,17 @@ else
 fi
 rm -rf "$mcpshim"
 
+# ── mcp_thread.py 的退出码契约 ──────────────────────────────────────────────
+# 门禁的数据源已改为「MCP 优先」，所以这个取数器的失败面必须自己可测：
+#   2 = 用法错  3 = 缺凭据（调用方据此回落）  4 = MCP 调用失败（不许回落掩盖）
+MCP_PY="$here/mcp_thread.py"
+expect_rc "mcp_thread：参数缺失 ⇒ 2" 2 python3 "$MCP_PY"
+expect_rc "mcp_thread：缺 WALGIT_MCP_TOKEN ⇒ 3（可回落）" 3 \
+  env -u WALGIT_MCP_TOKEN python3 "$MCP_PY" gqf2008/abb some-thread
+# 打不通的端口 ⇒ 4（不是 3：凭据在，是调用失败，调用方不得静默回落）
+expect_rc "mcp_thread：端点打不通 ⇒ 4（不得伪装成缺凭据）" 4 \
+  env WALGIT_MCP_TOKEN=dummy WALGIT_MCP_URL=http://127.0.0.1:1/mcp \
+  python3 "$MCP_PY" gqf2008/abb some-thread
+
 echo "── pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
