@@ -167,6 +167,11 @@ tools/check_collab_parents.sh --self-test
 # 不加这条的话，图会烂成「看着对、其实早不是这样」——而人不会主动去核数字。
 # 它不联网、不编译，只读行数与几个符号，毫秒级。
 tools/arch-check.sh
+# 「被门禁裸路径调用的脚本必须是 755」——同一个错 2026-11-02 一天犯了两次
+# （mutation-selftest.sh 与 arch-check.sh 先后提交成 644）。两次都是**本地绿、
+# 干净检出红**（chmod 只改工作区，git 索引仍 644），所以「跑一遍门禁」发现不了它。
+# 它读的是 git ls-files 的 mode，不是文件系统权限。
+tools/check_script_modes.sh
 # 变异自测：证明上面那些自测**真的能咬住回归**（评审 B3 的教训——手工变异逃逸过两次）。
 # 它在临时副本里改代码、跑自测、销毁，主检出不受影响。
 tools/review-cadence/mutation-selftest.sh
