@@ -8,6 +8,12 @@
 #   tools/check_review_cadence.sh <thread-id>          # 跑 `walgit collab thread <id>`
 #   tools/check_review_cadence.sh --json <file|->      # 离线：直接喂 thread JSON（自测/样本）
 #
+# 陈旧数据防护（card abb-d68-local-commands-20261102）：MCP 的 `collab_publish` **不写本地
+# refs**，而本门禁读的是本地 refs。若评审者用 MCP 发布 `request_changes`，不同步就会
+# **看不到它而判绿**。所以 <> 模式默认先 `git fetch` 同步 `refs/collab/*`；同步失败即
+# fail-closed（exit 2，宁红不假绿）。`--no-fetch` 或 `ABB_CADENCE_SKIP_FETCH=1` 跳过，
+# 跳过等于把门禁降级为 best-effort。
+#
 # 注：walgit D68 起 `walgit collab` 不再是协作的对外接口（对外面是 MCP `/mcp`），
 # 本地子命令默认拒绝执行；本脚本是**合并前的本地闸**，读的是本检出里的 refs、
 # 不该为了它去要 MCP 的 token 与网络，因此显式走 walgit 保留的本地门
@@ -87,10 +93,13 @@ thread_id=""
 json_input=""
 contract_ts="${ABB_REVIEW_CONTRACT_TS:-$CONTRACT_TS_DEFAULT}"
 no_review_ts="${ABB_NO_REVIEW_TS:-$NO_REVIEW_TS_DEFAULT}"
+# 默认先同步 refs/collab/*（见下方陈旧数据防护）；1 = 跳过。
+skip_fetch="${ABB_CADENCE_SKIP_FETCH:-0}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --json) [ $# -ge 2 ] || { echo "❌ --json 需要参数" >&2; exit 2; }; json_input="$2"; shift 2 ;;
+    --no-fetch) skip_fetch=1; shift ;;
     --contract-ts) [ $# -ge 2 ] || { echo "❌ --contract-ts 需要参数" >&2; exit 2; }; contract_ts="$2"; shift 2 ;;
     --no-review-ts) [ $# -ge 2 ] || { echo "❌ --no-review-ts 需要参数" >&2; exit 2; }; no_review_ts="$2"; shift 2 ;;
     -h | --help) usage; exit 0 ;;
@@ -129,6 +138,22 @@ if [ -n "$json_input" ]; then
     cp "$json_input" "$tmp"
   fi
 else
+  # 陈旧数据防护（card abb-d68-local-commands-20261102）。
+  # MCP 发布（`collab_publish`）**不写本地 refs**，而本门禁读的是本地 refs：
+  # 评审者若按新接口用 MCP 发布 `request_changes`，这里会看不到它而判绿。
+  # 因此默认先同步 `refs/collab/*`；同步不了就 fail-closed（宁可红，不可假绿）。
+  # `--no-fetch` 或 `ABB_CADENCE_SKIP_FETCH=1` 跳过（离线/自测），跳过是**降级为 best-effort**。
+  if [ "$skip_fetch" != "1" ]; then
+    if ! git fetch --quiet origin \
+        'refs/collab/inbox/*:refs/collab/inbox/*' \
+        'refs/collab/meta/*:refs/collab/meta/*' 2>"$tmp.err"; then
+      echo "❌ 无法从 origin 同步 refs/collab/*（MCP 发布不写本地 refs，陈旧数据会漏判评审）：" >&2
+      cat "$tmp.err" >&2 || true
+      echo "   ↳ 确认要离线判定陈旧数据（best-effort，可能假绿）再显式加 --no-fetch。" >&2
+      rm -f "$tmp.err"
+      exit 2
+    fi
+  fi
   # D68：本地子命令默认关闭，脚本必须显式声明这是本地读取（见脚本头注释）。
   if ! WALGIT_LOCAL_COMMANDS=1 walgit collab thread "$thread_id" > "$tmp" 2>"$tmp.err"; then
     echo "❌ 取不到 thread '$thread_id'（WALGIT_LOCAL_COMMANDS=1 walgit collab thread 非零退出）：" >&2

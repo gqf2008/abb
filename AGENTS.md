@@ -37,6 +37,12 @@ entire runtime directory; empty means default); per-bot workspaces under
   本仓已按此改齐：`tools/check_review_cadence.sh`、`tools/check_collab_parents.sh`、
   `tools/run_ci_runner.sh` 与 `src/agent.rs` 的提示词（后者的断言钉在命令形态上，删掉 env 会红）。
   **注意参数校验在门控之前**：`walgit collab thread`（缺 id）报的是 clap 的参数错，不是门被开。
+- **MCP 发布不写本地 refs（陈旧即假绿）**：`collab_publish` 只落在服务端 `refs/collab/inbox/*`，本地
+  检出不会自动更新。而本仓的合并门禁读**本地** refs ⇒ 评审用 MCP 发 `request_changes`、协调者本地跑
+  门禁就**看不到它而判绿**。实证：MCP 发布一条 comment 后本地 `collab thread` 只有 4 条（服务端 5 条），
+  `git fetch origin 'refs/collab/inbox/*:refs/collab/inbox/*'` 后变 5。两道防线：
+  `check_review_cadence.sh` 默认先同步、同步不成 fail-closed（`--no-fetch` 才降级为 best-effort）；
+  人手核对时也先 fetch。`git fetch` 不需要 walgit CLI。
 - **The host standard is normative**: agents collaborate by this walgit host's `SKILL.md` (`http://walgit.localhost:8081/SKILL.md`, §0–§7). Where this file and that standard disagree, **the standard wins**; this section is a pointer, not a second source of truth.
 - **Identity first (§0/§0a)**: one principal per collaborator, one Ed25519 key, materialized **per worktree** by
   `WALGIT_LOCAL_COMMANDS=1 walgit collab join --principal <proj>-<role>-N --push origin` (the seed lands in that worktree's git dir;

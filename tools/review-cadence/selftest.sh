@@ -184,7 +184,7 @@ expect_rc "顶层非数组（异常应 rc=2，不得漏成 0/5）" 2 "$check" --
 shim="$(mktemp -d)"
 printf '#!/bin/sh\nexit 1\n' > "$shim/walgit"
 chmod +x "$shim/walgit"
-expect_rc "thread 取不到（walgit 非零 ⇒ rc=2）" 2 env PATH="$shim:$PATH" "$check" some-nonexistent-thread
+expect_rc "thread 取不到（walgit 非零 ⇒ rc=2）" 2 env ABB_CADENCE_SKIP_FETCH=1 PATH="$shim:$PATH" "$check" some-nonexistent-thread
 rm -rf "$shim"
 
 # D68 回归：walgit 把本地子命令关在 `WALGIT_LOCAL_COMMANDS=1` 后面（对外面是 MCP `/mcp`），
@@ -202,8 +202,24 @@ echo '[]'
 SHIM
 chmod +x "$shim2/walgit"
 expect_rc "D68：门禁脚本必须带 WALGIT_LOCAL_COMMANDS=1 调 walgit" 0 \
-  env PATH="$shim2:$PATH" "$check" some-thread --contract-ts "$ts" --no-review-ts "$ts"
+  env ABB_CADENCE_SKIP_FETCH=1 PATH="$shim2:$PATH" "$check" some-thread --contract-ts "$ts" --no-review-ts "$ts"
 rm -rf "$shim2"
+
+# 陈旧数据防护：MCP 的 `collab_publish` 不写本地 refs，门禁读本地 refs 会漏判评审。
+# 默认先 `git fetch refs/collab/*`；同步不了要 fail-closed，而不是拿陈旧数据判绿。
+# 用一个 origin 打不通的临时仓验证（不碰网络、不在本仓里做）。
+stale="$(mktemp -d)"
+( cd "$stale" && git init -q . && git remote add origin "$stale/does-not-exist.git" ) >/dev/null 2>&1
+shim3="$(mktemp -d)"
+printf '#!/bin/sh\necho "[]"\n' > "$shim3/walgit"
+chmod +x "$shim3/walgit"
+# 同步失败 ⇒ rc=2（不许拿陈旧数据判绿）
+expect_rc "同步失败必须 fail-closed（不许用陈旧 refs 判绿）" 2 \
+  env PATH="$shim3:$PATH" sh -c "cd '$stale' && \"$check\" some-thread --contract-ts '$ts' --no-review-ts '$ts'"
+# 显式 --no-fetch ⇒ 允许降级为 best-effort（空 thread 无判据可红）
+expect_rc "--no-fetch 显式降级后可离线判定" 0 \
+  env PATH="$shim3:$PATH" sh -c "cd '$stale' && \"$check\" some-thread --no-fetch --contract-ts '$ts' --no-review-ts '$ts'"
+rm -rf "$stale" "$shim3"
 
 echo "── pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
