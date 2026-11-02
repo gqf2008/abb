@@ -138,30 +138,65 @@ if [ -n "$json_input" ]; then
     cp "$json_input" "$tmp"
   fi
 else
-  # 陈旧数据防护（card abb-d68-local-commands-20261102）。
-  # MCP 发布（`collab_publish`）**不写本地 refs**，而本门禁读的是本地 refs：
-  # 评审者若按新接口用 MCP 发布 `request_changes`，这里会看不到它而判绿。
-  # 因此默认先同步 `refs/collab/*`；同步不了就 fail-closed（宁可红，不可假绿）。
-  # `--no-fetch` 或 `ABB_CADENCE_SKIP_FETCH=1` 跳过（离线/自测），跳过是**降级为 best-effort**。
+  # ── thread 数据源：MCP 优先，CLI 仅作过渡回落 ──────────────────────────────
+  #
+  # walgit 的协作面是「纯 git + MCP」：本地子命令自 D68 起默认拒绝执行，且**本地二进制
+  # 将不再部署**（主机搬到服务器上）。所以门禁不能把 `walgit collab thread` 当唯一来源。
+  #
+  # 1) MCP（主路径）：`collab_thread` 返回服务端权威聚合——parent 链已排好、每条带
+  #    verified/broken_refs。不需要本仓复刻聚合与验签（复刻判据语义的风险更大）。
+  #    它读的是服务端状态，因此**没有「本地 refs 陈旧」问题**（`collab_publish` 不写
+  #    本地 refs ⇒ 读本地 refs 会漏判评审，那是假绿）。
+  # 2) CLI（过渡）：本机还留着二进制时可用，需要先 fetch 同步 refs/collab/*。
+  # 3) 都没有 ⇒ fail-closed 并说清怎么配，不许拿陈旧数据判绿。
   fetched=0
-  if [ "$skip_fetch" != "1" ]; then
-    if ! git fetch --quiet origin \
-        'refs/collab/inbox/*:refs/collab/inbox/*' \
-        'refs/collab/meta/*:refs/collab/meta/*' 2>"$tmp.err"; then
-      echo "❌ 无法从 origin 同步 refs/collab/*（MCP 发布不写本地 refs，陈旧数据会漏判评审）：" >&2
-      cat "$tmp.err" >&2 || true
-      echo "   ↳ 确认要离线判定陈旧数据（best-effort，可能假绿）再显式加 --no-fetch。" >&2
+  source=""
+  mcp_py="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/review-cadence/mcp_thread.py"
+  if [ -n "${WALGIT_MCP_TOKEN:-}" ] && [ -f "$mcp_py" ]; then
+    if python3 "$mcp_py" "${WALGIT_REPO:-gqf2008/abb}" "$thread_id" > "$tmp" 2>"$tmp.err"; then
+      source="MCP collab_thread"
+    else
+      mcp_rc=$?
+      # 缺凭据（3）才回落；真的调用失败（4）不该被 CLI 悄悄盖过去。
+      if [ "$mcp_rc" -ne 3 ]; then
+        echo "❌ MCP 取不到 thread '$thread_id'（mcp_thread.py rc=$mcp_rc）：" >&2
+        cat "$tmp.err" >&2 || true
+        echo "   ↳ 门禁不以 CLI 回落掩盖 MCP 失败（两者的数据源不同）。" >&2
+        rm -f "$tmp.err"
+        exit 2
+      fi
+    fi
+  fi
+
+  if [ -z "$source" ]; then
+    if ! command -v walgit >/dev/null 2>&1; then
+      echo "❌ 无法读取 thread '$thread_id'：既没有 WALGIT_MCP_TOKEN（MCP），本机也没有 walgit。" >&2
+      echo "   ↳ 配一个只读/写入 token：export WALGIT_MCP_TOKEN=…（可选 WALGIT_MCP_URL / WALGIT_REPO）。" >&2
+      echo "   ↳ 或用 --json <file> 喂一份离线 thread JSON。" >&2
       rm -f "$tmp.err"
       exit 2
     fi
-    fetched=1
-  fi
-  # D68：本地子命令默认关闭，脚本必须显式声明这是本地读取（见脚本头注释）。
-  if ! WALGIT_LOCAL_COMMANDS=1 walgit collab thread "$thread_id" > "$tmp" 2>"$tmp.err"; then
-    echo "❌ 取不到 thread '$thread_id'（WALGIT_LOCAL_COMMANDS=1 walgit collab thread 非零退出）：" >&2
-    cat "$tmp.err" >&2 || true
-    rm -f "$tmp.err"
-    exit 2
+    # 陈旧数据防护：CLI 读的是本地 refs，必须先同步。
+    # `--no-fetch` / `ABB_CADENCE_SKIP_FETCH=1` 跳过（离线/自测），跳过 = 降级为 best-effort。
+    if [ "$skip_fetch" != "1" ]; then
+      if ! git fetch --quiet origin \
+          'refs/collab/inbox/*:refs/collab/inbox/*' \
+          'refs/collab/meta/*:refs/collab/meta/*' 2>"$tmp.err"; then
+        echo "❌ 无法从 origin 同步 refs/collab/*（本地 refs 陈旧会漏判评审）：" >&2
+        cat "$tmp.err" >&2 || true
+        echo "   ↳ 确认要离线判定陈旧数据（best-effort，可能假绿）再显式加 --no-fetch。" >&2
+        rm -f "$tmp.err"
+        exit 2
+      fi
+      fetched=1
+    fi
+    if ! WALGIT_LOCAL_COMMANDS=1 walgit collab thread "$thread_id" > "$tmp" 2>"$tmp.err"; then
+      echo "❌ 取不到 thread '$thread_id'（WALGIT_LOCAL_COMMANDS=1 walgit collab thread 非零退出）：" >&2
+      cat "$tmp.err" >&2 || true
+      rm -f "$tmp.err"
+      exit 2
+    fi
+    source="walgit CLI（过渡）"
   fi
   rm -f "$tmp.err"
 fi
@@ -185,10 +220,12 @@ fi
 # abb-coordinator-bypassed-merge-gate-20261101 的同一个毛病）。
 if [ -n "$json_input" ]; then
   basis="外部 JSON（离线输入）"
+elif [ "${source:-}" = "MCP collab_thread" ]; then
+  basis="MCP collab_thread（服务端权威聚合）"
 elif [ "${fetched:-0}" = "1" ]; then
-  basis="已同步 refs/collab/*"
+  basis="walgit CLI + 已同步 refs/collab/*（过渡路径）"
 else
-  basis="⚠ 未同步（陈旧本地 refs，best-effort）"
+  basis="⚠ walgit CLI + 未同步（陈旧本地 refs，best-effort）"
 fi
 echo "── review cadence：${thread_id:-<json>}（契约阈值 ts=${contract_ts}；无评审新规 ts=${no_review_ts}）"
 echo "   判定依据：${basis}"
@@ -202,8 +239,10 @@ if [ -n "$violations" ]; then
   echo "$violations" | sed 's/^/  - /'
   exit 1
 fi
-if [ "${fetched:-0}" = "1" ] || [ -n "$json_input" ]; then
+# 只有「走 CLI 且没同步」这一种组合是 best-effort：MCP 读服务端、--json 由调用方负责，
+# 两者都不存在陈旧问题，必须打干净的 ✅（否则真绿也被降级，信噪比会崩）。
+if [ -n "$json_input" ] || [ "${source:-}" = "MCP collab_thread" ] || [ "${fetched:-0}" = "1" ]; then
   echo "✅ 通过"
 else
-  echo "⚠️ 通过（未同步：MCP 发布不写本地 refs，此结果 best-effort，不构成假绿防护）"
+  echo "⚠️ 通过（未同步：本地 refs 可能陈旧，此结果 best-effort，不构成假绿防护）"
 fi

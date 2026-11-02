@@ -271,47 +271,61 @@ owner 会话没有这条限制，`task status <id>` / `task logs <id> [--all]` /
 - **合并** `merge_result` **一条**（body 里带 `merged: true` 与合并点 `oid`，它同时把卡片移到 merged）；优先 fast-forward
 - **收尾** `status: closed`；看板卡片只能靠追加 `status` 条目移动，别改看板文件
 
-命令形态（两条路：**MCP 是协作接口，CLI 只剩运维**。下面的 `$WALGIT` 指**探测到的 walgit
-可执行路径**；`--parent` 必须取上一条命令返回的 oid；中文 body 用 python3 生成 JSON 再
-`--body \"$(cat f)\"`，别在 shell 里手写转义）：
+命令形态（**协作面是「纯 git + MCP」**：读走纯 git 或 MCP，写走 MCP `collab_publish`。
+walgit 的本地子命令自 D68 起默认拒执行，而且**主机会搬到服务器、本地将不再有 walgit 命令**，
+所以不要把本地二进制写成唯一路径。`--parent` 必须取上一条条目的真实 oid；
+中文 body 用 python3 生成 JSON，别在 shell 里手写转义）：
 
-> **D68：`walgit collab` / `walgit ci` 本地子命令默认拒执行**（`/<owner>/<repo>/api/…` 车道也全 404），
-> 协作的读写面是 MCP `/mcp`：`collab_board` / `collab_thread` / `collab_report` /
-> `collab_publish` / `collab_register` / `ci_status`。`collab_publish` **从不代签**，条目要先签好；
-> 要签的字节是「去 `sig` 后对象键按字节排序、无空白」，**任何 ed25519 实现都行**（不必是 walgit）。
-> 本地子命令仍可用（脚本/签名/`gc`/`ci run`），但**必须显式带 `WALGIT_LOCAL_COMMANDS=1`**：
+> **写一条条目 = 构造 JSON + 客户端签名 + MCP `collab_publish`。**
+> `collab_publish` **从不代签**（它 hold 不到 key，这是安全边界）。
+> 要签的字节见 `entry_canonical`：**去掉 `sig` 后，对象键按字节排序、无空白**——
+> 一句规则，**任何 ed25519 实现都能签**（openssl 即可），不需要 walgit。
+> 协作类 MCP 工具就这几个：`collab_board` / `collab_thread` / `collab_report` /
+> `collab_publish` / `collab_register` / `ci_status`；claim、status、patch、review、
+> merge_result **都不是独立工具**，而是发一条对应 `kind` 的条目。
 
 ```sh
-# 路径 A（本机有 walgit CLI 时最省事）：本地签名 + 推送一条 patch
-WALGIT_LOCAL_COMMANDS=1 \"$WALGIT\" --config ~/.walgit/walgit.toml collab entry --kind patch --id <线程> \
-    --actor <你的 principal> --parent <上一条 oid> --body \"$(cat body.json)\" \
-    --base refs/heads/main --head refs/heads/<branch> \
-  --push origin
-# 身份：每个 worktree 一个 principal（`WALGIT_LOCAL_COMMANDS=1 walgit collab join --principal <proj>-<role>-N --push origin`
-# 生成密钥到该 worktree 的 git dir，不共享、不代签）；有本地身份后 --actor/--key 自动解析。
-#
-# 路径 B（没有 CLI 也行）：自己构造 entry + 任何 ed25519 签 canonical，再 MCP `collab_publish`。
+# ① 造身份：每个 worktree 一个 principal，一 key 一 agent，不共享、不代签。
+#    seed 落在本 worktree 的 git dir 里（不进仓库、不进聊天）
+gd=$(git rev-parse --git-dir); mkdir -p \"$gd/walgit/keys\"
+openssl genpkey -algorithm ed25519 -out \"$gd/walgit/keys/<principal>.pem\"
+openssl pkey -in \"$gd/walgit/keys/<principal>.pem\" -pubout -outform DER \\
+  | tail -c 32 | base64        # ⇒ 32 字节公钥 base64
+# 把公钥交给 MCP collab_register {{repo, principal, public_key}}。
+# （本机恰好还有 walgit 二进制时，`walgit collab join` 是这两步的一步等价形式。）
+
+# ② 签一条条目（以 patch 为例）：canonical = 去 sig 后键排序、无空白的 JSON。
+#    jq -S 按键排序、-c 无空白 —— 正好就是 canonical 形式。
+jq -S -c --arg b \"$(cat body.json)\" \\
+  '{{version:1, kind:\"patch\", id:\"<线程>\", actor:\"<principal>\",
+    ts:(now|floor), parent:\"<上一条 oid>\", body:($b|fromjson)}}' > canonical.json
+openssl pkeyutl -sign -inkey \"$gd/walgit/keys/<principal>.pem\" -rawin \\
+  -in canonical.json -out sig.bin
+# entry 里的 sig 字段 = \"ed25519:\" + base64(sig.bin)
+
+# ③ 发布（MCP）：collab_publish {{repo, entry}}；actor 必须等于凭据的 principal。
 ```
 
-**发布完要 fetch**：MCP/远端发布**不写本地 refs**，读本地 refs 的闸门会看到陈旧数据（假绿）：
-`git fetch origin 'refs/collab/inbox/*:refs/collab/inbox/*'`（`git fetch` 不需要 walgit CLI）。
+**发布完要 fetch**：MCP 发布**不写本地 refs**，读本地 refs 的闸门会看到陈旧数据（假绿）：
+`git fetch origin 'refs/collab/inbox/*:refs/collab/inbox/*'`（`git fetch` 不需要 walgit）。
 
 **谁签什么**：**实现者**签自己的 `comment`/`patch` 与**实现侧的 `status` 流转**
 （`in-progress` / `needs-review` / `request_changes` 退回 in-progress）；**审查者**签自己的
 `review`；**coordinator** 签 `merge_result`（一条）与 `status: closed`。**不要用别人的 key 代签**——
-签名就是为了让审计链能区分「谁做的 / 谁审的 / 谁合的」。新 agent 要 key：`~/.walgit/new-agent-key.sh <principal> --repo <仓库>`
-（生成 key + 注册 principal，幂等）。
+签名就是为了让审计链能区分「谁做的 / 谁审的 / 谁合的」。
+**别引用 `~/.walgit/new-agent-key.sh`**——本机没有这个脚本（实测不存在），照着跑会失败。
 
-**可达性：先探测，别硬写**（写死的命令在这个环境里调不到是踩过的坑）：
+**可达性：先探测，别硬写**：
 
-1. `walgit` **不随包**（安装包里没有它）。按顺序探测：
-   `command -v walgit` → `$HOME/.local/bin/walgit` → `/Applications/walgit-tray.app/Contents/Resources/walgit`
-   （本机 PATH 通常已含 `~/.local/bin`，别假设）。三个都没有 → **明确告诉用户「本机没有 walgit CLI，
-   无法记账」**，把要记的内容留成文本，别假装记了。
-2. 仓库 `origin` 必须是本机 walgit（`git remote -v` 里能看到 `127.0.0.1:8081`），否则条目推不上去。
-3. 查状态：`WALGIT_LOCAL_COMMANDS=1 \"$WALGIT\" collab board`（看板）、`collab thread <id>`（单线程）、
-   `collab report`（总览）。不带 `WALGIT_LOCAL_COMMANDS=1` 会被 D68 直接拒。
-
+1. **MCP 凭据是主路径**：`WALGIT_MCP_URL`（默认 `http://127.0.0.1:8081/mcp`）与 `WALGIT_MCP_TOKEN`。
+   没有凭据就**明确告诉用户「无法记账」**，把要记的内容留成文本，别假装记了。
+2. `walgit` 二进制**不再是必需**：主机会搬到服务器，本地将没有它。若本机恰好有
+   （`command -v walgit` → `$HOME/.local/bin/walgit` → `/Applications/walgit-tray.app/Contents/Resources/walgit`），
+   本地子命令仍可用但要带 `WALGIT_LOCAL_COMMANDS=1`，且只当**便利路径**（签名 / `gc` / `ci run`）
+   ——不要把本地二进制写成唯一方式。
+3. 仓库 `origin` 必须是 walgit 主机（`git remote -v` 里能看到主机地址），否则条目推不上去。
+4. 查状态：MCP `collab_board` / `collab_thread` / `collab_report`（服务端权威）；也可纯 git 读
+   `git for-each-ref refs/collab/inbox` + `git cat-file`（记得先 fetch）。
 **受限（授权者）会话里用不了**：白名单里**没有 walgit**（实测 `walgit --version` 直接 deny）。
 白名单只放行 `$ABB_BIN` 的少数子命令（`job add` / `task add` / `session reset` / `deliver`；其中
 `task add --proc` 对 agent 明确拒绝，proc 只允许 GUI/人工入口）和一批
@@ -1414,33 +1428,38 @@ mod tests {
             // 否则 agent 会照着一个调不到的命令硬写（v7 踩过的坑）。
             assert!(
                 text.contains("走 walgit 记账")
-                    && text.contains("必须取上一条命令")
+                    && text.contains("必须取上一条条目的真实 oid")
                     && text.contains("谁签什么")
                     && text.contains("request_changes")
-                    && text.contains("WALGIT_LOCAL_COMMANDS=1 walgit collab join"),
+                    // 提示词曾指向 `~/.walgit/new-agent-key.sh`，而该脚本本机不存在
+                    // （实测 ls 无此文件）⇒ agent 照着跑直接失败。钉住「不许再引用它」。
+                    && !text.contains("new-agent-key.sh` <principal>"),
                 "{name} 缺 walgit 协作契约"
             );
+            // 可达性口径变了：主路径是 **MCP 凭据**，本地 walgit 二进制不再是必需
+            // （主机会搬到服务器，本地将没有该命令）。旧断言要求 "command -v walgit"，
+            // 那会把「依赖本地二进制」钉成契约，与方向相反。
             assert!(
-                text.contains("command -v walgit") && text.contains("无法记账"),
-                "{name} 缺 walgit 可达性探测"
+                text.contains("WALGIT_MCP_TOKEN") && text.contains("无法记账"),
+                "{name} 缺 MCP 凭据的可达性探测（主路径应是 MCP，而不是本地 walgit 二进制）"
             );
-            // D68：提示词里每条 `walgit collab` 都得能被真跑起来。walgit 把本地子命令
-            // 关在 `WALGIT_LOCAL_COMMANDS=1` 后面（对外面是 MCP），裸调会直接被拒。
-            // 断言钉在**命令形态**上（`WALGIT_LOCAL_COMMANDS=1 "$WALGIT"` 与 join 命令），
-            // 不是「全文出现过就算」：光在解说里提一句并不让 agent 的命令跑起来。
-            // 也正因如此，`walgit collab join` 这个旧断言换成带 env 的形式。
+            // 协作面 = 纯 git + MCP。walgit 主机会搬到服务器、本地不再有该命令，
+            // 所以提示词必须满足：① 写走 MCP `collab_publish`；② 明说不代签、签名在客户端；
+            // ③ 给出不依赖 walgit 的签名手段（openssl + canonical 规则）；④ 允许纯 git 读；
+            // ⑤ 提醒发布后 fetch（否则读本地 refs 的闸门假绿）。
+            // 反面断言同样重要：不许把本地二进制写成唯一路径（旧提示词正是这么写的）。
             assert!(
-                text.contains("WALGIT_LOCAL_COMMANDS=1 \"$WALGIT\" --config")
-                    && text.contains("WALGIT_LOCAL_COMMANDS=1 walgit collab join")
-                    && text.contains("collab entry")
-                    // D68 后协作面是 MCP；提示词必须点名工具与「不代签」，否则 agent
-                    // 会以为记账只能靠 CLI。两条路径都要在：CLI 可用时最省事、不可用也能做。
-                    && text.contains("collab_publish")
+                text.contains("collab_publish")
                     && text.contains("从不代签")
-                    && text.contains("路径 B")
-                    // MCP/远端发布不写本地 refs ⇒ 读本地 refs 的闸门会假绿，必须提醒 fetch。
+                    && text.contains("openssl")
+                    && text.contains("entry_canonical")
+                    && text.contains("本地将不再有 walgit")
                     && text.contains("refs/collab/inbox/*:refs/collab/inbox/*"),
-                "{name} 缺 walgit 的本地命令门（D68：WALGIT_LOCAL_COMMANDS=1 未进命令形态）"
+                "{name} 缺「纯 git + MCP」的协作口径（不代签/任意 ed25519/发布后 fetch）"
+            );
+            assert!(
+                !text.contains("WALGIT_LOCAL_COMMANDS=1 \"$WALGIT\" --config"),
+                "{name} 仍把 walgit CLI 写成记账的唯一命令形态（本地将没有该二进制）"
             );
             assert!(
                 text.contains("受限（授权者）会话里用不了"),

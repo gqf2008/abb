@@ -240,5 +240,46 @@ else
 fi
 rm -rf "$shim4"
 
+# ── 数据源：MCP 优先，CLI 只作过渡回落，都没有则 fail-closed ────────────────
+# walgit 本地二进制将不再部署（协作面 = 纯 git + MCP）。门禁不能只认 CLI。
+# 这里的断言不需要真实 MCP/网络：只验「没有凭据且没有 walgit」时是否 fail-closed，
+# 以及给了 token 时是否**尝试** MCP（用假 python3 模拟，不触网）。
+shim5="$(mktemp -d)"
+# 一个「既无 walgit 也无 token」的 PATH：门禁必须 exit 2 并说明怎么配
+mkdir -p "$shim5/bin"
+for t in git jq awk sed grep bash sh env mktemp dirname basename cat rm printf; do
+  real=$(command -v "$t" 2>/dev/null) && ln -sf "$real" "$shim5/bin/$t" 2>/dev/null
+done
+# python3 故意不放：模拟「本机什么都没有」，同时确认不会静默判绿
+expect_rc "无 MCP token 且无 walgit ⇒ fail-closed（不许判绿）" 2 \
+  env -u WALGIT_MCP_TOKEN PATH="$shim5/bin" "$check" some-thread --contract-ts "$ts" --no-review-ts "$ts"
+rm -rf "$shim5"
+
+# MCP 路径：假 mcp_thread.py 返回 []，断言走的是 MCP（判定依据里有 "MCP"）
+# 并断言 MCP 路径**不**打 best-effort 的 ⚠（它读服务端，不存在陈旧问题）。
+mcpshim="$(mktemp -d)"
+mkdir -p "$mcpshim/review-cadence"
+# 门禁自身需要同目录的 check.jq；这里把真 jq 程序带过去，只替换 mcp_thread.py。
+cp "$here/check.jq" "$mcpshim/review-cadence/check.jq"
+cat > "$mcpshim/review-cadence/mcp_thread.py" <<'PYEOF'
+import sys
+sys.stdout.write("[]")
+PYEOF
+cp "$check" "$mcpshim/check.sh"
+chmod +x "$mcpshim/check.sh"
+mout="$(WALGIT_MCP_TOKEN=dummy "$mcpshim/check.sh" some-thread --contract-ts "$ts" --no-review-ts "$ts" 2>&1)"
+mrc=$?
+if [ "$mrc" -eq 0 ] && printf '%s' "$mout" | grep -q 'MCP collab_thread'; then
+  pass=$((pass + 1)); echo 'ok   (0) 有 token 时走 MCP 数据源'
+else
+  fail=$((fail + 1)); echo "FAIL MCP 路径没走通（rc=${mrc}）"
+fi
+if printf '%s' "$mout" | grep -q '✅ 通过'; then
+  pass=$((pass + 1)); echo 'ok   (0) MCP 路径打干净的 ✅（服务端读，无陈旧问题）'
+else
+  fail=$((fail + 1)); echo 'FAIL MCP 路径被误降级为 best-effort'
+fi
+rm -rf "$mcpshim"
+
 echo "── pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

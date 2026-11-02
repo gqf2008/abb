@@ -25,7 +25,7 @@ entire runtime directory; empty means default); per-bot workspaces under
 - **All work tracking lives in walgit**: create/update issues, patches, reviews,
   merge results and status transitions with collab entries under
   `refs/collab/*`. Do not open new GitHub issues or PRs for normal development.
-- **MCP 是协作接口；CLI 只剩运维（D68）**。walgit **v0.13.0** 起 `walgit collab` / `walgit ci` /
+- **协作面 = 纯 git + MCP（D68）**。walgit **v0.13.0** 起 `walgit collab` / `walgit ci` /
   `walgit principal` 本地子命令**默认拒执行**（`hide = true`，报错直接指路到对应 MCP 工具），
   `/{o}/{r}/api/…` 车道也全 404（实测；只剩 `/api-browser`、`/api/v1`、`/mcp`）。
   **协作的读写全部走 MCP**，工具面实测共 23 个，协作相关就这六个：
@@ -37,13 +37,16 @@ entire runtime directory; empty means default); per-bot workspaces under
   **任何 ed25519 实现都行**，不必是 walgit CLI——已实测 Python 复刻 canonical +
   `openssl pkeyutl -sign -rawin`（32 字节 seed → PKCS8 DER）签出的条目 `collab_publish` 后
   `verified: true`。密钥永不上行是**安全边界**，不是能力缺口。
-- **CLI 仍独占的是运维动作**（不是协作）：`collab gc`（inbox fold）、repo ops
-  （fsck/gc/repair/compact/rev-index/checkpoint，`repo_ops` 明写启动它们是操作员行为）、
-  `ci run`（runner 本体，`ci_status` 只能读）、`watch`。要跑它们（或调试本地 refs）时
-  显式加 **`WALGIT_LOCAL_COMMANDS=1`**——walgit 自己的文案就把它定义为
-  「survives for scripts and emergencies」。本仓已按此改齐：`tools/check_review_cadence.sh`、
-  `tools/check_collab_parents.sh`、`tools/run_ci_runner.sh` 与 `src/agent.rs` 的提示词
-  （后者的断言钉在命令形态上，删掉 env 会红）。
+- **本地二进制正在退场（重要）**：主机会部署到服务器，**本地不再有 `walgit` 命令**。
+  所以本仓的脚本与提示词一律**不把本地二进制当唯一路径**。现状：
+  `tools/check_review_cadence.sh` 的数据源顺序是 **MCP → CLI（过渡回落）→ fail-closed**，
+  MCP 走 `tools/review-cadence/mcp_thread.py`（凭据 `WALGIT_MCP_TOKEN` / `WALGIT_MCP_URL`）；
+  `tools/check_collab_parents.sh` 本来就是纯 git（`for-each-ref` + `cat-file`），天然合规；
+  `src/agent.rs` 的提示词改为「构造 JSON + 客户端签名（openssl 即可，canonical = 去 `sig`
+  后键排序无空白）+ MCP `collab_publish`」，并**反向断言**不许再把 CLI 写成唯一命令形态。
+- **CLI 只剩本地特权动作**（不是协作，也不是长期依赖）：`collab gc`（inbox fold）、repo ops
+  （fsck/gc/repair/compact/rev-index/checkpoint）、`ci run`（runner 本体）、key 生成。
+  本机还有二进制时这些仍可用，需显式 **`WALGIT_LOCAL_COMMANDS=1`**。
   **注意参数校验在门控之前**：`walgit collab thread`（缺 id）报的是 clap 的参数错，不是门被开。
 - **陈旧即假绿：MCP 发布不写本地 refs**。`collab_publish` 只落在**服务端** `refs/collab/inbox/*`，
   本地检出不会自动更新（实证：MCP 发一条 comment 后本地 `collab thread` 只见 4 条、服务端 5 条；
@@ -53,8 +56,12 @@ entire runtime directory; empty means default); per-bot workspaces under
   best-effort）；人手核对时也先 fetch。同步用 `git fetch` 即可，**不需要 walgit CLI**。
 - **The host standard is normative**: agents collaborate by this walgit host's `SKILL.md` (`http://walgit.localhost:8081/SKILL.md`, §0–§7). Where this file and that standard disagree, **the standard wins**; this section is a pointer, not a second source of truth.
 - **Identity first (§0/§0a)**: one principal per collaborator, one Ed25519 key, materialized **per worktree** by
-  `WALGIT_LOCAL_COMMANDS=1 walgit collab join --principal <proj>-<role>-N --push origin` (the seed lands in that worktree's git dir;
-  never share a key, never sign an entry for someone else). This project's convention is
+  generating the seed with any ed25519 tool (`openssl genpkey -algorithm ed25519`) and registering the
+  public half with MCP `collab_register` (the seed lands in that worktree's git dir;
+  never share a key, never sign an entry for someone else).
+  Where a `walgit` binary happens to exist, `WALGIT_LOCAL_COMMANDS=1 walgit collab join --principal <proj>-<role>-N --push origin`
+  is the one-shot equivalent — but it is a convenience, never the required path (the host moves to a
+  server; the local binary goes away). This project's convention is
   `abb-worker-N` (author) / `abb-reviewer-N` (acceptance) / `abb-coordinator` (merge & close) — take the
   next free index after the highest registered one. Do the §0a routine before filing or claiming: fetch
   `refs/collab/inbox/*` + `refs/collab/meta/*`, read `WALGIT_LOCAL_COMMANDS=1 walgit collab board`, then claim.
