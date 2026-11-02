@@ -186,6 +186,21 @@ entire runtime directory; empty means default); per-bot workspaces under
 **除这三类之外，不要问 owner。** 尤其不要把「技术判断」包装成请示——那只是把该做的
 工作量转嫁给用户。
 
+### owner 已明确自己的角色：只验收，不当决策关口（2026-11-02）
+
+> 原话：「你是 leader 你决定，我只负责验收，这点记住，给你 mcp 就是需要你无人值守开发，直至达成目标」
+
+可执行的含义：
+
+- **我是 leader**：方案取舍、优先级、拆卡/并卡、要不要重构、用什么手法、先做哪一步，**全部自己定**，
+  定了就做，不回报「我准备怎么做」等批准。
+- **owner 只验收**：在**交付**时把结论与证据摆给他（做了什么、凭什么说对、残留是什么）。
+  验收前不要拿半成品去问。
+- **无人值守推进到目标达成**：遇到阻塞先自己解（查代码/文档/实验，必要时问 Jev），
+  不要因为「拿不准」就停下来等人。停下来只有两个正当理由：需要**授权**、或需要**人的现场**。
+- **保持可见**：无人值守不等于安静。多步工作用 `todo` 跟踪，关键结论写进卡片/注释，
+  合并前跑完门禁并留证据。
+
 ## Build, Test, and Development Commands
 
 Every cargo command below **must** carry the build-intermediate env prefix (user policy:
