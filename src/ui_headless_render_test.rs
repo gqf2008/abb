@@ -4231,9 +4231,6 @@ fn share_icon_renders_actual_glyphs_not_tofu() {
     // 所以在这个环境里无论怎么断言都判不出「字形在不在」，只能显式 `[skip]` 并说清原因，
     // 而不是假装测过了（那正是本仓反复踩的「跳过式断言当验证」）。
     if known_good == 0 {
-        // **必须走既有的 `glyph_skip_notice`，不能自己 println + return**：
-        // 那会绕过 `strict_no_skip()`——CI / `ABB_TEST_NO_SKIP` 下本次跳过就变成
-        // 「门禁无声变绿」，正是仓里明令禁止的形态。走这个函数，严格模式会 panic。
         // **不走 `glyph_skip_notice`**：它的 `[skip]` 文案是围绕「缺某个字形 + 一个复跑开关」
         // 设计的（会印 `ABB_TEST_ASSUME_MISSING_GLYPH=<码位>`）。本用例缺的不是某一个字形，
         // 而是**整台机器没有 emoji 字体**——照抄那个开关会给出一个根本不解决问题的复跑命令
