@@ -3372,6 +3372,76 @@ fn svg_len(s: &str, name: &str) -> Option<f32> {
     num.parse::<f32>().ok()
 }
 
+/// 跑 `syschat-share` 子命令，把会话渲成长图，返回结果。
+///
+/// **为什么是子进程**：渲染要装 Slint 软件后端，而 Slint 平台每线程一次——GUI 线程已被
+/// winit 占住，就地渲必失败。这条命令就是那个子进程的入口（见 `syschat_share_cli`）。
+///
+/// 调用方在**后台线程**里调它（长会话 30 轮 ≈ 16k 像素，渲染要几秒），
+/// 完成后经 `upgrade_in_event_loop` 回主线程。
+fn run_share_child(out: &std::path::Path) -> Result<ShareChildOk, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("取本程序路径失败：{e}"))?;
+    let output = crate::spawn::command(&exe.to_string_lossy())
+        .arg("syschat-share")
+        .arg("--json")
+        .arg("--out")
+        .arg(out)
+        .output()
+        .map_err(|e| format!("没能启动出图子进程：{e}"))?;
+
+    // 子命令**总是**打一行 JSON（成功与失败都是），所以先按 JSON 解；
+    // 解不出才退回到「用退出码 + stderr」这种兜底报因。
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().find(|l| l.trim_start().starts_with('{'));
+    match line.and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
+        Some(v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => {
+            let path = v
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| out.to_path_buf());
+            Ok(ShareChildOk {
+                path,
+                truncated: v
+                    .get("truncated")
+                    .and_then(|t| t.as_bool())
+                    .unwrap_or(false),
+            })
+        }
+        Some(v) => Err(v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("出图失败（子进程没给原因）")
+            .to_string()),
+        None => {
+            let err = String::from_utf8_lossy(&output.stderr);
+            let tail: String = err
+                .chars()
+                .rev()
+                .take(300)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            Err(format!(
+                "出图子进程没回可解析的结果（退出码 {:?}）{}",
+                output.status.code(),
+                if tail.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("：{}", tail.trim())
+                }
+            ))
+        }
+    }
+}
+
+/// 出图子进程的成功回执（只取 GUI 需要的两件事）。
+struct ShareChildOk {
+    path: std::path::PathBuf,
+    truncated: bool,
+}
+
 /// 加载待发附件缩略图（本地文件）。失败回落 `thumb-ok=false`（UI 显示字形，不空白）。
 fn load_thumb(path: &std::path::Path) -> (slint::Image, bool) {
     match slint::Image::load_from_path(path) {
@@ -8710,6 +8780,81 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
+    // ── 分享整个会话（卡 `abb-syschat-share-session-20261102`）──────────────
+    // 渲染必须在**子进程**里做：它要装 Slint 软件后端，而 Slint 平台是每线程一次的
+    // （GUI 这条线程已被 winit 占住）。所以这里是「spawn 自身 syschat-share 子命令」，
+    // 不是在 UI 线程里渲图。
+    //
+    // **不阻塞 UI**：子进程在后台线程里等（`std::thread::spawn`），渲染期间只把状态行
+    // 换成「正在生成…」；完成后再回主线程把路径塞进待发附件（`land_into_pending`）。
+    {
+        let cw = syschat_win.as_weak();
+        let land = land_into_pending.clone();
+        syschat_win.on_share_session(move || {
+            let Some(w) = cw.upgrade() else { return };
+            // 同一时刻只允许一个分享在跑：重复点会白烧一遍渲染（长会话几秒到十几秒）。
+            if w.get_sharing() {
+                return;
+            }
+            w.set_sharing(true);
+            w.set_status_is_error(false);
+            w.set_status_line("正在生成会话长图…".into());
+
+            // 线程边界上只传**纯数据**：`Rc`（`land`）和 Slint 的 weak handle 都不能跨线程。
+            // 所以后台线程只把 `Result` 投进一个标准通道，主线程那边用 Timer 轮询取走。
+            //
+            // 为什么不用 `upgrade_in_event_loop`：它的闭包也必须 `Send`，而闭包里要调
+            // `land`（`Rc<dyn Fn>`）⇒ 编译不过。通道 + Timer 是同一件事的可行写法，
+            // 且与仓里既有的「后台线程算、主线程 Timer 取」（bot-status 轮询）同款。
+            let (tx, rx) = std::sync::mpsc::channel::<Result<ShareChildOk, String>>();
+            std::thread::spawn(move || {
+                let out = crate::syschat::dir().join("share").join(format!(
+                    "share-{}.png",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                ));
+                // `send` 失败 = 主线程已经不关心了（窗口关了）⇒ 丢弃结果即可。
+                let _ = tx.send(run_share_child(&out));
+            });
+
+            // 轮询 Timer：150ms 一次，拿到结果就停。Timer 必须被持有（drop 即停），
+            // 所以它挂在窗口的一个 `Rc<RefCell<Option<Timer>>>` 上——这里用局部 `Rc`，
+            // 生命周期由闭包自己捕获的那个 clone 撑住。
+            let timer = Rc::new(slint::Timer::default());
+            let timer2 = timer.clone();
+            let cw3 = cw.clone();
+            let land3 = land.clone();
+            timer.start(
+                slint::TimerMode::Repeated,
+                std::time::Duration::from_millis(150),
+                move || {
+                    let Ok(res) = rx.try_recv() else { return };
+                    timer2.stop();
+                    let Some(w) = cw3.upgrade() else { return };
+                    w.set_sharing(false);
+                    match res {
+                        Ok(r) => {
+                            // 截断了要**明说**：宁可少画并写明，不能让人以为发全了。
+                            if r.truncated {
+                                w.set_status_is_error(false);
+                                w.set_status_line(
+                                    "长图已生成（内容超过上限，末尾已截断并标注）。".into(),
+                                );
+                            }
+                            land3(vec![r.path], "已生成会话长图并附加");
+                        }
+                        Err(e) => {
+                            w.set_status_is_error(true);
+                            w.set_status_line(format!("分享失败：{e}").into());
+                        }
+                    }
+                },
+            );
+        });
+    }
+
     // ── 划词工具条（类似飞书的划词菜单）────────────────────────────────────
     // 选区上报来自 Slint 全局 `TextSelection.moved`（消息块的只读 TextInput 在光标/选区
     // 变化时发出）。这里做三件事：切文本、**防抖**、落位；三个按钮的动作各自接一条回调。

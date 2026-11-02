@@ -3912,6 +3912,9 @@ export component SystemChatWindow inherits Window {
     callback copy-turn(int);     // ⧉ 复制（整轮正文 → 系统剪贴板）
     callback regen-turn(int);    // ⟳ 重新生成（用该轮的用户提示重跑，落历史、可停止）
     callback speak-turn(int);    // 🔊/⏹ 朗读（macOS `say`；再点一次 = 停止）
+    // 分享**整个会话**（卡 `abb-syschat-share-session-20261102`）：渲染成长图后进待发附件。
+    // 无参：分享的是会话而不是某一轮，所以不像上面三个那样带 `turn` 下标。
+    callback share-session();
     // 划词工具条：选中文本由全局 `TextSelection.moved` 直接交给 Rust（见 ui.rs），
     // 这里只声明工具条按钮的三个动作。
     callback sel-copy();         // 复制选中文字 → 系统剪贴板
@@ -3922,6 +3925,8 @@ export component SystemChatWindow inherits Window {
     // 名字不能叫 `speak-turn`：Slint 不允许 callback 与属性同名（`callback speak-turn(int)`
     // 会直接编译失败），所以属性用 `speaking-turn` 与回调区分开。
     in-out property <int> speaking-turn: -2;
+    /// 分享长图正在生成（防重复点：长会话渲染要几秒到十几秒，重复点会白烧一遍）。
+    in-out property <bool> sharing: false;
     callback attach-pick();
     callback attach-clear();       // 清空待发列表（只清内存，不删已落盘文件）
     callback attach-remove(int);   // 按完整列表下标移除单个待发附件（✕）
@@ -5008,6 +5013,13 @@ export component SystemChatWindow inherits Window {
                                 icon: b.turn == root.speaking-turn ? "⏹" : "🔊";
                                 tip: b.turn == root.speaking-turn ? "停止朗读" : "朗读这一轮";
                                 clicked => { root.speak_turn(b.turn); }
+                            }
+                            // 分享整段会话（位置在「重新生成」旁边之后、朗读之后最右）。
+                            // 图标用 `📤`：v14 的教训是 `⧉`/`⟳` 在系统 UI 字体下画方框，
+                            // 这几个 emoji 走字体回退链，实测能出字形（见真机验收项）。
+                            ActsIcon {
+                                icon: "📤";  tip: "分享整个会话（渲染成长图）";
+                                clicked => { root.share_session(); }
                             }
                         }
                     }
