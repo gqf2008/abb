@@ -208,6 +208,28 @@ else
   echo "⚠️  没构建出 $FEISHU_BIN ⇒ root 的飞书 e2e 将跳过（不是失败）"
 fi
 
+# crates/abb-channel-dingtalk 同构（第三个渠道，也是最后一个）。
+dingtalk_manifest="$repo_root/crates/abb-channel-dingtalk/Cargo.toml"
+dingtalk_target="$CARGO_TARGET_DIR-dingtalk"
+mkdir -p "$dingtalk_target"
+
+echo "== ABB 门禁：crates/abb-channel-dingtalk（独立包，中间产物外置于 ${dingtalk_target}）=="
+(
+  export CARGO_TARGET_DIR="$dingtalk_target"
+  cargo fmt --manifest-path "$dingtalk_manifest" --check
+  cargo clippy --manifest-path "$dingtalk_manifest" --locked --all-targets -- -D warnings
+  cargo build --manifest-path "$dingtalk_manifest" --locked
+  cargo test --manifest-path "$dingtalk_manifest" --locked
+)
+
+# 钉钉的产物路径传给 root 测试（`abb_negotiates_dingtalk_via_subscribe`）。
+DINGTALK_BIN="$dingtalk_target/debug/abb-channel-dingtalk"
+if [ -x "$DINGTALK_BIN" ]; then
+  export ABB_DINGTALK_BIN="$DINGTALK_BIN"
+else
+  echo "⚠️  没构建出 $DINGTALK_BIN ⇒ root 的钉钉 e2e 将跳过（不是失败）"
+fi
+
 echo "== ABB 门禁：root 包（中间产物外置于 ${CARGO_TARGET_DIR}）=="
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
@@ -257,6 +279,16 @@ if [ -x "$feishu_target/debug/abb-channel-feishu" ]; then
     else
         echo "❌ 产物存在但飞书 e2e 没跑：日志里没有 ABB_FEISHU_E2E_RAN" >&2
         echo "   查 gates.sh 里飞书 crate 组与 export 的顺序（必须先构建再 export，再跑 root 测试）。" >&2
+        exit 1
+    fi
+fi
+
+# 钉钉同理（判据看产物文件，不看 env）。
+if [ -x "$dingtalk_target/debug/abb-channel-dingtalk" ]; then
+    if grep -q 'ABB_DINGTALK_E2E_RAN' "$iso_log"; then
+        echo "✅ 钉钉跨包 e2e 真的跑了（订阅路径协商成功）"
+    else
+        echo "❌ 产物存在但钉钉 e2e 没跑：日志里没有 ABB_DINGTALK_E2E_RAN" >&2
         exit 1
     fi
 fi

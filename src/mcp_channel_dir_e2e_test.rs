@@ -380,3 +380,58 @@ fn abb_negotiates_feishu_via_subscribe_not_poll() {
 
     eprintln!("ABB_FEISHU_E2E_RAN（订阅路径协商成功，fetch 走的是通知排空）");
 }
+
+// ── 真渠道：钉钉 crate（crates/abb-channel-dingtalk）──────────────────
+
+fn dingtalk_bin() -> Option<String> {
+    let mut tried: Vec<String> = Vec::new();
+    if let Ok(p) = std::env::var("ABB_DINGTALK_BIN") {
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+        tried.push(format!("ABB_DINGTALK_BIN={p}（不存在）"));
+    }
+    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
+        let p = format!("{td}/debug/abb-channel-dingtalk");
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+        tried.push(p);
+    }
+    eprintln!(
+        "[skip] 没找到 abb-channel-dingtalk 构建产物 ⇒ 这条 e2e 没跑。找过：\n  {}\n\
+         构建方式：cargo build --manifest-path crates/abb-channel-dingtalk/Cargo.toml",
+        tried.join("\n  ")
+    );
+    None
+}
+
+/// **ABB 的生产协商器必须对钉钉选 `Subscribe`**（Stream 是推模型，没有 poll 工具）。
+///
+/// 与飞书同构、与微信相反。三个渠道各有一条这样的 e2e，合起来证明
+/// `negotiate` 的选路在**三种真实能力组合**下都对。
+#[test]
+fn abb_negotiates_dingtalk_via_subscribe() {
+    let Some(bin) = dingtalk_bin() else {
+        return;
+    };
+    let dir = TempDir::new("dt");
+    let args = vec!["--dir".to_string(), dir.path().display().to_string()];
+    let envs = vec![
+        ("DT_APP_ID".to_string(), "test".to_string()),
+        ("DT_APP_SECRET".to_string(), "test".to_string()),
+    ];
+    let mut source = crate::mcp_channel_loop::build_source_for_test("dingtalk", &bin, &args, &envs)
+        .unwrap_or_else(|e| panic!("ABB 的协商器接不上钉钉 server：{e}"));
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let got = rt.block_on(async { source.fetch().await });
+    assert!(
+        got.is_ok(),
+        "订阅路径下无通知应返回空批次（不是错误）；实际：{:?}",
+        got.err()
+    );
+    assert!(got.unwrap().is_empty(), "没有通知时不该有消息");
+
+    eprintln!("ABB_DINGTALK_E2E_RAN（订阅路径协商成功）");
+}
