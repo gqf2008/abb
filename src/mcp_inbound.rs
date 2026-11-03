@@ -257,6 +257,7 @@ mod tests {
         crate::mcp_bus::ChannelCapabilities {
             has_send_text: true,
             has_send_thread_reply: false,
+            has_send_attachment: false,
             has_poll: poll,
             inbox_uris: inbox.iter().map(|s| s.to_string()).collect(),
         }

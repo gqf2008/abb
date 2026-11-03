@@ -40,9 +40,26 @@ use serde_json::Value;
 
 use crate::mcp_bus::{build_request, parse_response, RpcError};
 
-/// 单行上限。与 ACP 侧同数量级（`runtime::acp::MAX_LINE_SIZE` = 10 MB）：
-/// 渠道消息可能带长正文/附件描述，但也不该无限。
-pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// 单行上限。
+///
+/// **2026-11-03 从 8 MB 提到 32 MB**，原因是附件走 base64 内联时撞上了它：
+/// base64 让数据膨胀 33%，于是 >6 MB 的文件会**静默失败**（`LineTooLong`
+/// 在接收侧抛出，发送方只看到一次失败的调用，很难与"渠道不支持附件"区分）。
+///
+/// 32 MB 的取舍：
+/// - base64 后约 24 MB 原文件 —— 覆盖 IM 场景的绝大多数附件（微信单文件上限本身也在这一档）
+/// - 不是无限：仍然防 rogue server 撑爆内存（这是原本设它的理由）
+/// - 与 ACP 侧 10 MB 不同档是刻意的：ACP 那条流只走文本，这条要走附件
+///
+/// **ABB 侧还会先做一次预检**（`mcp_channel::send_attachment`）：超限时给出
+/// 「附件太大（X MB，上限 Y MB）」而不是让底层报 LineTooLong。两层都要有：
+/// 预检负责**说清楚**，上限负责**兜底**。
+pub const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
+
+/// 附件内联传输的**原文件**上限（base64 后 ×4/3 必须留在 [`MAX_LINE_BYTES`] 内）。
+///
+/// 取 20 MB：20 × 4/3 ≈ 26.7 MB，给 JSON 外壳留足余量。
+pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
 /// 默认单次调用超时。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);

@@ -32,6 +32,12 @@ use serde::{Deserialize, Serialize};
 pub const TOOL_SEND_TEXT: &str = "send_text";
 /// 出站工具名：会话内话题回复（可选，缺失回落 [`TOOL_SEND_TEXT`]）。
 pub const TOOL_SEND_THREAD_REPLY: &str = "send_thread_reply";
+/// 出站**可选**工具名：发附件（契约 §3.5）。
+///
+/// 缺它就**只能发文本**——ABB 的 `Messenger::send_attachment` 会显式失败并说清原因，
+/// 不会假装送达（历史教训：旧默认实现把路径当文本发出去还返回 `Ok`）。
+pub const TOOL_SEND_ATTACHMENT: &str = "send_attachment";
+
 /// 入站兜底工具名（契约 §3.2 方案 B）。
 pub const TOOL_POLL: &str = "poll";
 /// 入站首选资源 URI 前缀（契约 §3.2 方案 A）。
@@ -111,6 +117,8 @@ impl std::fmt::Display for ContractError {
 pub struct ChannelCapabilities {
     pub has_send_text: bool,
     pub has_send_thread_reply: bool,
+    /// 是否声明了附件工具（可选；缺了就只能发文本）。
+    pub has_send_attachment: bool,
     pub has_poll: bool,
     /// 可订阅的收件箱 URI（`resources/list` 里以 `channel://` 开头的那些）。
     pub inbox_uris: Vec<String>,
@@ -182,6 +190,7 @@ mod tests {
         ChannelCapabilities {
             has_send_text: send,
             has_send_thread_reply: false,
+            has_send_attachment: false,
             has_poll: poll,
             inbox_uris: uris.iter().map(|s| s.to_string()).collect(),
         }
@@ -385,6 +394,7 @@ pub fn capabilities_from(
     Ok(ChannelCapabilities {
         has_send_text: has(TOOL_SEND_TEXT),
         has_send_thread_reply: has(TOOL_SEND_THREAD_REPLY),
+        has_send_attachment: has(TOOL_SEND_ATTACHMENT),
         has_poll: has(TOOL_POLL),
         inbox_uris,
     })

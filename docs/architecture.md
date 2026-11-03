@@ -60,7 +60,7 @@
 
  ④ MCP（两个方向，别混）
  ABB → agent：session/new 里**声明** mcpServers（ABB 只声明，不解释语义）
- ABB → 渠道 MCP 服务：**新方向，尚未接线**（src/mcp_bus.rs 只有契约与帧）
+ ABB → 渠道 MCP 服务：**已接线**（`mcp_bus`/`mcp_client`/`mcp_channel`/`mcp_inbound`/`mcp_adapter`/`mcp_channel_loop`，`bot.kind = "mcp"`）
 ```
 
 ## 3. 真正存在的接缝（换实现只动这里）
@@ -70,7 +70,7 @@
 | `Messenger` trait | `src/messenger.rs` | 3（飞书/微信/钉钉）+ 2 测试假件 |
 | 执行层命令解析 | `src/service.rs::resolve_acp_commands` | 随包优先 → PATH `ki` 回落 |
 | ACP 协议层 | `src/runtime/acp.rs` | 1（手写 JSON-RPC，行数见 §6） |
-| 渠道 MCP 契约 | `src/mcp_bus.rs` | 0（**只有契约，S1b 下半才接真管道**） |
+| 渠道 MCP | `src/mcp_*.rs` | 1（ABB 自己当 client；内置渠道与 MCP 渠道在 `messenger::build` 合流） |
 
 ## 4. 沙箱与准入（两个不同的东西，容易混）
 
@@ -111,9 +111,13 @@ $AGENT_BRIDGE_HOME 或 ~/.agent-bridge/        （main.rs:97 bridge_dir）
 |---|---|
 | `src/` 顶层 | 见下表 |
 | `src/runtime/`（从上游移植的会话层）**全目录 13727** | 主要 5 个：acp 4888 / harness 4332 / pool 2173 / queue 1536 / oneshot 571；其余 4 个小文件合计 227 |
-| `src/` 合计 | **118173** |
+| `src/` 合计 | **118375** |
 | `ui/app.slint` | 5964 |
 | GUI 三件合计（ui.rs + syschat.rs + 渲染台） | **26182** |
+
+MCP 总线拆成七个文件（`mcp_bus` 547 契约与帧 / `mcp_client` 传输 / `mcp_channel` Messenger /
+`mcp_inbound` 入站协议 / `mcp_inbound_loop` 驱动 / `mcp_adapter` 翻译 / `mcp_channel_loop` 事件循环）。
+加上 `crates/abb-channel-wechat/`（微信渠道的独立 server）后，渠道实现可以整块搬出主仓。
 
 最大的六个文件：`ui.rs` 12792、`syschat.rs` 7671、`ui_headless_render_test.rs` 5719、
 `task_run.rs` 4563、`platform.rs` 4096、`main.rs` 3456。
@@ -125,8 +129,8 @@ $AGENT_BRIDGE_HOME 或 ~/.agent-bridge/        （main.rs:97 bridge_dir）
 
 | 缺 | 状态 |
 |---|---|
-| ABB 自己连渠道 MCP | 只有契约（`mcp_bus.rs`），没有真管道 |
-| 界面配置渠道 | 还在（`ui.rs` 里有渠道配置面），S3 才移除 |
+| ABB 自己连渠道 MCP | ✅ 已接线；有参考实现（`tools/channel-mcp-dir/`）与微信真实现（`crates/abb-channel-wechat/`） |
+| 界面配置渠道 | ✅ 已改造：新建 bot 默认 `mcp`；已存在的内置渠道 bot 仍显示其字段（Jev 裁定 adaptive） |
 | 内置渠道退役 | **没动**。feishu 2206 / wechat 1640 / dingtalk 1764 行全在 |
 | 渠道 MCP 服务的真实样本 | 0 个。契约没有经过任何真实 server 验证 |
 

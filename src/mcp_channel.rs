@@ -158,6 +158,34 @@ fn text_of_tool_result(resp: &Value) -> String {
         .join("\n")
 }
 
+/// 标准 base64（含 padding）。手写不引 crate——与 ABB 既有风格一致
+/// （`wechat.rs` 里的 base64 也是手写的，避免为几行代码拉依赖树）。
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// 把 client 错误翻成「哪个工具、为什么」。带工具名是因为一个渠道可能有多个工具，
 /// 只说「写不进去」运维没法判断是哪一步。
 fn map_err(tool: &str, e: ClientError) -> anyhow::Error {
@@ -197,19 +225,59 @@ impl Messenger for McpChannelMessenger {
         Ok(())
     }
 
-    /// 附件：本步骤**显式失败**。
+    /// 发附件（契约 §3.5）。
     ///
-    /// 不写默认实现的原因与 `Messenger::send_attachment` 的注释同口径：把路径当文本
-    /// 发出去还返回 Ok，会让投递方以为附件送达。
+    /// 三道闸，顺序是刻意的：
+    ///
+    /// 1. **服务没声明工具** ⇒ 明确失败并说清「该渠道只能发文本」。
+    ///    不假装成功——历史教训：旧默认实现把路径当文本发出去还返回 `Ok`。
+    /// 2. **文件读不出来** ⇒ 报 IO 错误（路径错、权限不足）。
+    /// 3. **体积超限** ⇒ 报「附件太大（X MB，上限 Y MB）」。
+    ///
+    /// 第 3 道必须在**发送之前**：否则超限会一路走到 `mcp_client` 的单行上限，
+    /// 变成一个笼统的 `LineTooLong`，与「渠道不支持附件」难以区分。
     async fn send_attachment(
         &self,
-        _chat_id: &str,
-        _meta: &crate::attachments::AttachmentMeta,
+        chat_id: &str,
+        meta: &crate::attachments::AttachmentMeta,
     ) -> Result<()> {
-        Err(anyhow::anyhow!(
-            "渠道 `{}` 的 MCP 服务尚未声明附件工具（S1c 只做出站文本）",
-            self.name
-        ))
+        if !self.caps.has_send_attachment {
+            return Err(anyhow::anyhow!(
+                "渠道 `{}` 的 MCP 服务未声明 `{}` 工具 ⇒ 该渠道只能发文本",
+                self.name,
+                crate::mcp_bus::TOOL_SEND_ATTACHMENT
+            ));
+        }
+        let path = std::path::Path::new(&meta.path);
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("读附件失败（{}）：{e}", path.display()))?;
+        if bytes.len() > crate::mcp_client::MAX_ATTACHMENT_BYTES {
+            return Err(anyhow::anyhow!(
+                "附件太大：{:.1} MB，上限 {:.0} MB（base64 后需留在单帧上限内）",
+                bytes.len() as f64 / 1_048_576.0,
+                crate::mcp_client::MAX_ATTACHMENT_BYTES as f64 / 1_048_576.0
+            ));
+        }
+        // base64 内联：Jev 裁定 `base64_inline`（p=0.78/conf=0.67），
+        // 理由是 ABB 与渠道 server 通常同机（都是本地子进程），
+        // 两段式上传对这个场景过重；path_ref 会把 ABB 的文件系统暴露给 server。
+        let data = base64_encode(&bytes);
+        let mut c = self
+            .client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("渠道 client 锁中毒"))?;
+        Self::call_tool(
+            &mut c,
+            crate::mcp_bus::TOOL_SEND_ATTACHMENT,
+            serde_json::json!({
+                "chat_id": chat_id,
+                "name": meta.file_name,
+                "mime": meta.mime,
+                "kind": meta.kind,
+                "data_b64": data,
+            }),
+        )?;
+        Ok(())
     }
 }
 
@@ -280,6 +348,95 @@ mod tests {
         assert!(err.contains("入站"), "报因要指明缺入站能力：{err}");
     }
 
+    /// 声明了工具但**文件读不出来** ⇒ 报 IO 错（不是静默成功）。
+    #[tokio::test]
+    async fn send_attachment_reports_unreadable_file() {
+        let m = spawn_fake(
+            r#"while IFS= read -r line; do
+                 id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+                 case "$line" in
+                   *tools/list*)
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"send_text"},{"name":"send_attachment"}]}}\n' "$id" ;;
+                   *resources/list*)
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"resources":[{"uri":"channel://inbox"}]}}\n' "$id" ;;
+                   *) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+                 esac
+               done"#,
+        )
+        .unwrap_or_else(|e| panic!("应当连上：{e}"));
+        assert!(m.capabilities().has_send_attachment, "该假服务声明了工具");
+        let meta = crate::attachments::AttachmentMeta {
+            kind: "file".into(),
+            source: "test".into(),
+            file_name: "nope.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 1,
+            path: "/definitely/not/here/nope.bin".into(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let err = m.send_attachment("c", &meta).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("读附件失败"),
+            "读不出来要说清是 IO 问题：{msg}"
+        );
+    }
+
+    /// **体积超限必须在发送前拒绝**并说清大小。
+    ///
+    /// 不能让它一路走到 `mcp_client` 的单行上限——那里的报错是笼统的
+    /// `LineTooLong`，与「渠道不支持附件」难以区分。
+    #[tokio::test]
+    async fn send_attachment_rejects_oversized_before_sending() {
+        let m = spawn_fake(
+            r#"while IFS= read -r line; do
+                 id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+                 case "$line" in
+                   *tools/list*)
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"send_text"},{"name":"send_attachment"}]}}\n' "$id" ;;
+                   *resources/list*)
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"resources":[{"uri":"channel://inbox"}]}}\n' "$id" ;;
+                   *) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+                 esac
+               done"#,
+        )
+        .unwrap_or_else(|e| panic!("应当连上：{e}"));
+
+        // 造一个刚超上限的文件（稀疏写，别真占内存）
+        let path = std::env::temp_dir().join(format!(
+            "abb-attach-big-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        {
+            let f = std::fs::File::create(&path).expect("建临时文件");
+            f.set_len((crate::mcp_client::MAX_ATTACHMENT_BYTES + 1) as u64)
+                .expect("设长度");
+        }
+        let meta = crate::attachments::AttachmentMeta {
+            kind: "file".into(),
+            source: "test".into(),
+            file_name: "big.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 0,
+            path: path.display().to_string(),
+            sha256: String::new(),
+            note: String::new(),
+        };
+        let err = m.send_attachment("c", &meta).await.unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("附件太大"),
+            "超限要在发送前拒绝并说清大小：{msg}"
+        );
+        assert!(msg.contains("MB"), "报因要带单位：{msg}");
+    }
+
     #[test]
     fn capabilities_are_recorded_from_what_the_server_exposes() {
         let m = spawn_fake(
@@ -348,9 +505,25 @@ mod tests {
             .expect("应回落到 send_text 并成功");
     }
 
-    /// 附件必须**显式失败**，不能假装成功（历史教训：默认实现把路径当文本发还返回 Ok）。
+    /// base64 编码正确（标准字母表 + padding）。附件走它内联传输。
+    #[test]
+    fn base64_encode_is_correct() {
+        // 长度 % 3 的三种情形各验一次（padding 数量不同）
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // 含高位字节（0x80..0xff）也要对，别只测 ASCII
+        assert_eq!(base64_encode(&[0xff, 0xfe]), "//4=");
+    }
+
+    /// **服务没声明 `send_attachment` ⇒ 明确失败**，并且报因要说清是「没声明工具」，
+    /// 不能笼统说"发送失败"（那样会让人以为是网络问题）。
     #[tokio::test]
-    async fn send_attachment_fails_explicitly() {
+    async fn send_attachment_without_tool_fails_with_reason() {
         let m = spawn_fake(
             r#"while IFS= read -r line; do
                  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
@@ -375,9 +548,10 @@ mod tests {
             note: String::new(),
         };
         let err = m.send_attachment("c", &meta).await.unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("附件"),
-            "报因要说清是附件不支持：{err}"
+            msg.contains("未声明") && msg.contains("send_attachment"),
+            "报因要点名缺哪个工具：{msg}"
         );
     }
 }

@@ -182,6 +182,21 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "send_attachment",
+            "description": "发媒体给微信会话（图片/文件；内容 base64 内联）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string", "description": "会话键（微信 = user id）"},
+                    "name": {"type": "string", "description": "文件名（用于判断类型）"},
+                    "mime": {"type": "string"},
+                    "kind": {"type": "string", "description": "image | file | video"},
+                    "data_b64": {"type": "string", "description": "文件内容的 base64"}
+                },
+                "required": ["chat_id", "name", "data_b64"]
+            }
+        },
+        {
             "name": "login",
             "description": "扫码登录：渲染二维码 PNG 到 --dir，返回图片路径（给人扫）",
             "inputSchema": {"type": "object", "properties": {}}
@@ -192,6 +207,44 @@ fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": {}}
         }
     ])
+}
+
+/// 标准 base64 解码（含 padding）。返回 `None` 表示输入非法。
+///
+/// 手写不引 crate：与 ABB 侧 `mcp_channel::base64_encode` 对称，
+/// 且 `weixin.rs` 里本来就有 base64 实现（这里独立写一份是因为那边的函数私有）。
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let pad = chunk.iter().filter(|&&c| c == b'=').count();
+        let mut n: u32 = 0;
+        for (i, &c) in chunk.iter().enumerate() {
+            let v = if c == b'=' { 0 } else { val(c)? };
+            n |= (v as u32) << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
 }
 
 /// 登录成功时返回给 ABB 的**结果体**。
@@ -237,6 +290,41 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             let rt = rt();
             rt.block_on(ch.client.send_text(chat_id, &ctx, text))
                 .map_err(|e| format!("send_text 失败：{e}"))?;
+            Ok(json!({"content": [{"type": "text", "text": "ok"}]}))
+        }
+        "send_attachment" => {
+            let chat_id = a.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("file");
+            let kind_s = a.get("kind").and_then(|v| v.as_str()).unwrap_or("file");
+            let b64 = a.get("data_b64").and_then(|v| v.as_str()).unwrap_or("");
+            if chat_id.is_empty() {
+                return Err("send_attachment 缺 chat_id".into());
+            }
+            if b64.is_empty() {
+                return Err("send_attachment 缺 data_b64".into());
+            }
+            let data = base64_decode(b64)
+                .ok_or_else(|| "data_b64 不是合法 base64".to_string())?;
+            let ctx = ch
+                .contexts
+                .lock()
+                .map_err(|_| "contexts 锁中毒".to_string())?
+                .get(chat_id)
+                .cloned()
+                .unwrap_or_default();
+            if ctx.is_empty() {
+                eprintln!("[wechat-mcp] 警告：chat_id={chat_id} 无 context_token，媒体可能被丢弃");
+            }
+            // 微信侧的类型判定：按 kind 走。图片走 Image，其余一律按 File
+            // （VOICE 类型实测被官方丢弃，所以音频也按 File 发——沿用 ABB 原实现的结论）。
+            let kind = match kind_s {
+                "image" => weixin::OutboundMediaKind::Image,
+                "video" => weixin::OutboundMediaKind::Video,
+                _ => weixin::OutboundMediaKind::File,
+            };
+            let rt = rt();
+            rt.block_on(ch.client.send_media(chat_id, &ctx, kind, name, &data))
+                .map_err(|e| format!("send_attachment 失败：{e}"))?;
             Ok(json!({"content": [{"type": "text", "text": "ok"}]}))
         }
         "poll" => {
@@ -393,7 +481,10 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, vec!["send_text", "poll", "login", "login_status"]);
+        assert_eq!(
+            names,
+            vec!["send_text", "poll", "send_attachment", "login", "login_status"]
+        );
         assert!(
             !names.contains(&"send_thread_reply".to_string()),
             "微信无话题概念，不该声明它（否则 ABB 不回落 send_text）"
@@ -490,6 +581,60 @@ mod tests {
         );
         assert!(text.contains("token_len"), "应当只暴露长度，不暴露值");
         assert_eq!(body["user_id"], "u1", "user_id 可以明文（它不是凭证）");
+    }
+
+    /// base64 解码要和 ABB 的编码对称（含 padding 的三种情形）。
+    #[test]
+    fn base64_roundtrip() {
+        for s in ["", "f", "fo", "foo", "foob", "fooba", "foobar"] {
+            let enc = {
+                // 用与 ABB 相同的标准表编码，再解码回来
+                let data = s.as_bytes();
+                let mut e = String::new();
+                const T: &[u8; 64] =
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                for ch in data.chunks(3) {
+                    let b = [ch[0], *ch.get(1).unwrap_or(&0), *ch.get(2).unwrap_or(&0)];
+                    let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+                    e.push(T[(n >> 18) as usize & 63] as char);
+                    e.push(T[(n >> 12) as usize & 63] as char);
+                    e.push(if ch.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+                    e.push(if ch.len() > 2 { T[n as usize & 63] as char } else { '=' });
+                }
+                e
+            };
+            assert_eq!(
+                base64_decode(&enc).as_deref(),
+                Some(s.as_bytes()),
+                "往返失败：{s:?} → {enc:?}"
+            );
+        }
+        // 非法输入返回 None（不是 panic、不是空 Vec）
+        assert_eq!(base64_decode("!!!!"), None);
+        assert_eq!(base64_decode("abc"), None, "长度不是 4 的倍数");
+    }
+
+    /// 非法 base64 ⇒ 明确报错，不是静默发空内容。
+    #[test]
+    fn invalid_base64_errors() {
+        let e = call_tool(
+            &fake_channel(),
+            &json!({"name":"send_attachment","arguments":{
+                "chat_id":"c","name":"x.png","data_b64":"!!!!"}}),
+        )
+        .unwrap_err();
+        assert!(e.contains("合法 base64"), "报因要说清是编码问题：{e}");
+    }
+
+    /// 缺 data_b64 ⇒ 报错（不是发一个空文件）。
+    #[test]
+    fn missing_b64_errors() {
+        let e = call_tool(
+            &fake_channel(),
+            &json!({"name":"send_attachment","arguments":{"chat_id":"c","name":"x"}}),
+        )
+        .unwrap_err();
+        assert!(e.contains("data_b64"), "报因要点名缺哪个字段：{e}");
     }
 
     /// 未实现的方法要报错（不是静默成功）。
