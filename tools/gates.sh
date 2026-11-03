@@ -157,6 +157,31 @@ echo "== ABB 门禁：crates/abb-chart（独立包，中间产物外置于 ${cha
   cargo test --manifest-path "$chart_manifest" --offline
 )
 
+# crates/abb-channel-wechat 同样是独立包，root 的四条也碰不到它。
+#
+# **为什么必须加这一组**（2026-11-03 实测）：那个包从建起来到功能做完，
+# 一直是「有测试、但没人跑」——`cargo test` 得显式带 `--manifest-path` 才会跑到它。
+# 这正是本仓 `docs/false-green-checklist.md` 第 4 种形态
+# （**守卫覆盖面没跟上代码增长**）：代码加了新包，门禁清单没跟上，等于没有守卫。
+#
+# 不用 `check_test_isolation.sh`：那个守卫查「测试不得写 ~/.agent-bridge」，
+# 而这个包的测试只起子进程、不碰运行目录。
+# 目标目录另开 `-wechat` 子目录，理由同 chart（cargo 的锁粒度是整目录）。
+wechat_manifest="$repo_root/crates/abb-channel-wechat/Cargo.toml"
+wechat_target="$CARGO_TARGET_DIR-wechat"
+mkdir -p "$wechat_target"
+
+echo "== ABB 门禁：crates/abb-channel-wechat（独立包，中间产物外置于 ${wechat_target}）=="
+(
+  export CARGO_TARGET_DIR="$wechat_target"
+  cargo fmt --manifest-path "$wechat_manifest" --check
+  cargo clippy --manifest-path "$wechat_manifest" --locked --all-targets -- -D warnings
+  cargo build --manifest-path "$wechat_manifest" --locked
+  # 集成测试要起真子进程（`tests/contract.rs`），所以不能用 --offline 之外的额外限制；
+  # 但依赖已 lock，`--locked` 保证不临时拉新版本。
+  cargo test --manifest-path "$wechat_manifest" --locked
+)
+
 # 协作门禁（crates/* 之外，跑得快、不联网、不编译）：这两条守的是「合并闸门本身」，
 # 之前只在 .walgit/ci.toml 里跑，本地 gates.sh 漏了 —— 而协调者合并前跑的是 gates.sh
 # （评审 NB-6）。放在最后：前面任何一条失败都不会掩盖它们。

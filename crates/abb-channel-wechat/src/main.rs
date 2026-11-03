@@ -303,8 +303,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             if b64.is_empty() {
                 return Err("send_attachment 缺 data_b64".into());
             }
-            let data = base64_decode(b64)
-                .ok_or_else(|| "data_b64 不是合法 base64".to_string())?;
+            let data = base64_decode(b64).ok_or_else(|| "data_b64 不是合法 base64".to_string())?;
             let ctx = ch
                 .contexts
                 .lock()
@@ -483,7 +482,13 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["send_text", "poll", "send_attachment", "login", "login_status"]
+            vec![
+                "send_text",
+                "poll",
+                "send_attachment",
+                "login",
+                "login_status"
+            ]
         );
         assert!(
             !names.contains(&"send_thread_reply".to_string()),
@@ -554,8 +559,11 @@ mod tests {
     /// 后者会让用户一直等一个根本不存在的二维码。
     #[test]
     fn login_status_without_login_errors() {
-        let e = call_tool(&fake_channel(), &json!({"name":"login_status","arguments":{}}))
-            .unwrap_err();
+        let e = call_tool(
+            &fake_channel(),
+            &json!({"name":"login_status","arguments":{}}),
+        )
+        .unwrap_err();
         assert!(e.contains("还没调 login"), "报因要指路：{e}");
     }
 
@@ -598,8 +606,16 @@ mod tests {
                     let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
                     e.push(T[(n >> 18) as usize & 63] as char);
                     e.push(T[(n >> 12) as usize & 63] as char);
-                    e.push(if ch.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-                    e.push(if ch.len() > 2 { T[n as usize & 63] as char } else { '=' });
+                    e.push(if ch.len() > 1 {
+                        T[(n >> 6) as usize & 63] as char
+                    } else {
+                        '='
+                    });
+                    e.push(if ch.len() > 2 {
+                        T[n as usize & 63] as char
+                    } else {
+                        '='
+                    });
                 }
                 e
             };

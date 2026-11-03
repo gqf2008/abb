@@ -20,7 +20,6 @@
 //! ——区别在于它写清了还剩哪一步，而不是"反正先让它绿"。
 #![allow(dead_code)]
 
-
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -583,10 +582,7 @@ impl WeixinClient {
         let status = resp.status();
         let text = resp.text().await.context("读响应体失败")?;
         if !status.is_success() {
-            anyhow::bail!(
-                "POST {endpoint} HTTP {status}: {}",
-                truncate(&text, 200)
-            );
+            anyhow::bail!("POST {endpoint} HTTP {status}: {}", truncate(&text, 200));
         }
         serde_json::from_str(&text).with_context(|| format!("POST {endpoint} 响应非 JSON"))
     }
@@ -683,11 +679,7 @@ impl WeixinClient {
         context_token: &str,
         item_list: Vec<serde_json::Value>,
     ) -> Result<()> {
-        let client_id = format!(
-            "fb_{}_{}",
-            unix_secs(),
-            fastrand::u64(..)
-        );
+        let client_id = format!("fb_{}_{}", unix_secs(), fastrand::u64(..));
         let body = serde_json::json!({
             "msg": {
                 "from_user_id": "",
@@ -977,7 +969,7 @@ fn aes_ecb_encrypt(plain: &[u8], key: &[u8; 16]) -> Vec<u8> {
     let pad = 16 - (plain.len() % 16);
     let mut buf = plain.to_vec();
     buf.resize(buf.len() + pad, pad as u8);
-    for block in buf.as_chunks_mut::<16>().0 {
+    for block in buf.chunks_mut(16) {
         cipher.encrypt_block(GenericArray::from_mut_slice(block));
     }
     buf
@@ -987,12 +979,13 @@ fn aes_ecb_encrypt(plain: &[u8], key: &[u8; 16]) -> Vec<u8> {
 fn aes_ecb_decrypt(ciphertext: &[u8], key: &[u8; 16]) -> Result<Vec<u8>> {
     use aes::cipher::generic_array::GenericArray;
     use aes::cipher::{BlockDecrypt, KeyInit};
-    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
+    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
         anyhow::bail!("CDN 密文长度 {} 不是 16 的倍数，解密失败", ciphertext.len());
     }
-    let cipher = aes::Aes128::new_from_slice(key).map_err(|_| anyhow!("AES key 初始化失败（长度应为 16 字节）"))?;
+    let cipher = aes::Aes128::new_from_slice(key)
+        .map_err(|_| anyhow!("AES key 初始化失败（长度应为 16 字节）"))?;
     let mut buf = ciphertext.to_vec();
-    for block in buf.as_chunks_mut::<16>().0 {
+    for block in buf.chunks_mut(16) {
         cipher.decrypt_block(GenericArray::from_mut_slice(block));
     }
     // PKCS7 去填充
@@ -1165,4 +1158,3 @@ pub fn save_qrcode_image(dir: &std::path::Path, content: &str) -> Result<std::pa
     std::fs::write(&p, png)?;
     Ok(p)
 }
-
