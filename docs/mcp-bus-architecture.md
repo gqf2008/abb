@@ -158,6 +158,31 @@ ABB 侧会在**发送之前**做预检并给出「附件太大：X MB，上限 Y
 **渠道配置由提供 MCP 的一方决定**：ABB 不认识 `WX_TOKEN` 是什么，它只是把 `env`
 原样传给子进程。所以接一个新渠道不需要改 ABB——写一个新的 MCP server 就行。
 
+#### 三个已有渠道的配置对照
+
+每个渠道的 `env` 由它自己的 server 定义（ABB 只转发）。实测的完整清单：
+
+| 渠道 | `command` | `args` | `env` |
+|---|---|---|---|
+| 微信 | `abb-channel-wechat` | `--dir <二维码/登录态目录>` | `WX_TOKEN`、`WX_BASE_URL`、`WX_USER_ID`（可选 `WX_CDN_BASE_URL`） |
+| 飞书 | `abb-channel-feishu` | 无 | `FS_APP_ID`、`FS_APP_SECRET` |
+| 钉钉 | `abb-channel-dingtalk` | 无 | `DT_APP_ID`、`DT_APP_SECRET`、`DT_ROBOT_CODE` |
+
+**为什么只有微信用 `--dir`**：微信要扫码登录，二维码 PNG 需要一个落地目录
+（`login` 工具把图写到那里、路径打到 stderr）。飞书与钉钉用 `app_id`/`app_secret`
+换 `tenant_token` / Stream 凭证，不需要本地目录 ⇒ **它们忽略命令行参数**
+（传了也不报错，但不起作用）。
+
+**微信的特殊之处：凭证不是一开始就有的。** 流程是：
+
+1. `mcp_channel` 只配 `command` + `args`，`env` 先留空；
+2. 调 `login` 工具 → 二维码写到 `--dir`；
+3. 扫码后调 `login_status` → `confirmed` 时 token 打到 **stderr**（不放进工具结果，
+   因为工具结果会被 ABB 落进会话历史）；
+4. 把 stderr 里的三项填进 `mcp_channel.env`，重启 bot。
+
+飞书/钉钉没有这一步——凭证来自开放平台后台，直接填 `env` 即可。
+
 ### 4.2 已有的渠道实现
 
 | 实现 | 位置 | 状态 |
