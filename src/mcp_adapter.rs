@@ -27,8 +27,6 @@
 // 本步骤（S2c adapter）把翻译逻辑做成可单测的纯函数；**接进 `service::run_bot`
 // 的循环（真 client → negotiate → 循环 → Bridge）是 S2d**。
 // 与 `mcp_bus`/`mcp_inbound` 同口径：**移除必须是「真接上了」**，不是「先关警告」。
-#![allow(dead_code)]
-
 use crate::bridge::Ev;
 use crate::config::SenderRole;
 use crate::mcp_bus::ChannelMessage;

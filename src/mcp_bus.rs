@@ -24,8 +24,6 @@
 //!
 //! 契约常量与校验函数在本步骤（S1a）只被测试使用；接线到实际连接是 S1b/S1c，
 //! 所以整模块暂时 `allow(dead_code)`——移除它的时候必须是「真的接上了」而不是「先关警告」。
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 /// 出站工具名（契约 §3.1）。缺失即该渠道不可用。
@@ -161,6 +159,13 @@ pub enum Inbound {
 ///
 /// `channel://inbox` ⇒ `None`（全局收件箱，会话键随消息自带）；
 /// `channel://<chat_id>/inbox` ⇒ `Some(chat_id)`。
+///
+/// **当前没被调用，但保留**（逐项 allow 而非删掉）：
+/// 入站走的是「订阅整个 inbox → read → 消息自带 chat_id」这条路，用不到从 URI 反解。
+/// 但 `channel://<chat_id>/inbox` 是契约允许的形态（`docs/mcp-bus-architecture.md` §3.2），
+/// 有些 server 会按会话分资源——接入那种 server 时就要靠它把 URI 映射回会话键。
+/// 删掉它等于把契约的一半实现丢掉，而契约本身没变。
+#[allow(dead_code)]
 pub fn chat_id_of_inbox_uri(uri: &str) -> Result<Option<String>, ContractError> {
     let rest = uri
         .strip_prefix(INBOX_URI_PREFIX)
