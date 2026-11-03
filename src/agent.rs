@@ -1664,6 +1664,88 @@ mod tests {
         assert!(prompt.contains("gh auth status"));
     }
 
+    /// 取出 base prompt 里以 `header` 开头的一节（到下一个一级标题为止）。
+    fn prompt_section<'a>(prompt: &'a str, header: &str) -> &'a str {
+        let start = prompt
+            .find(header)
+            .unwrap_or_else(|| panic!("base prompt 缺小节「{header}」"));
+        let rest = &prompt[start + header.len()..];
+        let len = rest.find("\n# ").map(|i| i + 1).unwrap_or(rest.len());
+        &prompt[start..start + header.len() + len]
+    }
+
+    /// 渠道配置**按需告知**（owner 要求 + Jev `on_need` 裁定，rid
+    /// `gen-dec-1793667261-Nm9zKdQPgZm2XQZheUoC`）。三个判据，缺一个就要变红：
+    ///
+    /// 1. **带触发闸门**：这一节必须写明「按需 / 没人问就不要主动讲」——否则它就变成
+    ///    常驻声明（Jev 明确否掉的那种），而不只是“把内容写进去了”。
+    /// 2. **契约锚点齐全**：渠道服务讲错一句，用户就会照错的配——必需 `send_text`、
+    ///    可选 `send_thread_reply`、入站资源订阅与 `poll` 二选一、`mcp_channel` 的四个字段。
+    /// 3. **不把内置渠道说成主路径**：feishu/wechat/dingtalk 的实现还在，但新渠道一律走
+    ///    契约；出现「推荐/优先/默认/首选/主路径」而同一行没有否定词就判红。
+    #[test]
+    fn base_prompt_mcp_channel_guide_is_on_demand_and_accurate() {
+        let prompt = include_str!("runtime/base_prompt.md");
+        let sec = prompt_section(prompt, "# 用户想接新渠道时");
+
+        // 1) 按需闸门（变异验证：把这三句删掉 ⇒ 本测试立刻红）。
+        for needle in ["按需", "不要主动讲", "没人问就不要主动讲"] {
+            assert!(sec.contains(needle), "应按需触发，缺「{needle}」");
+        }
+
+        // 2) 契约锚点。`send_text` 必须与「必需」同现，且 `poll` 方案要带游标语义。
+        for needle in [
+            "`send_text`",
+            "必需",
+            "`send_thread_reply`",
+            "回落",
+            "channel://inbox",
+            "channel://<chat_id>/inbox",
+            "notifications/resources/updated",
+            "resources/read",
+            "`poll`",
+            "next_cursor",
+            "二选一",
+            "`mcp_channel`",
+            "`name`",
+            "`command`",
+            "`args`",
+            "`env`",
+            "启动命令",
+        ] {
+            assert!(sec.contains(needle), "渠道接入说明缺契约锚点「{needle}」");
+        }
+        let send_line = sec
+            .lines()
+            .find(|l| l.contains("`send_text`"))
+            .expect("应提到 send_text");
+        assert!(
+            send_line.contains("必需"),
+            "send_text 是唯一的必需出站工具，必须就地标明：{send_line}"
+        );
+
+        // 3) 内置渠道不得被写成推荐/主路径（否定语境除外）。
+        const BUILTIN: [&str; 3] = ["飞书", "微信", "钉钉"];
+        const RECOMMENDING: [&str; 5] = ["推荐", "优先", "默认", "首选", "主路径"];
+        const NEGATING: [&str; 6] = ["不是", "不要", "别", "非", "一律走", "不内置"];
+        for line in prompt.lines() {
+            if !BUILTIN.iter().any(|c| line.contains(c)) {
+                continue;
+            }
+            let recommends = RECOMMENDING.iter().any(|w| line.contains(w));
+            let negates = NEGATING.iter().any(|w| line.contains(w));
+            assert!(
+                !recommends || negates,
+                "内置渠道被写成了推荐/主路径（原文：{line}）"
+            );
+        }
+        // 反过来：这一节必须显式说「内置实现不是主路径」，否则等于默认它仍是。
+        assert!(
+            sec.contains("不是**主路径") || sec.contains("不是主路径"),
+            "这一节应显式声明内置实现不是主路径"
+        );
+    }
+
     #[test]
     fn sandbox_mode_mode_serde_roundtrip_and_defaults() {
         // kebab-case 反序列化 + full-access 默认（旧 config 无字段兼容）+ Auto legacy 可读
