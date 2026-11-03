@@ -61,6 +61,7 @@ mod proc_group;
 mod proc_sysctl;
 mod proto;
 mod redact;
+mod retry;
 mod runtime;
 mod schedule;
 mod screenshot;

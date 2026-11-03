@@ -1343,6 +1343,11 @@ async fn weixin_loop(
     // 连续客户端超时计数：偶发超时是长轮询常态；连续 ≥3 次（≈2 分钟无任何成功响应）= 通道疑似
     // 半开假死（与 WS 看门狗同理：发得出去≠通，收得到才算通），降级「重连中」并留痕。
     let mut consec_timeouts = 0u32;
+    // 连续失败计数（**2026-11-03 owner 决定「永不放弃」后加的日志节流**）。
+    //
+    // 原本固定 3s 重试：服务长期不可用时一天约 28800 条日志，而日志是排障唯一线索，
+    // 刷屏等于把它毁了。成功一次就复位，所以偶发抖动仍是 3s。
+    let mut fails: u32 = 0;
     loop {
         if stop.is_cancelled() {
             break;
@@ -1361,6 +1366,7 @@ async fn weixin_loop(
                         save_wx_cursor(&key, &cursor);
                         timeout_ms = new_timeout.max(5_000);
                         consec_timeouts = 0; // 成功响应 = 通道真通，复位假死计数
+                        fails = 0; // 同上：复位重连退避
                         // 每次成功轮询都视为「在线」，但至多 10s 重报一次续命（对抗僵尸过滤）
                         if last_online.elapsed() > std::time::Duration::from_secs(10) {
                             crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "在线");
@@ -1395,8 +1401,20 @@ async fn weixin_loop(
                     }
                     Err(e) => {
                         crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "重连中");
-                        crate::log!("[bot:{key}] getupdates 出错，3s 后重试：{e}");
-                        if interruptible_sleep(std::time::Duration::from_secs(3), &stop).await {
+                        fails += 1;
+                        // 「要不要放弃」由 `retry::should_give_up` 统一决定（当前恒 false）。
+                        // 保留这个判断而不是省掉，是为了让将来重新引入上限时**只改一处**。
+                        if crate::retry::should_give_up(fails) {
+                            crate::log!("[bot:{key}] 连续失败 {fails} 次，放弃重连");
+                            crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "连接失败");
+                            break;
+                        }
+                        let wait = crate::retry::backoff(fails);
+                        crate::log!(
+                            "[bot:{key}] getupdates 出错，{}s 后重试（第 {fails} 次）：{e}",
+                            wait.as_secs()
+                        );
+                        if interruptible_sleep(wait, &stop).await {
                             break;
                         }
                     }
