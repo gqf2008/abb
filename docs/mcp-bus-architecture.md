@@ -183,6 +183,57 @@ ABB 侧会在**发送之前**做预检并给出「附件太大：X MB，上限 Y
 
 飞书/钉钉没有这一步——凭证来自开放平台后台，直接填 `env` 即可。
 
+#### `owner_ids`：谁是管理员
+
+MCP 渠道的 `sender_id` 是**渠道服务自报**的字符串，ABB 没有任何平台侧鉴权手段。
+所以**默认全部受限**（fail-closed）——「接一个渠道」绝不等于「自动交出全权限」。
+
+要恢复管理能力（免 @ 开关、`/trash` 回收站），必须在配置里显式声明：
+
+```jsonc
+"mcp_channel": {
+  "name": "feishu",
+  "command": "/path/to/abb-channel-feishu",
+  "owner_ids": ["ou_abc123", "ou_def456"],   // ← 谁是管理员
+  "env": [ … ]
+}
+```
+
+**四个必须知道的语义**：
+
+| 行为 | 说明 |
+|---|---|
+| 空/不写 `owner_ids` | **全部受限**（默认，安全侧） |
+| 名单含该 `sender_id` | 该发送者是 `Owner`（全权限） |
+| 匹配**大小写敏感** | `Alice` ≠ `alice`（sender_id 是标识符，不是人名） |
+| 空 `sender_id` **永不算 owner** | 哪怕名单里也写了空串（那是畸形配置） |
+
+**怎么找到自己的 `sender_id`**：随便发一条消息，看 ABB 日志里 `[bridge] 收到消息 … sender=`（或渠道 server 的 stderr）。
+填进去、重启 bot 即生效。
+
+#### 从内置渠道迁到 MCP 渠道
+
+内置渠道（`kind = "feishu"` 等）与 MCP 渠道（`kind = "mcp"`）是**两套并行实现**，
+可以同时存在、逐 bot 迁移，不需要一刀切。
+
+**一条飞书 bot 的迁移步骤**：
+
+1. 记下原 bot 的 `app_id` / `app_secret`（`config.json` 里那一项）
+2. 新建一个 bot，`kind` 填 `mcp`，`mcp_channel` 填：
+   - `command`: `abb-channel-feishu` 的绝对路径
+   - `env`: `FS_APP_ID` / `FS_APP_SECRET`（就是第 1 步那两个）
+   - `owner_ids`: 填你自己的 `sender_id`（否则管理功能不可用，见上）
+3. 停用原 bot（`enabled: false`），启用新 bot
+4. 发一条消息验证收发
+
+**注意**：两个 bot 用**同一套凭证**同时跑会双收消息（同一个飞书应用只能有一条长连接）。
+所以迁移时必须**先停旧的再启新的**，不能并行试。
+
+**回滚**：把新 bot 停用、旧 bot 启用即可——旧实现完整保留，代码没删。
+
+**微信的差异**：微信 MCP 渠道的凭证来自扫码（`login` 工具），不是 `app_secret`；
+且有 `--dir` 参数（二维码落地目录）。其余步骤相同。
+
 ### 4.2 已有的渠道实现
 
 | 实现 | 位置 | 状态 |
