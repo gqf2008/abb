@@ -29,9 +29,10 @@
 //! - `send` 要超时包装（#18 / #179）：网络半死时 `sink.send()` 可永久挂起 ⇒ `select!` 冻死 ⇒ 永不重连；
 //! - **半开看门狗**：连通性的证据是「最近收到过对端帧」，不是「ping 发得出去」。
 //!
-//! 未做的（本批范围外，与飞书版同口径）：入站附件**只带 `kind`/`name`**，`url_or_path` 留空
-//! ——真下载要 `download_msg_file`，属下一批。**不编造本地路径**（编造会让 agent 去读一个
-//! 不存在的文件且不报错）。
+//! 未做的（本批范围外，与飞书版同口径）：入站附件**不预下载**——这里只带 `kind`/`name`，
+//! `url_or_path` 留空；真下载由 `download_attachment` 工具**按需**做（钉钉的 `downloadCode`
+//! 只在入站帧里出现一次，所以入站时先记进台账，见 `Channel::remember`）。
+//! **不编造本地路径**（编造会让 agent 去读一个不存在的文件且不报错）。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -253,6 +254,9 @@ async fn ingest(ch: &Arc<Channel>, frame: &Value) {
     if !chat_id.is_empty() && !msg.sender_staff_id.is_empty() {
         ch.note_sender(&chat_id, &msg.sender_staff_id);
     }
+    // 附件引用（downloadCode）只在入站帧里出现一次 —— 必须现场记下来，
+    // 否则 `download_attachment` 工具永远拿不到下载引用（见 `Channel::remember`）。
+    ch.remember(&msg);
     eprintln!(
         "[dingtalk-ws] 收到 chat={} mid={} from={} text_len={} atts={}",
         chat_id,
@@ -297,10 +301,11 @@ pub fn to_channel_message(msg: &DingtalkMessage, sender_name: &str) -> Value {
         .attachments
         .iter()
         .map(|a| {
-            // 真下载（`download_msg_file`）不在本批范围 ⇒ `url_or_path` 留空，
+            // 不预下载（见文件头）⇒ `url_or_path` 留空；真下载走 `download_attachment` 工具，
+            // 它的下载引用已由 `Channel::remember` 记进台账。
             // ABB 会如实记成「渠道未提供附件位置」，**不编造本地路径**。
             eprintln!(
-                "[dingtalk-ws] 入站附件未下载 kind={} code={} name={}",
+                "[dingtalk-ws] 入站附件待按需下载 kind={} code={} name={}",
                 a.kind, a.download_code, a.file_name
             );
             json!({"kind": a.kind, "name": a.file_name, "url_or_path": ""})

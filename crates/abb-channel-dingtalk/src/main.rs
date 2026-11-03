@@ -10,7 +10,33 @@
 //! | 出站 | 工具 `send_text`（必需） | ✅ 走 `dingtalk::DingTalkClient::send_text`（超长自动分段） |
 //! | 出站 | 工具 `send_thread_reply`（可选） | ❌ **不声明**：钉钉**没有话题概念** |
 //! | 出站 | 工具 `send_attachment`（可选） | ✅ base64 内联 → `media/upload` → 图片/文件消息 |
-//! | 入站 | `poll` 或 `channel://` 资源订阅 | ✅ **资源订阅**（`channel://inbox`），见下 |
+//! | 出站 | 工具 `create_chat`（可选） | ✅ `topapi/im/chat/create`（`owner_user_id` 同时作群主与唯一成员） |
+//! | 入站 | `channel://` 资源订阅 | ✅ **资源订阅**（`channel://inbox`），见下 |
+//! | 入站 | 工具 `download_attachment`（可选） | ✅ `downloadCode` 台账 + `messageFiles/download` → 落盘给路径 |
+//! | 查询 | 工具 `get_chat_info`（可选） | ✅ `topapi/im/chat/get`（单聊走 `contact/users/:id`） |
+//! | 查询 | 工具 `chat_brief`（可选） | ✅ 入站 `conversationTitle` 台账 + 上面的反查兜底 |
+//! | 查询 | 工具 `user_display_name`（可选） | ✅ `contact/users/:id` |
+//! | 状态 | 工具 `note_sender`（可选） | ✅ 写入进程内「最近提问者」表（与入站路径同一张） |
+//!
+//! ## 明确**不声明**的可选能力（宁可缺，不可假）
+//!
+//! | 工具 | 为什么不声明 |
+//! |---|---|
+//! | `send_thread_reply` | 钉钉没有话题维度（见下节） |
+//! | `typing` / `del_typing` / `done` | 钉钉机器人**没有表情/reaction API**——没有能落地的平台动作 |
+//! | `note_context` | 它是微信 `context_token` 的专用形状；钉钉的出站不需要任何会话令牌 |
+//! | `get_quoted_message` | 钉钉的引用内容**随入站帧到达**（`text.repliedMsg`），本进程在入站时已按
+//!   ABB 原 prompt 形状并进 `text`（`[引用消息]…`）；钉钉也没有「按 msgId 取任意历史消息」
+//!   的接口，声明它只会让 ABB 多跑一次注定落空的调用 |
+//! | `poll` | 入站是服务端推的长连接（见下节），没有「按游标取一批」的原语 |
+//!
+//! ## `download_attachment` 为什么要一张「最近入站消息」台账
+//!
+//! 契约把参数定成 `{message_id, seq}`（§3.4：**怎么下载是渠道的事**），而钉钉的
+//! `downloadCode` 只在入站 CALLBACK 帧里出现**一次**——不记下来就永远拿不到。
+//! 所以入站时把「message_id → 附件引用（kind / downloadCode / 文件名）+ robotCode」
+//! 记进容量 [`RECENT_CAP`] 的台账，工具调用时反查。台账只留最近若干条：这是**能力**
+//! 而不是**保证**——查不到就明确报错，让 ABB 如实记成「附件没下来」，绝不编造路径。
 //!
 //! ## 与飞书版的唯一结构差异：没有 `send_thread_reply`
 //!
@@ -56,12 +82,13 @@
 mod dingtalk;
 mod wsin;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use dingtalk::DingTalkClient;
+use dingtalk::{DingTalkClient, DingtalkAttachment, DingtalkMessage};
 use serde_json::{json, Value};
 
 /// 入站资源的 URI（契约 §3.2 的 A 方案，整渠道一个 inbox）。
@@ -76,6 +103,74 @@ const INBOX_CAP: usize = 200;
 /// 20 MB × 4/3 ≈ 26.7 MB < 契约 §3.5 的单帧上限 32 MB，仍在线内。
 const DINGTALK_IMAGE_MAX_BYTES: usize = 20 * 1024 * 1024;
 const DINGTALK_FILE_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+/// 「最近入站消息」台账容量（条）。
+///
+/// 只服务两个可选能力：`download_attachment`（按 `message_id` 反查 `downloadCode`）
+/// 与 `chat_brief`（按 `chat_id` 反查群名）。正常调用是「收到消息后立刻处理」，
+/// 几百条足够覆盖重试/并发；上限只为**不吃内存**——满了丢最旧的，且丢掉的
+/// 消息会得到一条说得清原因的报错（见 `download_attachment` 臂）。
+const RECENT_CAP: usize = 500;
+
+/// ABB 对**引用消息**的附件用的 `seq` 约定是 `100 + i`（`bridge` 的引用路径），
+/// 主消息自己的附件则是 `i`。台账按同一套编号分派，免得两个方向错位。
+const QUOTED_SEQ_BASE: usize = 100;
+
+/// 一条待下载附件的台账项（`downloadCode` 只在入站帧里出现一次，必须记下来）。
+#[derive(Debug, Clone)]
+pub(crate) struct CachedAttachment {
+    kind: String,
+    download_code: String,
+    file_name: String,
+    /// 语音消息的转写文本（钉钉 `recognition`）：落盘时原样回报给 ABB 当备注。
+    voice_text: String,
+}
+
+impl CachedAttachment {
+    fn of(a: &DingtalkAttachment) -> CachedAttachment {
+        CachedAttachment {
+            kind: a.kind.clone(),
+            download_code: a.download_code.clone(),
+            file_name: a.file_name.clone(),
+            voice_text: a.voice_text.clone(),
+        }
+    }
+}
+
+/// 一条入站消息的台账项。
+#[derive(Debug, Clone)]
+pub(crate) struct CachedMessage {
+    /// 回调里的 `robotCode`（下载附件必需）。空 ⇒ 回落渠道级 `DT_ROBOT_CODE`。
+    robot_code: String,
+    /// 本条消息自己的附件（`seq` 就是下标）。
+    attachments: Vec<CachedAttachment>,
+    /// 被引用消息的附件（`seq` = `QUOTED_SEQ_BASE + i`）。
+    quoted_attachments: Vec<CachedAttachment>,
+}
+
+/// 定长「最近入站消息」台账（FIFO 淘汰）。
+#[derive(Default)]
+pub(crate) struct Recent {
+    order: VecDeque<String>,
+    items: HashMap<String, CachedMessage>,
+}
+
+impl Recent {
+    fn put(&mut self, mid: &str, m: CachedMessage) {
+        if self.items.insert(mid.to_string(), m).is_none() {
+            self.order.push_back(mid.to_string());
+        }
+        while self.order.len() > RECENT_CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.items.remove(&old);
+            }
+        }
+    }
+
+    fn get(&self, mid: &str) -> Option<&CachedMessage> {
+        self.items.get(mid)
+    }
+}
 
 /// 渠道进程的共享状态。
 struct Channel {
@@ -99,6 +194,11 @@ struct Channel {
     /// 里查它）；本进程没有 `send_thread_reply` 工具了，所以由 `send_text` 消费它，
     /// 否则群聊里回复会静默失去 @ 提及（见文件头「代价与补偿」）。
     last_sender: Mutex<HashMap<String, String>>,
+    /// 「最近入站消息」台账（`download_attachment` 按 `message_id` 反查下载引用用）。
+    recent: Mutex<Recent>,
+    /// 会话名台账（钉钉只在**入站帧**里给 `conversationTitle`，出站/查询接口的群资料
+    /// 需要额外权限；先记下来，`chat_brief`/`get_chat_info` 才能不联网就答）。
+    chat_names: Mutex<HashMap<String, String>>,
     /// stdout 的唯一出口。主循环回包与 Stream 线程推通知都走它 ⇒ **行不会交错**。
     out: Mutex<std::io::Stdout>,
 }
@@ -144,6 +244,54 @@ impl Channel {
             .unwrap_or_else(|e| e.into_inner())
             .get(chat_id)
             .cloned()
+    }
+
+    /// 记下一条入站消息的附件引用与 robotCode（`download_attachment` 反查用）。
+    ///
+    /// 顺手记下会话名：钉钉只在入站帧里给 `conversationTitle`，出站/查询接口的群资料
+    /// 需要额外权限——不在这里记，`chat_brief` 就得多跑一次注定失败的 API。
+    pub(crate) fn remember(&self, msg: &DingtalkMessage) {
+        let convert = |atts: &[DingtalkAttachment]| -> Vec<CachedAttachment> {
+            atts.iter().map(CachedAttachment::of).collect()
+        };
+        let cached = CachedMessage {
+            robot_code: msg.robot_code.clone(),
+            attachments: convert(&msg.attachments),
+            quoted_attachments: convert(&msg.quoted_attachments),
+        };
+        self.recent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(&msg.mid, cached);
+        let chat_id = msg.chat_id();
+        if !chat_id.is_empty() && !msg.conversation_title.is_empty() {
+            self.note_chat_name(&chat_id, &msg.conversation_title);
+        }
+    }
+
+    /// 取某条入站消息的台账项（没有 = 没收到过 / 已被 FIFO 腾出）。
+    fn cached_message(&self, mid: &str) -> Option<CachedMessage> {
+        self.recent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(mid)
+            .cloned()
+    }
+
+    fn note_chat_name(&self, chat_id: &str, name: &str) {
+        self.chat_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(chat_id.to_string(), name.to_string());
+    }
+
+    fn chat_name_of(&self, chat_id: &str) -> Option<String> {
+        self.chat_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(chat_id)
+            .cloned()
+            .filter(|n| !n.is_empty())
     }
 
     /// Stream 线程的入口：塞进缓冲，然后（若已订阅）推一条「有更新」。
@@ -225,6 +373,8 @@ fn main() {
         subscribed: Mutex::new(Vec::new()),
         notify_pending: AtomicBool::new(false),
         last_sender: Mutex::new(HashMap::new()),
+        recent: Mutex::new(Recent::default()),
+        chat_names: Mutex::new(HashMap::new()),
         out: Mutex::new(std::io::stdout()),
     });
 
@@ -387,6 +537,76 @@ fn tools() -> Value {
                 },
                 "required": ["chat_id", "name", "data_b64"]
             }
+        },
+        {
+            "name": "create_chat",
+            "description": "创建钉钉群会话（topapi/im/chat/create）。注意：钉钉建群必须给群主与成员，所以 owner_user_id 同时当群主和唯一成员；钉钉群无「群介绍」字段，description 被忽略",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "群名"},
+                    "description": {"type": "string", "description": "群介绍（钉钉无此字段，传了也忽略）"},
+                    "owner_user_id": {"type": "string", "description": "群主 staffId（钉钉建群必需；空则明确报错）"}
+                },
+                "required": ["name", "owner_user_id"]
+            }
+        },
+        {
+            "name": "download_attachment",
+            "description": "把某条入站消息的第 seq 个附件下载到本地，返回落盘路径（钉钉的 downloadCode 只在入站帧里出现一次，本进程按 message_id 反查）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string", "description": "入站消息的 message_id"},
+                    "seq": {"type": "integer", "description": "附件序号（主消息附件从 0 起；引用消息的附件按 ABB 约定从 100 起）"}
+                },
+                "required": ["message_id", "seq"]
+            }
+        },
+        {
+            "name": "get_chat_info",
+            "description": "查群资料（topapi/im/chat/get，返回群名；钉钉群没有群介绍字段，description 恒空）。单聊会话走通讯录反查对方姓名",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string", "description": "会话键：群聊 = cid…，单聊 = staffId"}
+                },
+                "required": ["chat_id"]
+            }
+        },
+        {
+            "name": "chat_brief",
+            "description": "会话类型 + 会话名（历史回填用）：群聊回 group、单聊回 p2p；名字优先用入站帧里的 conversationTitle",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string", "description": "会话键：群聊 = cid…，单聊 = staffId"}
+                },
+                "required": ["chat_id"]
+            }
+        },
+        {
+            "name": "user_display_name",
+            "description": "按 staffId 反查姓名（contact/users/:id；查不到就报错，不返回空串）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "对方 staffId"}
+                },
+                "required": ["user_id"]
+            }
+        },
+        {
+            "name": "note_sender",
+            "description": "记下会话最近一条入站消息的发送者（send_text 在群聊里 @ 他）。与入站时本进程自己刷新的那张表是同一张",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string", "description": "会话键（群聊 = cid…）"},
+                    "sender_id": {"type": "string", "description": "发送者 staffId"}
+                },
+                "required": ["chat_id", "sender_id"]
+            }
         }
     ])
 }
@@ -490,7 +710,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 Ok::<(), anyhow::Error>(())
             })
             .map_err(|e| format!("send_text 失败：{e:#}"))?;
-            Ok(json!({"content": [{"type": "text", "text": "ok"}]}))
+            Ok(tool_text("ok"))
         }
         "send_attachment" => {
             let chat_id = a.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -549,7 +769,26 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 }
             })
             .map_err(|e| format!("send_attachment 失败：{e:#}"))?;
-            Ok(json!({"content": [{"type": "text", "text": "ok"}]}))
+            Ok(tool_text("ok"))
+        }
+        // ── 可选能力（契约 §3.4）：钉钉能做的，声明了就必须真做 ──
+        "create_chat" => create_chat(ch, &a),
+        "download_attachment" => download_attachment(ch, &a),
+        "get_chat_info" => get_chat_info(ch, &a),
+        "chat_brief" => chat_brief(ch, &a),
+        "user_display_name" => user_display_name(ch, &a),
+        "note_sender" => {
+            let chat_id = a.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+            let sender_id = a.get("sender_id").and_then(|v| v.as_str()).unwrap_or("");
+            if chat_id.is_empty() {
+                return Err("note_sender 缺 chat_id".into());
+            }
+            if sender_id.is_empty() {
+                return Err("note_sender 缺 sender_id".into());
+            }
+            // 与入站路径同一张表：`send_text` 在群聊里查它做 @（见 `at_user_for`）。
+            ch.note_sender(chat_id, sender_id);
+            Ok(tool_text("ok"))
         }
         other => Err(format!("未知工具 `{other}`")),
     }
@@ -565,6 +804,269 @@ fn at_user_for(ch: &Arc<Channel>, chat_id: &str) -> Option<String> {
         return None;
     }
     ch.last_sender_of(chat_id)
+}
+
+/// 工具成功的统一回包形状（MCP `tools/call` 的 `content` 数组）。
+fn tool_text(s: &str) -> Value {
+    json!({"content": [{"type": "text", "text": s}]})
+}
+
+/// `create_chat`：建群。
+///
+/// 契约把 `owner_user_id` 一起给了过来（内置实现当时没有这个参数、只能传空 `owner`）。
+/// 钉钉的 `topapi/im/chat/create` **要求** `owner` 与 `useridlist` 都非空，传空串的
+/// 请求必然被平台拒——所以这里把 `owner_user_id` 同时当群主与唯一成员。
+/// 拿不到 `owner_user_id` 就**当场报错并指路登记制**，而不是发一条注定被拒的请求。
+fn create_chat(ch: &Arc<Channel>, a: &Value) -> Result<Value, String> {
+    let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let description = a.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let owner = a
+        .get("owner_user_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if name.trim().is_empty() {
+        return Err("create_chat 缺 name（群名）".into());
+    }
+    if owner.trim().is_empty() {
+        return Err(
+            "create_chat 缺 owner_user_id（群主 staffId）：钉钉建群必须指定群主与成员，\
+             没有群主只能手动建群后在虚拟 Bot 面板里登记 chat_id"
+                .into(),
+        );
+    }
+    let chat_id = rt()
+        .block_on(ch.client.create_chat(name, description, owner))
+        .map_err(|e| format!("create_chat 失败：{e:#}"))?;
+    // 新群记下群名：`chat_brief`/`get_chat_info` 能立即答（此时还没有任何入站消息）。
+    ch.note_chat_name(&chat_id, name);
+    Ok(json!({"chat_id": chat_id}))
+}
+
+/// `download_attachment`：按 `{message_id, seq}` 反查附件引用并下载到本地。
+///
+/// 参数形状是契约定的（§3.4「怎么下载是渠道的事」）：ABB 只给消息 id 与序号，
+/// `downloadCode` 由本进程的入站台账提供（它只在 CALLBACK 帧里出现一次）。
+fn download_attachment(ch: &Arc<Channel>, a: &Value) -> Result<Value, String> {
+    let mid = a.get("message_id").and_then(|v| v.as_str()).unwrap_or("");
+    if mid.is_empty() {
+        return Err("download_attachment 缺 message_id".into());
+    }
+    // seq 缺失当 0（单附件消息的常见调用），但**非法数字**要报错，不猜。
+    let seq = match a.get("seq") {
+        None | Some(Value::Null) => 0usize,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| format!("download_attachment 的 seq 不是非负整数：{v}"))?
+            as usize,
+    };
+    let cached = ch.cached_message(mid).ok_or_else(|| {
+        format!(
+            "没有 message_id={mid} 的入站记录：钉钉的 downloadCode 只在入站帧里出现一次，\
+             本进程只存最近 {RECENT_CAP} 条消息的附件引用；查不到就不能编一个文件出来"
+        )
+    })?;
+    // 主消息附件直接用 seq；引用消息的附件按 ABB 的 `QUOTED_SEQ_BASE + i` 约定。
+    let (att, hint) = if seq >= QUOTED_SEQ_BASE {
+        (
+            cached.quoted_attachments.get(seq - QUOTED_SEQ_BASE),
+            format!(
+                "该消息的引用消息只有 {} 个附件",
+                cached.quoted_attachments.len()
+            ),
+        )
+    } else {
+        (
+            cached.attachments.get(seq),
+            format!("该消息只有 {} 个附件", cached.attachments.len()),
+        )
+    };
+    let att = att.ok_or_else(|| format!("download_attachment 的 seq={seq} 越界：{hint}"))?;
+    if att.download_code.is_empty() {
+        return Err(format!(
+            "download_attachment：seq={seq} 的附件没有 downloadCode（入站帧未提供），无法下载"
+        ));
+    }
+    // robotCode 以回调里的为准（回调值仅当非空才用），否则回落渠道级配置。
+    let rc = if cached.robot_code.is_empty() {
+        ch.robot_code.as_str()
+    } else {
+        cached.robot_code.as_str()
+    };
+    if rc.is_empty() {
+        return Err(
+            "download_attachment 失败：未配置机器人码（DT_ROBOT_CODE / DT_APP_ID 都为空）".into(),
+        );
+    }
+    let bytes = rt()
+        .block_on(ch.client.download_msg_file(&att.download_code, rc))
+        .map_err(|e| format!("download_attachment 失败（下载下载码对应的文件）：{e:#}"))?;
+    let size = bytes.len();
+    let path = save_download(mid, seq, att, bytes)?;
+    Ok(json!({
+        "path": path.to_string_lossy(),
+        "kind": att.kind,
+        "file_name": att.file_name,
+        "mime": mime_of(&att.file_name),
+        "size": size,
+        // 语音消息的转写文本（其它类型为空）：ABB 会把它当附件备注进 prompt。
+        "note": att.voice_text,
+    }))
+}
+
+/// 落盘。目录：`DT_DOWNLOAD_DIR` 优先，否则 `<系统临时目录>/abb-channel-dingtalk`。
+///
+/// 文件名带消息 id 与序号（`<mid>-<seq>-<原名>`）避免同名覆盖，两段都做过清洗
+/// （`mid` 里常见 `=`、`/` 等字符，直接当文件名会跳出目录）。
+fn save_download(
+    mid: &str,
+    seq: usize,
+    att: &CachedAttachment,
+    bytes: Vec<u8>,
+) -> Result<PathBuf, String> {
+    let dir = download_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("建下载目录 {} 失败：{e}", dir.display()))?;
+    let name = download_file_name(att, seq);
+    let path = dir.join(format!("{}-{seq}-{name}", safe_component(mid)));
+    std::fs::write(&path, &bytes).map_err(|e| format!("写附件 {} 失败：{e}", path.display()))?;
+    Ok(path)
+}
+
+/// 下载目录（`DT_DOWNLOAD_DIR` 显式覆盖；默认放系统临时目录下的专属子目录）。
+fn download_dir() -> PathBuf {
+    match std::env::var("DT_DOWNLOAD_DIR") {
+        Ok(d) if !d.trim().is_empty() => PathBuf::from(d),
+        _ => std::env::temp_dir().join("abb-channel-dingtalk"),
+    }
+}
+
+/// 落盘文件名：原名可用就用（已清洗路径分隔符），否则按 kind + seq 补一个。
+fn download_file_name(att: &CachedAttachment, seq: usize) -> String {
+    let cleaned = safe_component(att.file_name.trim());
+    if !cleaned.is_empty() && cleaned != "_" {
+        return cleaned;
+    }
+    let ext = match att.kind.as_str() {
+        "image" => "png",
+        "audio" => "amr",
+        "video" => "mp4",
+        _ => "bin",
+    };
+    format!("attachment-{seq}.{ext}")
+}
+
+/// 把任意字符串清洗成安全的文件名片段：只留字母/数字/`.`/`-`/`_`，其余换 `_`；
+/// 连 `..` 也压成单个 `.`——落盘文件名始终带 `<mid>-<seq>-` 前缀，理论上跳不出去，
+/// 但没理由留一个「跳目录」的形状给下一个人误解。
+fn safe_component(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    while out.contains("..") {
+        out = out.replace("..", ".");
+    }
+    out
+}
+
+/// 按扩展名猜 mime（ABB 只拿它做提示；不给就空，**不猜成 `application/octet-stream`**
+/// 之外的东西）。
+fn mime_of(file_name: &str) -> &'static str {
+    let ext = file_name
+        .rsplit_once('.')
+        .map(|(_, e)| e.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        "amr" => "audio/amr",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "rar" => "application/vnd.rar",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "txt" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+/// `get_chat_info`：群聊走 `topapi/im/chat/get`；单聊没有群可查，改走通讯录拿对方姓名。
+///
+/// 钉钉的群资料**没有群介绍字段** ⇒ `description` 恒空（平台限制，与内置实现同口径）。
+fn get_chat_info(ch: &Arc<Channel>, a: &Value) -> Result<Value, String> {
+    let chat_id = a.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+    if chat_id.is_empty() {
+        return Err("get_chat_info 缺 chat_id".into());
+    }
+    if dingtalk::is_group_chat(chat_id) {
+        let (name, _) = rt()
+            .block_on(ch.client.get_chat_info(chat_id))
+            .map_err(|e| format!("get_chat_info 失败：{e:#}"))?;
+        if !name.is_empty() {
+            ch.note_chat_name(chat_id, &name);
+        }
+        Ok(json!({"name": name, "description": ""}))
+    } else {
+        let name = rt().block_on(ch.client.user_name(chat_id)).ok_or_else(|| {
+            format!(
+                "get_chat_info：单聊会话 {chat_id} 查不到对方姓名\
+                     （通讯录权限不足/已离职/网络失败）"
+            )
+        })?;
+        ch.note_chat_name(chat_id, &name);
+        Ok(json!({"name": name, "description": ""}))
+    }
+}
+
+/// `chat_brief`：会话类型 + 会话名（历史回填用）。
+///
+/// 类型按会话键前缀定（`cid…` = 群），不需要联网；名字先用入站帧里的
+/// `conversationTitle`，没有才去反查（钉钉没有现成的「按 chat_id 取会话」接口）。
+fn chat_brief(ch: &Arc<Channel>, a: &Value) -> Result<Value, String> {
+    let chat_id = a.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+    if chat_id.is_empty() {
+        return Err("chat_brief 缺 chat_id".into());
+    }
+    let chat_type = if dingtalk::is_group_chat(chat_id) {
+        "group"
+    } else {
+        "p2p"
+    };
+    let name = match ch.chat_name_of(chat_id) {
+        Some(n) => n,
+        // 名字查不到不算错：契约允许 `chat_name` 为空（回填不上名字比整条失败可接受）。
+        None => get_chat_info(ch, &json!({"chat_id": chat_id}))
+            .ok()
+            .and_then(|v| v.get("name").and_then(|x| x.as_str()).map(str::to_string))
+            .unwrap_or_default(),
+    };
+    Ok(json!({"chat_type": chat_type, "chat_name": name}))
+}
+
+/// `user_display_name`：按 staffId 反查姓名。查不到就**报错**（不回空串——空名字
+/// 在授权记录里跟「没查」长得一样）。
+fn user_display_name(ch: &Arc<Channel>, a: &Value) -> Result<Value, String> {
+    let user_id = a.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+    if user_id.is_empty() {
+        return Err("user_display_name 缺 user_id".into());
+    }
+    let name = rt().block_on(ch.client.user_name(user_id)).ok_or_else(|| {
+        format!("user_display_name：查不到 {user_id} 的姓名（通讯录权限不足/已离职/网络失败）")
+    })?;
+    Ok(json!({"name": name}))
 }
 
 /// 标准 base64 解码（含 padding）。返回 `None` 表示输入非法。
@@ -682,6 +1184,8 @@ mod tests {
             subscribed: Mutex::new(Vec::new()),
             notify_pending: AtomicBool::new(false),
             last_sender: Mutex::new(HashMap::new()),
+            recent: Mutex::new(Recent::default()),
+            chat_names: Mutex::new(HashMap::new()),
             // 单测的 stdout 会被 `cargo test` 捕获，写进去不会污染真实协议通道。
             out: Mutex::new(std::io::stdout()),
         })
@@ -691,22 +1195,94 @@ mod tests {
         handle(ch, &req).expect("要回包")
     }
 
-    /// 出站工具**只有两条**：钉钉无话题 ⇒ 不声明 `send_thread_reply`。
-    ///
-    /// 这条与飞书版正好相反（那边必须声明），所以两边各钉一条：判据不能只靠人记。
+    /// **工具集必须精确等于「真的实现了的那些」**：多一条就是虚报能力，少一条就是
+    /// 静默能力退化。做不到的可选能力一条都不许声明（下一条测试钉住反面）。
     #[test]
-    fn tools_list_declares_two_tools_and_no_thread_reply() {
+    fn tools_list_declares_exactly_the_implemented_tools() {
         let names: Vec<String> = tools()
             .as_array()
             .unwrap()
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, vec!["send_text", "send_attachment"]);
-        assert!(
-            !names.iter().any(|n| n == "send_thread_reply"),
-            "钉钉没有话题概念，声明它会让 ABB 走到必然失败的路径"
+        assert_eq!(
+            names,
+            vec![
+                "send_text",
+                "send_attachment",
+                "create_chat",
+                "download_attachment",
+                "get_chat_info",
+                "chat_brief",
+                "user_display_name",
+                "note_sender",
+            ]
         );
+        // 每个声明了的工具都要能在 `call_tool` 里落到真分支：空参数时必须报
+        // 「缺 X」这类业务报错，而不是「未知工具」。
+        let ch = fake_channel();
+        for name in &names {
+            let e = call_tool(&ch, &json!({"name": name, "arguments": {}}))
+                .expect_err("空参数必须报错");
+            assert!(!e.contains("未知工具"), "`{name}` 声明了却没实现：{e}");
+        }
+    }
+
+    /// 做不到的可选能力**一条都不能声明**：钉钉无话题、无表情/reaction API；
+    /// `note_context` 是微信专用；`get_quoted_message` 的引用内容已随入站帧并进 `text`，
+    /// 钉钉也没有「按 msgId 取历史消息」的接口；入站走资源订阅，所以不声明 `poll`。
+    /// 声明它们只会让 ABB 走到必然失败（或白跑一趟）的路径。
+    #[test]
+    fn unachievable_optional_tools_are_not_declared() {
+        let names: Vec<String> = tools()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        for absent in [
+            "send_thread_reply",
+            "typing",
+            "del_typing",
+            "done",
+            "note_context",
+            "get_quoted_message",
+            "poll",
+        ] {
+            assert!(
+                !names.iter().any(|n| n == absent),
+                "`{absent}` 钉钉做不到（或无此概念），不许声明：{names:?}"
+            );
+        }
+    }
+
+    /// 每个工具的必需参数必须写进 schema（只写名字不写 schema 等于让调用方猜）。
+    #[test]
+    fn every_tool_declares_its_required_arguments() {
+        let list = tools();
+        let required = |name: &str| -> Value {
+            let t = list
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("没有工具 {name}"));
+            t["inputSchema"]["required"].clone()
+        };
+        assert_eq!(required("send_text"), json!(["chat_id", "text"]));
+        assert_eq!(
+            required("send_attachment"),
+            json!(["chat_id", "name", "data_b64"])
+        );
+        assert_eq!(required("create_chat"), json!(["name", "owner_user_id"]));
+        assert_eq!(
+            required("download_attachment"),
+            json!(["message_id", "seq"])
+        );
+        assert_eq!(required("get_chat_info"), json!(["chat_id"]));
+        assert_eq!(required("chat_brief"), json!(["chat_id"]));
+        assert_eq!(required("user_display_name"), json!(["user_id"]));
+        assert_eq!(required("note_sender"), json!(["chat_id", "sender_id"]));
     }
 
     /// 入站资源必须列出来（不是空数组——那会让 ABB 判「无入站」）。
@@ -915,6 +1491,8 @@ mod tests {
             subscribed: Mutex::new(Vec::new()),
             notify_pending: AtomicBool::new(false),
             last_sender: Mutex::new(HashMap::new()),
+            recent: Mutex::new(Recent::default()),
+            chat_names: Mutex::new(HashMap::new()),
             out: Mutex::new(std::io::stdout()),
         });
         let e = call_tool(
@@ -1001,5 +1579,185 @@ mod tests {
         }
         assert_eq!(base64_decode("!!!!"), None);
         assert_eq!(base64_decode("abc"), None, "长度不是 4 的倍数");
+    }
+
+    // ── 可选能力（契约 §3.4）─────────────────────────────────────
+
+    fn dt_attachment(kind: &str, code: &str, name: &str) -> DingtalkAttachment {
+        DingtalkAttachment {
+            kind: kind.to_string(),
+            download_code: code.to_string(),
+            file_name: name.to_string(),
+            voice_text: String::new(),
+        }
+    }
+
+    fn dt_message(mid: &str, atts: Vec<DingtalkAttachment>) -> DingtalkMessage {
+        DingtalkMessage {
+            mid: mid.to_string(),
+            sender_staff_id: "staff_1".to_string(),
+            conversation_id: "cid_room".to_string(),
+            conversation_type: "2".to_string(),
+            conversation_title: "测试群".to_string(),
+            text: String::new(),
+            mentioned: true,
+            robot_code: "robot_from_callback".to_string(),
+            quoted_text: String::new(),
+            quoted_attachments: Vec::new(),
+            attachments: atts,
+        }
+    }
+
+    /// 台账的核心用途：**入站时没记，`download_attachment` 就永远拿不到 downloadCode**。
+    #[test]
+    fn remember_keeps_attachment_codes_and_chat_name() {
+        let ch = fake_channel();
+        let m = dt_message("mid_1", vec![dt_attachment("image", "dc_1", "a.png")]);
+        ch.remember(&m);
+        let cached = ch.cached_message("mid_1").expect("要能反查到");
+        assert_eq!(cached.attachments.len(), 1);
+        assert_eq!(cached.attachments[0].download_code, "dc_1");
+        assert_eq!(
+            cached.robot_code, "robot_from_callback",
+            "回调里的 robotCode 必须优先于渠道级配置"
+        );
+        assert_eq!(ch.chat_name_of("cid_room").as_deref(), Some("测试群"));
+        assert!(
+            ch.cached_message("mid_unknown").is_none(),
+            "没收到就是没收到，不编造"
+        );
+    }
+
+    /// 台账有上限：满了丢最旧（否则长跑进程会吃内存）。
+    #[test]
+    fn recent_cache_is_bounded_and_drops_oldest() {
+        let ch = fake_channel();
+        for i in 0..(RECENT_CAP + 1) {
+            ch.remember(&dt_message(&format!("mid_{i}"), Vec::new()));
+        }
+        assert!(ch.cached_message("mid_0").is_none(), "最旧的应被腾出");
+        assert!(
+            ch.cached_message(&format!("mid_{RECENT_CAP}")).is_some(),
+            "最新的必须还在"
+        );
+    }
+
+    /// 查不到 / 越界 / 缺 seq 都要**明确报错**（不能回空路径，那等于谎称下载了）。
+    #[test]
+    fn download_attachment_argument_and_cache_errors() {
+        let ch = fake_channel();
+        let e = download_attachment(&ch, &json!({})).unwrap_err();
+        assert!(e.contains("message_id"), "要点名缺哪个字段：{e}");
+
+        let e = download_attachment(&ch, &json!({"message_id":"mid_unknown","seq":0})).unwrap_err();
+        assert!(e.contains("没有 message_id"), "要说清是没记到：{e}");
+
+        ch.remember(&dt_message(
+            "mid_1",
+            vec![dt_attachment("image", "dc_1", "a.png")],
+        ));
+        let e = download_attachment(&ch, &json!({"message_id":"mid_1","seq":1})).unwrap_err();
+        assert!(e.contains("越界"), "越界要说清：{e}");
+
+        // seq 不是非负整数：不猜成 0。
+        let e = download_attachment(&ch, &json!({"message_id":"mid_1","seq":"zero"})).unwrap_err();
+        assert!(e.contains("非负整数"), "报因要说清 seq 形状：{e}");
+
+        // 引用消息的附件走 100+i 通道；没有就报越界（不能悄悄回落到主消息）。
+        let e = download_attachment(&ch, &json!({"message_id":"mid_1","seq":100})).unwrap_err();
+        assert!(e.contains("引用消息"), "要说清是引用通道：{e}");
+
+        // 有记录但 downloadCode 为空：同样明确报错（不去发一个空下载码）。
+        ch.remember(&dt_message(
+            "mid_2",
+            vec![dt_attachment("file", "", "b.pdf")],
+        ));
+        let e = download_attachment(&ch, &json!({"message_id":"mid_2","seq":0})).unwrap_err();
+        assert!(e.contains("downloadCode"), "要说清缺下载码：{e}");
+    }
+
+    /// 落盘文件名要带消息 id + 序号（防同名覆盖），且必须清洗路径分隔符。
+    #[test]
+    fn download_file_names_are_safe_and_unique() {
+        let cached =
+            |kind: &str, name: &str| CachedAttachment::of(&dt_attachment(kind, "dc", name));
+        assert_eq!(download_file_name(&cached("image", "a.png"), 3), "a.png");
+        let evil = cached("file", "../../etc/passwd");
+        let name = download_file_name(&evil, 0);
+        assert!(!name.contains('/'), "路径分隔符必须被清洗：{name}");
+        assert!(!name.contains(".."), "不许留 ..（防跳出目录）：{name}");
+        // 没名字时按 kind 补后缀（上传/落盘都要有扩展名）。
+        let unnamed = cached("audio", "");
+        assert_eq!(download_file_name(&unnamed, 2), "attachment-2.amr");
+        assert_eq!(safe_component("a b"), "a_b");
+    }
+
+    /// mime 按扩展名给；不认识的落到 octet-stream（不猜具体类型）。
+    #[test]
+    fn mime_is_derived_from_extension() {
+        assert_eq!(mime_of("a.PNG"), "image/png");
+        assert_eq!(
+            mime_of("报表.xlsx"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        assert_eq!(mime_of("voice.amr"), "audio/amr");
+        assert_eq!(mime_of("noext"), "application/octet-stream");
+    }
+
+    /// `chat_brief`：类型按前缀给、名字用台账（**不联网**就能答的部分要真的不联网）。
+    #[test]
+    fn chat_brief_answers_from_the_inbound_cache() {
+        let ch = fake_channel();
+        ch.note_chat_name("cid_room", "测试群");
+        let r = chat_brief(&ch, &json!({"chat_id":"cid_room"})).unwrap();
+        assert_eq!(r["chat_type"], "group");
+        assert_eq!(r["chat_name"], "测试群");
+        // 单聊的类型判定不需要任何台账/网络。
+        ch.note_chat_name("staff_1", "张三");
+        let r = chat_brief(&ch, &json!({"chat_id":"staff_1"})).unwrap();
+        assert_eq!(r["chat_type"], "p2p");
+        assert_eq!(r["chat_name"], "张三");
+        let e = chat_brief(&ch, &json!({})).unwrap_err();
+        assert!(e.contains("chat_id"), "要点名缺哪个字段：{e}");
+    }
+
+    /// `note_sender` 必须真的影响出站 @（否则就是个假工具）。
+    #[test]
+    fn note_sender_feeds_the_group_at_path() {
+        let ch = fake_channel();
+        let r = call_tool(
+            &ch,
+            &json!({"name":"note_sender","arguments":{"chat_id":"cid_room","sender_id":"staff_9"}}),
+        )
+        .expect("note_sender 不该失败");
+        assert_eq!(r["content"][0]["text"], "ok");
+        assert_eq!(at_user_for(&ch, "cid_room").as_deref(), Some("staff_9"));
+        let e = call_tool(
+            &ch,
+            &json!({"name":"note_sender","arguments":{"chat_id":"cid_room"}}),
+        )
+        .unwrap_err();
+        assert!(e.contains("sender_id"), "要点名缺哪个字段：{e}");
+    }
+
+    /// `create_chat` 没有群主就当场报错并指路登记制，不发注定被拒的请求。
+    #[test]
+    fn create_chat_requires_name_and_owner_before_any_network_call() {
+        let ch = fake_channel();
+        let e = create_chat(&ch, &json!({"owner_user_id":"staff_1"})).unwrap_err();
+        assert!(e.contains("name"), "要点名缺群名：{e}");
+        let e = create_chat(&ch, &json!({"name":"群"})).unwrap_err();
+        assert!(e.contains("owner_user_id"), "要点名缺群主：{e}");
+        assert!(e.contains("登记"), "要指路登记制降级：{e}");
+    }
+
+    /// 查询类工具的入参校验（网络分支要真凭证，这里只钉「不许静默空串」）。
+    #[test]
+    fn query_tools_reject_missing_arguments() {
+        let ch = fake_channel();
+        let e = get_chat_info(&ch, &json!({})).unwrap_err();
+        assert!(e.contains("chat_id"), "要点名缺哪个字段：{e}");
+        let e = user_display_name(&ch, &json!({})).unwrap_err();
+        assert!(e.contains("user_id"), "要点名缺哪个字段：{e}");
     }
 }

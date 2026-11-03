@@ -17,16 +17,12 @@
 //!
 //! ## 关于 `allow(dead_code)`
 //!
-//! 搬过来的这 985 行里，**群管理、附件下载等能力本批没接进 MCP 契约**：契约只用到
-//! `send_text`（`send_single`/`send_group`）、`upload_media`/`upload_image`、
-//! `send_image_message`、`send_file_message`、`user_name` 这几条。剩下的
-//! （`download_msg_file` / `create_chat` / `get_chat_info` / `update_chat` /
-//! `DINGTALK_MSG_LIMIT` …）**能用且要留**，只是暂时没有调用方。
-//!
-//! 所以这里是模块级 `allow`，但**解除条件明确**：等入站附件下载（`download_msg_file`）
-//! 与群管理（§3.4 的可选能力）依次接进契约之后移除。与飞书版同一处置口径
-//! （`crates/abb-channel-feishu/src/feishu.rs` 文件头），不是「反正先让它绿」。
-#![allow(dead_code)]
+//! 搬过来的这 985 行里，**群管理/附件下载已经全部接进了 MCP 契约**（可选能力那一批）：
+//! `download_msg_file`（`download_attachment`）、`create_chat`、`get_chat_info`、
+//! `user_name` 都有了调用方。**只剩 `update_chat`（改群名）没有契约入口**——可选能力
+//! 清单里没有「改群名」，所以它现在只挂着一条 `#[allow(dead_code)]`（在函数自己身上，
+//! 不是整个模块），将来若要接进契约，解除条件就是把那条 allow 去掉。
+//! 与飞书版同一处置口径（`crates/abb-channel-feishu/src/feishu.rs` 文件头）。
 
 //! 钉钉通道 —— 企业内部应用机器人（Stream 模式）。
 //!
@@ -449,22 +445,27 @@ impl DingTalkClient {
     }
 
     /// 创建群会话（虚拟 Bot #75；topapi/im/chat/create 的文档形状）。
-    /// ⚠️ 能力边界（重要）：该接口需要 `owner`（群主员工 userid）+ `useridlist`
-    /// （至少一名成员），企业内部应用机器人拿不到这些 → **真实建群大概率失败**。
-    /// ABB 不做任何规避：失败由 GUI 走「登记制降级」——用户平台手动建群（群名=角色名），
-    /// 再用 GUI 的「手动登记」登记 chat_id（群消息事件里的 conversationId 即 chat_id）。
-    /// 真实建群/机器人入群需用户实测（见 PR #75 说明）。请求形状照文档，mock 单测锁定。
-    /// `description` 参数保留仅为对齐 FeishuClient 签名：钉钉群没有群介绍字段，忽略。
-    pub async fn create_chat(&self, name: &str, _description: &str) -> Result<String> {
+    ///
+    /// ⚠️ 能力边界（重要）：该接口要求 `owner`（群主 userId）+ `useridlist`（至少一名
+    /// 成员），两项都不得为空。内置版当时没有 owner 参数、只能传空值，所以真实建群
+    /// 大概率失败，ABB 靠「登记制降级」兜底（用户平台手动建群→用 GUI 手动登记 chat_id）。
+    /// MCP 契约把 `owner_user_id` 一并给了渠道（§3.4 `create_chat`），所以这里把它填进
+    /// `owner`，并**同时放进 `useridlist`**（群主本身就是成员）：不给成员列表的请求必然
+    /// 被平台拒，而契约手上只有这一个 userid。
+    ///
+    /// 失败仍由 ABB 走登记制降级：错误原样上报，不假装建成功。
+    /// `description` 参数保留仅为对齐契约签名：钉钉群没有群介绍字段，忽略。
+    pub async fn create_chat(
+        &self,
+        name: &str,
+        _description: &str,
+        owner_user_id: &str,
+    ) -> Result<String> {
         let token = self.access_token().await?;
         let resp = self
             .http
             .post(self.oapi_url("/topapi/im/chat/create", &token))
-            .json(&json!({
-                "name": name,
-                "owner": "",
-                "useridlist": [],
-            }))
+            .json(&create_chat_body(name, owner_user_id))
             .send()
             .await?;
         let status = resp.status();
@@ -521,6 +522,10 @@ impl DingTalkClient {
 
     /// 改群名（topapi/im/chat/update）：钉钉可改的只有 name（无群介绍字段，desc 忽略）。
     /// 与 create_chat 同需用户实测：机器人改群名权限取决于机器人权限配置。
+    ///
+    /// **目前没有契约入口**（可选能力清单里没有「改群名」），所以是这个模块唯一
+    /// 带 `allow(dead_code)` 的函数——不是整个模块放宽。
+    #[allow(dead_code)]
     pub async fn update_chat(&self, chat_id: &str, name: &str, _description: &str) -> Result<()> {
         let token = self.access_token().await?;
         let resp = self
@@ -608,6 +613,19 @@ pub fn is_group_chat(chat_id: &str) -> bool {
     chat_id.starts_with("cid")
 }
 
+/// `topapi/im/chat/create` 的请求体。
+///
+/// 抽成纯函数是为了**单测能验真实请求形状**（钉钉侧对 `owner` / `useridlist` 都有
+/// 非空要求，写错只需要一次真实调用才发现，代价太大）。
+pub fn create_chat_body(name: &str, owner_user_id: &str) -> Value {
+    json!({
+        "name": name,
+        "owner": owner_user_id,
+        // 群主本身就是成员：只给 owner 不给 useridlist 的请求会被平台拒。
+        "useridlist": [owner_user_id],
+    })
+}
+
 /// 钉钉图片上传支持的扩展名（官方 /media/upload 口径：jpg、gif、png、bmp；
 /// jpeg 是 jpg 的常见别名，一并接受）。`kind_from_name` 会把 svg/ico/heic/webp
 /// 也归成 image，但钉钉服务端会拒；在能力闸就拦下，别把原始错误丢给用户。
@@ -666,6 +684,11 @@ pub struct DingtalkMessage {
     /// 文本内容（已 trim；群聊含 @机器人名 前缀，由 bridge 剥）。纯附件消息为空。
     pub text: String,
     /// 是否在 @ 名单里（群聊判据）。
+    ///
+    /// 本 crate **不消费**它：准入判断（「群里没 @ 机器人要不要应答」）归 ABB，
+    /// 渠道只负责把入站帧翻译成契约消息。留着是因为它是 `parse_message` 的完整产物，
+    /// 删掉等于让协议层少解一个字段（将来 ABB 若要按它判准入，契约里要有它）。
+    #[allow(dead_code)]
     pub mentioned: bool,
     /// 回调里的 robotCode（下载附件必需；缺省回落到 app_id）。
     pub robot_code: String,
@@ -1004,4 +1027,117 @@ pub(crate) fn percent_encode_query(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    /// 一次性 mock HTTP 服务器：按顺序回 `bodies` 里的 JSON，并记录收到的
+    /// `<请求行> <请求体>`（断言请求形状用）。
+    ///
+    /// 只为了让 `with_base` 有真实用途：建群请求的形状（`owner` / `useridlist`
+    /// 必须非空）错了要真调一次钉钉才发现，而那是**有副作用**且需要凭证的调用。
+    fn mock_http(bodies: Vec<&'static str>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑本地端口");
+        let base = format!("http://{}", listener.local_addr().expect("取本地地址"));
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for body in bodies {
+                let (mut sock, _) = listener.accept().expect("接受连接");
+                let mut reader = BufReader::new(sock.try_clone().expect("复制 socket"));
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let len = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                let mut buf = vec![0u8; len];
+                if len > 0 {
+                    reader.read_exact(&mut buf).expect("读请求体");
+                }
+                seen.push(format!(
+                    "{} {}",
+                    head.lines().next().unwrap_or(""),
+                    String::from_utf8_lossy(&buf)
+                ));
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).expect("回响应");
+                sock.flush().expect("flush");
+            }
+            seen
+        });
+        (base, handle)
+    }
+
+    /// 建群的真实请求：先换 token，再带 `owner` + `useridlist`（两项都非空才可能建成功），
+    /// 旧网关的鉴权走 query 参数。
+    #[tokio::test]
+    async fn create_chat_request_carries_owner_and_member_list() {
+        let (base, seen) = mock_http(vec![
+            r#"{"accessToken":"tok","expireIn":7200}"#,
+            r#"{"errcode":0,"chatid":"cid_new"}"#,
+        ]);
+        let client = DingTalkClient::with_base("app", "secret", &base);
+        let chat_id = client
+            .create_chat("后端开发", "提示词", "staff_1")
+            .await
+            .expect("建群应成功");
+        assert_eq!(chat_id, "cid_new");
+        let seen = seen.join().expect("mock 线程");
+        assert_eq!(seen.len(), 2, "应当只有换 token + 建群两次请求：{seen:?}");
+        assert!(
+            seen[0].contains("/v1.0/oauth2/accessToken"),
+            "第一次要换 token：{}",
+            seen[0]
+        );
+        assert!(
+            seen[1].contains("/topapi/im/chat/create") && seen[1].contains("access_token=tok"),
+            "旧网关鉴权走 query 参数：{}",
+            seen[1]
+        );
+        assert!(seen[1].contains(r#""owner":"staff_1""#), "{}", seen[1]);
+        assert!(
+            seen[1].contains(r#""useridlist":["staff_1"]"#),
+            "群主必须同时是成员（只给 owner 的请求会被平台拒）：{}",
+            seen[1]
+        );
+    }
+
+    /// 建群请求必须带非空 `owner` 与 `useridlist`：钉钉侧两项都非空才可能建成功，
+    /// 而写错只需要一次真实调用（且有副作用）才发现，所以在纯函数上钉死。
+    #[test]
+    fn create_chat_body_carries_owner_as_a_member() {
+        let body = create_chat_body("后端开发", "staff_1");
+        assert_eq!(body["name"], "后端开发");
+        assert_eq!(body["owner"], "staff_1", "群主必须是契约给的 owner_user_id");
+        assert_eq!(
+            body["useridlist"],
+            json!(["staff_1"]),
+            "只给 owner 不给 useridlist 的请求会被平台拒"
+        );
+    }
+
+    /// 群/单聊判定是靠前缀的约定，改它会同时影响发送路由与 @ 逻辑。
+    #[test]
+    fn group_chat_is_decided_by_cid_prefix() {
+        assert!(is_group_chat("cidAsXSBLnA=="));
+        assert!(!is_group_chat("16650***698"));
+    }
 }

@@ -5,10 +5,12 @@
 //! 最容易坏的地方——一行 `println!` 就能让 ABB 侧解析炸掉。
 //!
 //! 判据对齐 `docs/mcp-bus-architecture.md` §3：
-//! - `send_text` 必须存在；**`send_thread_reply` 必须不存在**（钉钉无话题概念——
-//!   这一条与飞书版正好相反）
+//! - `tools/list` **精确等于**本渠道真的实现的那 8 个工具（2 个必需 + 6 个可选能力）；
+//!   **`send_thread_reply` 必须不存在**（钉钉无话题概念——这一条与飞书版正好相反），
+//!   `typing` / `del_typing` / `done` / `note_context` / `get_quoted_message` / `poll`
+//!   同样一个都不许声明（做不到或无此概念，理由见 crate README §2）
 //! - 入站走 **资源订阅**（`resources/list` 精确等于 `["channel://inbox"]`）
-//! - 未知方法回 error
+//! - 未知方法回 error；可选能力查不到数据时回 error（不回空串）
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -75,38 +77,98 @@ fn stdout_is_pure_json_rpc() {
     );
 }
 
-/// 出站：`send_text` + `send_attachment`，且**没有** `send_thread_reply`。
+/// `tools/list` **精确等于**真的实现了的那 8 个（多一条 = 虚报能力，少一条 = 静默退化）。
 ///
-/// 缺 `send_thread_reply` 是**故意**的：钉钉的发送接口没有话题维度，声明一个做不到的
-/// 能力会让 ABB 走到必然失败的路径。ABB 按契约 §3.1 回落 `send_text`。
+/// 必须逐名核对而不是「包含某几个」：
+/// - 缺 `send_text` ⇒ ABB 判渠道不可用；
+/// - 多声明 `send_thread_reply` / `typing` / `done` / `note_context` / `get_quoted_message`
+///   ⇒ ABB 会走到必然失败（或注定落空）的路径——钉钉没有话题、没有表情 API。
 #[test]
-fn declares_text_and_attachment_but_no_thread_reply() {
+fn declares_exactly_the_implemented_tools() {
     let got = roundtrip(&[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#]);
     let tools = got[0]["result"]["tools"].as_array().expect("tools 数组");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-    for want in ["send_text", "send_attachment"] {
+    assert_eq!(
+        names,
+        vec![
+            "send_text",
+            "send_attachment",
+            "create_chat",
+            "download_attachment",
+            "get_chat_info",
+            "chat_brief",
+            "user_display_name",
+            "note_sender",
+        ],
+        "工具集必须精确等于实际实现的那几个"
+    );
+    for absent in [
+        "send_thread_reply",
+        "typing",
+        "del_typing",
+        "done",
+        "note_context",
+        "get_quoted_message",
+        "poll",
+    ] {
         assert!(
-            names.contains(&want),
-            "缺 `{want}`（ABB 据此判能力）。实际：{names:?}"
+            !names.contains(&absent),
+            "钉钉做不到（或无此概念），不该声明 `{absent}`。实际：{names:?}"
         );
     }
-    assert!(
-        !names.contains(&"send_thread_reply"),
-        "钉钉无话题概念，不该声明 `send_thread_reply`。实际：{names:?}"
-    );
     // 每个工具的必需参数都要在 schema 里 —— 只写名字不写 schema 等于让调用方猜。
-    let send_text = tools.iter().find(|t| t["name"] == "send_text").unwrap();
+    let required = |name: &str| -> serde_json::Value {
+        tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("没有工具 {name}"))["inputSchema"]["required"]
+            .clone()
+    };
     assert_eq!(
-        send_text["inputSchema"]["required"],
+        required("send_text"),
         serde_json::json!(["chat_id", "text"])
     );
-    let send_att = tools
-        .iter()
-        .find(|t| t["name"] == "send_attachment")
-        .unwrap();
     assert_eq!(
-        send_att["inputSchema"]["required"],
+        required("send_attachment"),
         serde_json::json!(["chat_id", "name", "data_b64"])
+    );
+    assert_eq!(
+        required("create_chat"),
+        serde_json::json!(["name", "owner_user_id"])
+    );
+    assert_eq!(
+        required("download_attachment"),
+        serde_json::json!(["message_id", "seq"])
+    );
+    assert_eq!(required("get_chat_info"), serde_json::json!(["chat_id"]));
+    assert_eq!(required("chat_brief"), serde_json::json!(["chat_id"]));
+    assert_eq!(
+        required("user_display_name"),
+        serde_json::json!(["user_id"])
+    );
+    assert_eq!(
+        required("note_sender"),
+        serde_json::json!(["chat_id", "sender_id"])
+    );
+}
+
+/// 可选能力在**没有凭证**时也必须回 error，而不是回一个空路径/空名字（静默空串
+/// 会让 ABB 把「没下载」当成「下载了」）。`download_attachment` 的未知 message_id
+/// 在联网前就该被台账拒掉，所以这条不需要真凭证。
+#[test]
+fn download_attachment_unknown_message_errors_before_network() {
+    let got = roundtrip(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"download_attachment","arguments":{"message_id":"mid-never-seen","seq":0}}}"#,
+    ]);
+    let err = got[0]
+        .get("error")
+        .unwrap_or_else(|| panic!("必须回 error：{}", got[0]));
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("没有 message_id"),
+        "报因要说是没记到这条消息：{err}"
     );
 }
 
