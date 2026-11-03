@@ -179,6 +179,35 @@ else
 fi
 
 
+# crates/abb-channel-feishu 同构（独立包，root 碰不到）。
+#
+# 2026-11-03 的教训：微信 crate 从建成到功能做完一直「有测试但没人跑」——
+# 加到门禁后立刻抓到「从未跑过 fmt」与一条 MSRV 违规。飞书这组从一开始就加。
+feishu_manifest="$repo_root/crates/abb-channel-feishu/Cargo.toml"
+feishu_target="$CARGO_TARGET_DIR-feishu"
+mkdir -p "$feishu_target"
+
+echo "== ABB 门禁：crates/abb-channel-feishu（独立包，中间产物外置于 ${feishu_target}）=="
+(
+  export CARGO_TARGET_DIR="$feishu_target"
+  cargo fmt --manifest-path "$feishu_manifest" --check
+  cargo clippy --manifest-path "$feishu_manifest" --locked --all-targets -- -D warnings
+  cargo build --manifest-path "$feishu_manifest" --locked
+  cargo test --manifest-path "$feishu_manifest" --locked
+)
+
+# 飞书 crate 的产物路径也传给 root 测试：`abb_negotiates_feishu_via_subscribe_not_poll`
+# 要起真子进程验「ABB 的生产协商器对飞书选 Subscribe 而不是 Poll」。
+#
+# **这是 ABB 订阅路径第一次在真渠道上被验证**（此前只有 `tools/channel-mcp-dir/` 的桩走过）。
+# 不传的话那条 e2e 永远 skip——而 skip 默认等于通过（第 8 种假绿形态）。
+FEISHU_BIN="$feishu_target/debug/abb-channel-feishu"
+if [ -x "$FEISHU_BIN" ]; then
+  export ABB_FEISHU_BIN="$FEISHU_BIN"
+else
+  echo "⚠️  没构建出 $FEISHU_BIN ⇒ root 的飞书 e2e 将跳过（不是失败）"
+fi
+
 echo "== ABB 门禁：root 包（中间产物外置于 ${CARGO_TARGET_DIR}）=="
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
@@ -220,6 +249,18 @@ else
     echo "   这是环境问题，不是代码问题；但门禁对这条 e2e 的覆盖是**缺失**的。"
 fi
 
+# 飞书同理：判据看**产物文件本身**（不看 env——env 退化时看它会把接线问题误判成环境问题，
+# 微信那次变异实测逃逸过）。
+if [ -x "$feishu_target/debug/abb-channel-feishu" ]; then
+    if grep -q 'ABB_FEISHU_E2E_RAN' "$iso_log"; then
+        echo "✅ 飞书跨包 e2e 真的跑了（订阅路径协商成功）"
+    else
+        echo "❌ 产物存在但飞书 e2e 没跑：日志里没有 ABB_FEISHU_E2E_RAN" >&2
+        echo "   查 gates.sh 里飞书 crate 组与 export 的顺序（必须先构建再 export，再跑 root 测试）。" >&2
+        exit 1
+    fi
+fi
+
 # 兜底：清掉 TMPDIR 里陈旧的测试夹具（见脚本头注；根因修复在 src/testtmp.rs 的 RAII 归属）。
 tools/clean_test_fixtures.sh
 
@@ -235,23 +276,6 @@ echo "== ABB 门禁：crates/abb-chart（独立包，中间产物外置于 ${cha
   cargo clippy --manifest-path "$chart_manifest" --locked --all-targets -- -D warnings
   cargo build --manifest-path "$chart_manifest" --locked
   cargo test --manifest-path "$chart_manifest" --offline
-)
-
-# crates/abb-channel-feishu 同构（独立包，root 碰不到）。
-#
-# 2026-11-03 的教训：微信 crate 从建成到功能做完一直「有测试但没人跑」——
-# 加到门禁后立刻抓到「从未跑过 fmt」与一条 MSRV 违规。飞书这组从一开始就加。
-feishu_manifest="$repo_root/crates/abb-channel-feishu/Cargo.toml"
-feishu_target="$CARGO_TARGET_DIR-feishu"
-mkdir -p "$feishu_target"
-
-echo "== ABB 门禁：crates/abb-channel-feishu（独立包，中间产物外置于 ${feishu_target}）=="
-(
-  export CARGO_TARGET_DIR="$feishu_target"
-  cargo fmt --manifest-path "$feishu_manifest" --check
-  cargo clippy --manifest-path "$feishu_manifest" --locked --all-targets -- -D warnings
-  cargo build --manifest-path "$feishu_manifest" --locked
-  cargo test --manifest-path "$feishu_manifest" --locked
 )
 
 # 协作门禁（crates/* 之外，跑得快、不联网、不编译）：这两条守的是「合并闸门本身」，

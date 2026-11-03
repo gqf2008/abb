@@ -320,3 +320,63 @@ fn abb_negotiates_real_wechat_channel() {
     // 门禁里 `grep -q 'ABB_WECHAT_E2E_RAN'` 才是有意义的判据。
     eprintln!("ABB_WECHAT_E2E_RAN（已起真子进程并完成协商）");
 }
+
+// ── 真渠道：飞书 crate（crates/abb-channel-feishu）──────────────────
+
+/// 飞书 crate 的二进制路径（同一次 `cargo build` 的产物）。
+fn feishu_bin() -> Option<String> {
+    let mut tried: Vec<String> = Vec::new();
+    if let Ok(p) = std::env::var("ABB_FEISHU_BIN") {
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+        tried.push(format!("ABB_FEISHU_BIN={p}（不存在）"));
+    }
+    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
+        let p = format!("{td}/debug/abb-channel-feishu");
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+        tried.push(p);
+    }
+    eprintln!(
+        "[skip] 没找到 abb-channel-feishu 构建产物 ⇒ 这条 e2e 没跑。找过：\n  {}\n\
+         构建方式：cargo build --manifest-path crates/abb-channel-feishu/Cargo.toml",
+        tried.join("\n  ")
+    );
+    None
+}
+
+/// **ABB 的生产协商器必须对飞书选 `Subscribe`，不是 `Poll`**。
+///
+/// 与微信那条正好相反：微信不暴露 `channel://` 资源（只能 poll），
+/// 飞书暴露 `channel://inbox`（走订阅）——ABB 的订阅路径**第一次在真渠道上被验证**。
+///
+/// 判据不只是「能连上」，而是**选路正确**：`build_source` 内部调 `negotiate`，
+/// 它对 `resources` 有内容的服务会优先订阅。若错选 poll，fetch 会去打 HTTP
+/// 并因凭证无效报错——所以「fetch 返回 Ok 的空批次」本身就证明走了订阅。
+#[test]
+fn abb_negotiates_feishu_via_subscribe_not_poll() {
+    let Some(bin) = feishu_bin() else {
+        return;
+    };
+    let dir = TempDir::new("fs");
+    let args = vec!["--dir".to_string(), dir.path().display().to_string()];
+    let envs = vec![
+        ("FS_APP_ID".to_string(), "test".to_string()),
+        ("FS_APP_SECRET".to_string(), "test".to_string()),
+    ];
+    let mut source = crate::mcp_channel_loop::build_source_for_test("feishu", &bin, &args, &envs)
+        .unwrap_or_else(|e| panic!("ABB 的协商器接不上飞书 server：{e}"));
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let got = rt.block_on(async { source.fetch().await });
+    assert!(
+        got.is_ok(),
+        "订阅路径下无通知应返回空批次（不是错误）；实际：{:?}",
+        got.err()
+    );
+    assert!(got.unwrap().is_empty(), "没有通知时不该有消息");
+
+    eprintln!("ABB_FEISHU_E2E_RAN（订阅路径协商成功，fetch 走的是通知排空）");
+}
