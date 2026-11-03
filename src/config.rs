@@ -317,6 +317,10 @@ pub struct OwnerInfo {
     pub name: String,
 }
 
+// 内置渠道已退役（2026-11-04）⇒ 以下授权码/白名单机制在 ABB 侧**暂无调用方**。
+// 保留而不是删除：准入已归渠道 server（契约 §4「渠道语义由 server 决定」），
+// 但若将来契约补 sender 白名单能力，这套实现可直接复用。删除会丢掉行为规格。
+#[allow(dead_code)]
 /// 消费授权码的结果（bridge 据此回发用户可见文案）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerCodeResult {
@@ -339,6 +343,10 @@ fn new_owner_code() -> String {
     s
 }
 
+// 内置渠道已退役（2026-11-04）⇒ 以下授权码/白名单机制在 ABB 侧**暂无调用方**。
+// 保留而不是删除：准入已归渠道 server（契约 §4「渠道语义由 server 决定」），
+// 但若将来契约补 sender 白名单能力，这套实现可直接复用。删除会丢掉行为规格。
+#[allow(dead_code)]
 /// 把 open_id 加入白名单字符串 + 展示名列表（去重；name 空用 open_id 兜底）。
 /// owner 与授权者共用同一套追加逻辑（consume 按 role 决定写到哪份）。
 fn whitelist_add(list: &mut String, infos: &mut Vec<OwnerInfo>, open_id: &str, name: &str) {
@@ -359,6 +367,10 @@ fn whitelist_add(list: &mut String, infos: &mut Vec<OwnerInfo>, open_id: &str, n
     }
 }
 
+// 内置渠道已退役（2026-11-04）⇒ 以下授权码/白名单机制在 ABB 侧**暂无调用方**。
+// 保留而不是删除：准入已归渠道 server（契约 §4「渠道语义由 server 决定」），
+// 但若将来契约补 sender 白名单能力，这套实现可直接复用。删除会丢掉行为规格。
+#[allow(dead_code)]
 /// 在 BotConfig 上消费授权码（纯逻辑，不落盘）：
 /// 匹配（不区分大小写）pending 里的码 → 删除该码（一次性）；未过期 → 按码的 role 把 sender
 /// 加入 owner 白名单（owner_open_id+owner_infos）并记录展示名（name 空则用 open_id 兜底）
@@ -586,6 +598,10 @@ impl BotConfig {
         &self.wx_user_id
     }
 
+    // 内置渠道已退役（2026-11-04）⇒ 以下授权码/白名单机制在 ABB 侧**暂无调用方**。
+    // 保留而不是删除：准入已归渠道 server（契约 §4「渠道语义由 server 决定」），
+    // 但若将来契约补 sender 白名单能力，这套实现可直接复用。删除会丢掉行为规格。
+    #[allow(dead_code)]
     /// 钉钉发送用的机器人编码：显式配置优先，否则回落 AppKey（企业内部应用机器人默认相同）。
     pub fn ding_robot_code(&self) -> &str {
         if self.ding_robot_code.is_empty() {
@@ -595,6 +611,10 @@ impl BotConfig {
         }
     }
 
+    // 内置渠道已退役（2026-11-04）⇒ 以下授权码/白名单机制在 ABB 侧**暂无调用方**。
+    // 保留而不是删除：准入已归渠道 server（契约 §4「渠道语义由 server 决定」），
+    // 但若将来契约补 sender 白名单能力，这套实现可直接复用。删除会丢掉行为规格。
+    #[allow(dead_code)]
     /// 统一访问判定（不矛盾的单一入口）：只放行 owner（管理员）白名单成员。
     /// （授权者白名单与公开开关已随 granted 机制移除——未经授权一律拦截，fail-closed。）
     /// 飞书用 open_id 字段、钉钉用 staffId 字段（各自独立，互不干扰）。
@@ -612,6 +632,10 @@ impl BotConfig {
         !owner_ids.is_empty() && is_owner_allowed(owner_ids, sender_id)
     }
 
+    // 内置渠道已退役（2026-11-04）⇒ 以下授权码/白名单机制在 ABB 侧**暂无调用方**。
+    // 保留而不是删除：准入已归渠道 server（契约 §4「渠道语义由 server 决定」），
+    // 但若将来契约补 sender 白名单能力，这套实现可直接复用。删除会丢掉行为规格。
+    #[allow(dead_code)]
     /// 按 kind 取（owner 白名单, owner 展示名）的可变引用，
     /// 授权码消费按 bot 类型落位（飞书 open_id / 钉钉 staffId）。
     fn owner_whitelists_mut(&mut self) -> (&mut String, &mut Vec<OwnerInfo>) {
@@ -713,6 +737,10 @@ pub fn provider_kind_index(kind: &str) -> Option<usize> {
     PROVIDER_KINDS.iter().position(|k| *k == kind)
 }
 
+// 内置渠道已退役（2026-11-04）⇒ 以下授权码/白名单机制在 ABB 侧**暂无调用方**。
+// 保留而不是删除：准入已归渠道 server（契约 §4「渠道语义由 server 决定」），
+// 但若将来契约补 sender 白名单能力，这套实现可直接复用。删除会丢掉行为规格。
+#[allow(dead_code)]
 /// 纯函数：owner 白名单是否放行 sender。空（或只有分隔符/空白）owner = 不设限（true）；
 /// 非空时按逗号/分号/空白拆成多个 open_id，任一精确匹配即 true。bridge.rs 运行时判定与单测
 /// 共用，避免两边各拆一遍。
@@ -1888,6 +1916,10 @@ impl Config {
         Some((code, expires_at))
     }
 
+    // 内置渠道已退役（2026-11-04）⇒ 以下授权码/白名单机制在 ABB 侧**暂无调用方**。
+    // 保留而不是删除：准入已归渠道 server（契约 §4「渠道语义由 server 决定」），
+    // 但若将来契约补 sender 白名单能力，这套实现可直接复用。删除会丢掉行为规格。
+    #[allow(dead_code)]
     /// 消费授权码（bridge 收到疑似授权码的私聊消息时调用）：
     /// Admitted → sender 已加入该 bot owner 白名单（含展示名）并落盘；Expired/NotFound → 只反馈不落盘。
     /// 找不到 bot / 落盘失败 → NotFound（不误授权，也静默不打扰）。

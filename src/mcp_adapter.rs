@@ -162,6 +162,7 @@ mod tests {
             text: text.into(),
             ts: 1793600000,
             attachments: vec![],
+            parent_id: String::new(),
         }
     }
 

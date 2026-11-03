@@ -239,6 +239,9 @@ impl Bridge {
             .await
     }
 
+    // 群解散自动注销：飞书 im.chat.deleted 事件入口随内置渠道退役。
+    // 缺口已记入 docs/channel-retirement-plan.md（需契约补「群生命周期事件」）。
+    #[allow(dead_code)]
     /// 群被解散事件（im.chat.deleted_v1）：虚拟 Bot 登记自动移除——平台侧解散后 ABB
     /// 不残留幽灵登记（deliver @角色名不再指向死群、GUI 列表不再显示无效项）。
     /// 事件体 `{"chat_id": "oc_…"}`。写登记表与 GUI 并发的 last-writer-wins 取舍

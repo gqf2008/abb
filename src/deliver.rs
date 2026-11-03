@@ -663,9 +663,9 @@ impl Router {
                 None => crate::outbox::OutboxStore::new(&item.target_bot),
             };
             // 归一化入队键（bot key / ABB 频道 UUID / 空 → 平台 receive_id），与
-            // Bridge::flush_outbox 共用同一函数，保证入站补发时 store.take 命中
+            // `Bridge::queue_outbox` 共用同一函数，保证两边写出同一种 chat_key
             //（缺陷 abb-wx-outbox-flush-mismatch-20260917：本机现场积压 chat_id 实测
-            //  就是 bot key，补发侧却用平台 id → 永远 attempts=0 且零日志）。
+            //  就是 bot key，旧补发侧却用平台 id → 永远 attempts=0 且零日志）。
             store.add(crate::outbox::OutboxItem {
                 id: item.id.clone(),
                 chat_id: crate::outbox::resolve_delivery_chat(&item.target_bot, &item.target_chat),

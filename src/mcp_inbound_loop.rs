@@ -151,6 +151,7 @@ mod tests {
             text: format!("{chat}/{id}"),
             ts: 0,
             attachments: vec![],
+            parent_id: String::new(),
         }
     }
 

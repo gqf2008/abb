@@ -4,12 +4,6 @@
 use super::*;
 
 impl Bridge {
-    /// config 读不到本 bot（单测注入）时，用构造时的访问控制快照判定放行。
-    /// 快照 = self.bot（build 时从 config 复制，含 kind 与全部访问字段）。
-    pub(super) fn access_snapshot_allows(&self, sender_id: &str) -> bool {
-        self.bot.access_allows(sender_id)
-    }
-
     /// #51 免 @ 开关的「config 优先、快照回落」读取（见 mention_snapshot 字段注释）。
     /// 判定键 = config.json 里有没有该 bot：有 → 生产路径（热读，重启保持）；
     /// 没有（单测随机 key / bot 被改名）或 config 读失败 → 内存快照（最后已知状态）。
@@ -51,113 +45,5 @@ impl Bridge {
             }
             crate::config::MentionModeSave::Failed => false,
         }
-    }
-
-    pub(super) fn access_and_role(
-        &self,
-        sender_id: &str,
-    ) -> (
-        bool,
-        crate::config::SenderRole,
-        Option<std::collections::HashMap<String, String>>,
-        bool,
-    ) {
-        match crate::config::Config::load() {
-            Ok(c) => match c.bots.into_iter().find(|b| b.key() == self.bot.key()) {
-                Some(b) => (
-                    b.access_allows(sender_id),
-                    crate::config::SenderRole::Owner,
-                    Some(b.mention_modes),
-                    b.mention_default,
-                ),
-                None => (
-                    self.access_snapshot_allows(sender_id),
-                    crate::config::SenderRole::Owner,
-                    None,
-                    false,
-                ),
-            },
-            Err(_) => (
-                self.access_snapshot_allows(sender_id),
-                crate::config::SenderRole::Owner,
-                None,
-                false,
-            ),
-        }
-    }
-
-    /// #51+#91 门槛判定：per-chat 显式值优先（"off"→免@，"on"→要@），无条目回落 bot 级
-    /// 默认（mention_default）。config 路径有该 bot → 以 config 为准；否则（单测随机 key /
-    /// 读失败）→ 回落内存快照（快照只有 per-chat 值，无 bot 默认概念，保持旧语义）。
-    pub(super) fn mention_off(
-        &self,
-        mention: &Option<std::collections::HashMap<String, String>>,
-        chat_id: &str,
-        mention_default: bool,
-    ) -> bool {
-        match mention {
-            Some(m) => match m.get(chat_id).map(String::as_str) {
-                Some("off") => true,
-                // 显式 per-chat "on"（或未知值）→ 覆盖 bot 默认，按需要 @ 处理
-                Some(_) => false,
-                // 无 per-chat 条目 → 用 bot 级默认（#91）
-                None => mention_default,
-            },
-            None => {
-                self.mention_snapshot
-                    .lock()
-                    .unwrap()
-                    .get(chat_id)
-                    .map(String::as_str)
-                    == Some("off")
-            }
-        }
-    }
-
-    /// 尝试把一条消息当作管理员授权码处理（owner 生成后给到对方）。仅 p2p 接受（飞书 p2p /
-    /// 钉钉单聊，群里发码太公开防抢注）；文本精确匹配 pending 码 → 消费并把发送者加入
-    /// owner 白名单（按 bot kind 落位到 open_id 或 staffId 字段）、回发结果。
-    /// 返回 true = 授权码消息已消费/回复，调用方应 return（不再进 agent）。
-    pub(super) async fn try_consume_owner_code(
-        &self,
-        sender_id: &str,
-        chat_id: &str,
-        is_p2p: bool,
-        text: &str,
-    ) -> bool {
-        let text = text.trim();
-        if !is_p2p || text.is_empty() {
-            return false;
-        }
-        use crate::config::OwnerCodeResult as R;
-        // 先查发送者展示名（best-effort，查不到用 id 兜底）：随授权一起落盘，GUI 授权列表
-        // 能显示「谁」。查名放授权前：失败不阻塞授权。
-        let name = self
-            .msgr
-            .user_display_name(sender_id)
-            .await
-            .unwrap_or_default();
-        let r = crate::config::Config::consume_owner_code(&self.bot.key(), text, sender_id, &name);
-        let reply = match r {
-            R::Admitted => Some("✅ 授权成功，你现在可以在这个 bot 里对话了。"),
-            R::Expired => Some("❌ 授权码已过期，请联系管理员重新生成。"),
-            R::NotFound => None, // 不是授权码 → 按未授权消息忽略
-        };
-        let Some(txt) = reply else {
-            return false;
-        };
-        if let Err(e) = self.msgr.send_text(chat_id, txt).await {
-            crate::log!(
-                "[bridge] 授权码回复发送失败 chat={}: {e:#}",
-                trunc(chat_id, 10)
-            );
-        }
-        crate::log!(
-            "[bridge] 授权码消息处理完成（bot={} sender={} result={:?}）",
-            self.bot.key(),
-            sender_id,
-            r
-        );
-        true
     }
 }

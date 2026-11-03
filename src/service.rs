@@ -1298,132 +1298,23 @@ async fn run_bot(
         }
         crate::botstatus::clear(&key);
         crate::log!("[bot:{key}] MCP 渠道循环退出");
-    } else if bot.is_dingtalk() {
-        crate::dingtalk::stream_loop(bot.app_id.clone(), bot.app_secret.clone(), bridge, stop)
-            .await;
-        crate::botstatus::clear(&key);
-        crate::log!("[bot:{key}] 钉钉 Stream 循环退出");
-    } else if bot.is_wechat() {
-        weixin_loop(bot, bridge, stop).await; // weixin_loop 退出时已 clear
-        crate::log!("[bot:{key}] 微信长轮询循环退出");
     } else {
-        crate::ws::ws_loop(bot.app_id.clone(), bot.app_secret.clone(), bridge, stop).await;
-        crate::botstatus::clear(&key);
-        crate::log!("[bot:{key}] WS 循环退出");
-    }
-}
-
-/// 微信事件循环：HTTP 长轮询 getupdates（游标增量）→ bridge.on_weixin。
-/// 断线/出错退避重试；errcode -14（会话超时）报「会话过期」后退出（需重新扫码）。
-async fn weixin_loop(
-    bot: crate::config::BotConfig,
-    bridge: Arc<Bridge>,
-    stop: tokio_util::sync::CancellationToken,
-) {
-    let key = bot.key();
-    let base = if bot.wx_base_url.is_empty() {
-        crate::wechat::FIXED_BASE_URL
-    } else {
-        bot.wx_base_url.as_str()
-    };
-    let cdn = if bot.wx_cdn_base_url.is_empty() {
-        crate::wechat::DEFAULT_CDN_BASE_URL
-    } else {
-        bot.wx_cdn_base_url.as_str()
-    };
-    let client = crate::wechat::WeixinClient::new(base, &bot.wx_token, cdn);
-    // 游标持久化（2026-10-05 审计 #19）：原来每次启动都从空游标开始 ⇒ 升级/崩溃/看门狗
-    // 重拉任何一次重启都变成「消息黑洞」（停机窗口内用户发的消息大概率直接丢）。
-    // 从 workspaces/<key>/wx_cursor.json 恢复；缺失/损坏都退回空串，绝不因此启动失败。
-    let mut cursor = load_wx_cursor(&key);
-    let mut timeout_ms: u64 = 35_000;
-    crate::log!("[bot:{key}] 微信长轮询启动 base={base}");
-    // 每次 poll 成功都重报一次「在线」（绑真实连通，非独立心跳）；snapshot 僵尸阈值已放宽到 180s。
-    let mut last_online = std::time::Instant::now();
-    // 连续客户端超时计数：偶发超时是长轮询常态；连续 ≥3 次（≈2 分钟无任何成功响应）= 通道疑似
-    // 半开假死（与 WS 看门狗同理：发得出去≠通，收得到才算通），降级「重连中」并留痕。
-    let mut consec_timeouts = 0u32;
-    // 连续失败计数（**2026-11-03 owner 决定「永不放弃」后加的日志节流**）。
-    //
-    // 原本固定 3s 重试：服务长期不可用时一天约 28800 条日志，而日志是排障唯一线索，
-    // 刷屏等于把它毁了。成功一次就复位，所以偶发抖动仍是 3s。
-    let mut fails: u32 = 0;
-    loop {
-        if stop.is_cancelled() {
-            break;
-        }
-        let next = client.get_updates(&cursor, timeout_ms);
-        tokio::select! {
-            _ = stop.cancelled() => { break; }
-            res = next => {
-                match res {
-                    Ok((msgs, new_cursor, new_timeout)) => {
-                        if !msgs.is_empty() {
-                            crate::log!("[bot:{key}] getupdates 返回 {} 条消息", msgs.len());
-                        }
-                        cursor = new_cursor;
-                        // 每次拿到新游标就落盘（尽力而为 + 原子写）：重启后能从这里续上。
-                        save_wx_cursor(&key, &cursor);
-                        timeout_ms = new_timeout.max(5_000);
-                        consec_timeouts = 0; // 成功响应 = 通道真通，复位假死计数
-                        fails = 0; // 同上：复位重连退避
-                        // 每次成功轮询都视为「在线」，但至多 10s 重报一次续命（对抗僵尸过滤）
-                        if last_online.elapsed() > std::time::Duration::from_secs(10) {
-                            crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "在线");
-                            last_online = std::time::Instant::now();
-                        }
-                        // 每条消息 spawn 独立处理（对齐飞书 ws_loop）：per-chat 串行由 bridge 的
-                        // chat_lock 保证，而「停止词」等控制消息须能与运行中的任务**并发**处理，
-                        // 若在此串行 await，长任务会把它（及其后的新消息）全部堵到跑完为止。
-                        // #69 审计：短/中命、有 owner（bridge chat_lock + pending.json 恢复），
-                        // 不登记——关停语义靠进程退出兜底（见 svc_tasks.rs 登记口径）。
-                        for msg in msgs {
-                            let b = bridge.clone();
-                            tokio::spawn(async move {
-                                b.on_weixin(msg).await;
-                            });
-                        }
-                    }
-                    Err(crate::wechat::WxError::SessionExpired) => {
-                        crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "会话过期");
-                        crate::log!("[bot:{key}] 微信会话已超时（-14），需重新扫码登录");
-                        break;
-                    }
-                    Err(crate::wechat::WxError::PollTimeout) => {
-                        consec_timeouts += 1;
-                        if consec_timeouts == 3 {
-                            crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "重连中");
-                            crate::log!(
-                                "[bot:{key}] ⚠️ 连续 3 次长轮询超时（约 2 分钟无成功响应），疑似通道假死，持续重试中"
-                            );
-                        }
-                        // 超时后立刻下一轮长轮询即可（服务端无新消息本就靠超时驱动），不额外 sleep
-                    }
-                    Err(e) => {
-                        crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "重连中");
-                        fails += 1;
-                        // 「要不要放弃」由 `retry::should_give_up` 统一决定（当前恒 false）。
-                        // 保留这个判断而不是省掉，是为了让将来重新引入上限时**只改一处**。
-                        if crate::retry::should_give_up(fails) {
-                            crate::log!("[bot:{key}] 连续失败 {fails} 次，放弃重连");
-                            crate::botstatus::report(&key, &bot.kind, &bot.bot_name, "连接失败");
-                            break;
-                        }
-                        let wait = crate::retry::backoff(fails);
-                        crate::log!(
-                            "[bot:{key}] getupdates 出错，{}s 后重试（第 {fails} 次）：{e}",
-                            wait.as_secs()
-                        );
-                        if interruptible_sleep(wait, &stop).await {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        // **内置渠道已退役**（2026-11-04）。这里的三个分支（钉钉 Stream / 微信长轮询 /
+        // 飞书 WS）连同 `src/{dingtalk,wechat,feishu,ws}.rs` 一起删掉了，
+        // 实现搬到 `crates/abb-channel-*` 三个独立 MCP server。
+        //
+        // `messenger::build` 已经挡过一遍（那条路径更早失败），这里是第二条闸：
+        // 万一有人绕过 build 直接进来，也必须是**响亮失败**而不是静默不启动——
+        // 「bot 显示在线但永不来消息」比启动失败难查得多。
+        crate::log!(
+            "[bot:{key}] kind=`{}` 是已退役的内置渠道 ⇒ 事件循环不启动。\
+             请改成 kind=mcp（见 docs/mcp-bus-architecture.md「从内置渠道迁到 MCP 渠道」）",
+            bot.kind
+        );
     }
     crate::botstatus::clear(&key);
 }
+
 /// 睡眠 dur，但可被关停令牌打断。返回 true=收到关停广播（调用方应 break）。
 async fn interruptible_sleep(
     dur: std::time::Duration,
@@ -2713,72 +2604,5 @@ mod tests {
         let p = job_prompt(&job, &bot_key);
         assert!(p.contains("简单提醒"));
         assert!(!p.starts_with("[受限模式]"));
-    }
-}
-
-/// 微信长轮询游标落盘位置：`workspaces/<bot_key>/wx_cursor.json`。
-fn wx_cursor_path(bot_key: &str) -> std::path::PathBuf {
-    crate::workspace_dir(bot_key).join("wx_cursor.json")
-}
-
-/// 读取持久化的微信游标（缺失/损坏 ⇒ 空串，绝不因此启动失败）。
-fn load_wx_cursor(bot_key: &str) -> String {
-    let path = wx_cursor_path(bot_key);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return String::new();
-    };
-    parse_wx_cursor(&text).unwrap_or_default()
-}
-
-/// 从 JSON 里取游标。损坏 ⇒ None（调用方退回空串）。
-fn parse_wx_cursor(text: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    Some(v.get("buf")?.as_str()?.to_string())
-}
-
-/// 落盘游标（原子写 + 尽力而为：失败只记一条，绝不影响长轮询）。
-fn save_wx_cursor(bot_key: &str, cursor: &str) {
-    let path = wx_cursor_path(bot_key);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let body = serde_json::json!({ "buf": cursor }).to_string();
-    if let Err(e) = crate::atomic_write_text(&path, &body) {
-        crate::log!("[bot:{bot_key}] 微信游标落盘失败（不影响长轮询）：{e:#}");
-    }
-}
-
-#[cfg(test)]
-mod wx_cursor_guard_tests {
-    /// 游标必须能往返、且损坏输入不得 panic（审计 #19）。
-    ///
-    /// 判别力：把持久化删掉（`load_wx_cursor` 恒返回空串）⇒ 生产侧断言红。
-    #[test]
-    fn wx_cursor_roundtrip_and_corrupt_input() {
-        let body = serde_json::json!({ "buf": "CURSOR-123" }).to_string();
-        assert_eq!(
-            crate::service::parse_wx_cursor(&body).as_deref(),
-            Some("CURSOR-123")
-        );
-        assert_eq!(
-            crate::service::parse_wx_cursor("not-json"),
-            None,
-            "损坏输入退回 None"
-        );
-        assert_eq!(crate::service::parse_wx_cursor("{\"other\":1}"), None);
-    }
-
-    /// 生产侧必须真的载入与保存（否则游标只是一次性内存变量）。
-    #[test]
-    fn wechat_loop_loads_and_saves_the_cursor() {
-        let src = include_str!("service.rs");
-        assert!(
-            src.contains("let mut cursor = load_wx_cursor(&key)"),
-            "启动必须载入游标"
-        );
-        assert!(
-            src.contains("save_wx_cursor(&key, &cursor)"),
-            "拿到新游标必须落盘"
-        );
     }
 }

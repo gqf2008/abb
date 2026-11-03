@@ -121,18 +121,28 @@ want "runtime 全目录行数"     "$RUNTIME_ALL"
 want "GUI 三件合计行数"       "$GUI_TOTAL"
 
 # ── 校验：几条结构性断言（数字对了但结构变了更危险）──────────────────────────
-# Messenger 实现数 = 3 个生产实现（测试假件不算）
-n_msgr=$(grep -c 'impl Messenger for' src/messenger.rs)
-if [ "$n_msgr" -ne 3 ]; then
+# Messenger 生产实现数 = 1（内置渠道 2026-11-04 退役后只剩 MCP 一个）。
+#
+# 为什么改成断言「恰好 1」而不是「至少 1」：多出来的实现只可能是有人把内置渠道
+# 加了回来——那会让文档 §2「MCP 渠道是唯一入站形态」变成假话，而代码照样编译。
+n_msgr=$(grep -c 'impl Messenger for' src/mcp_channel.rs)
+if [ "$n_msgr" -ne 1 ]; then
     fail=$((fail + 1))
-    printf '❌ Messenger 生产实现数：实测 %s，文档写 3\n' "$n_msgr"
+    printf '❌ Messenger 生产实现数：实测 %s，文档写 1（内置渠道退役后只应有 MCP）\n' "$n_msgr"
 fi
-# 入站三入口仍在（id 变了说明有人重构）
-for fn in 'on_payload' 'on_weixin' 'on_dingtalk'; do
-    if ! grep -rq "pub async fn ${fn}" src/bridge/; then
-        fail=$((fail + 1)); printf '❌ 入站入口 %s 不存在了（文档 §2 描述过期）\n' "$fn"
+# 内置渠道的源文件**必须不存在**（退役不可逆的机器断言）。
+#
+# 反向断言比「MCP 入口存在」更有价值：缺 MCP 入口编译就红了，
+# 而内置渠道只要有一个文件被误恢复，编译照样通过、行为悄悄分叉。
+for f in 'src/feishu.rs' 'src/wechat.rs' 'src/dingtalk.rs' 'src/ws.rs' 'src/proto.rs'; do
+    if [ -e "$f" ]; then
+        fail=$((fail + 1)); printf '❌ %s 又出现了（内置渠道已于 2026-11-04 退役）\n' "$f"
     fi
 done
+# MCP 入站主循环仍在（唯一入站形态）
+if ! grep -q 'pub async fn run' src/mcp_channel_loop.rs; then
+    fail=$((fail + 1)); printf '❌ MCP 入站主循环 mcp_channel_loop::run 不存在了\n'
+fi
 # 两条 task 执行通道仍在
 for ch in 'Schedule' 'Manual'; do
     if ! grep -q "    ${ch}," src/task_run.rs; then
@@ -176,9 +186,14 @@ if [ -f "$plan" ]; then
             index($2, m) { gsub(/[^0-9]/, "", $3); print $3; exit }' "$plan")
         [ -n "$doc_n" ] || continue
         if [ ! -f "$f" ]; then
-            fail=$((fail + 1))
-            printf '❌ 退役方案仍提到 %s（%s 行），但该文件已删除 ⇒ 退役后忘了更新方案\n' \
-                "src/$mod.rs" "$doc_n"
+            # 文件已删 ⇒ 文档可以保留行数**作为历史记录**，但必须明说它已删除。
+            # 判据：该模块所在小节的标题里要有「已删除」/「退役前」字样。
+            # 否则就是在描述一个已经不存在的东西——而 owner 按它做判断。
+            if ! grep -q '已删除\|退役前' "$plan"; then
+                fail=$((fail + 1))
+                printf '❌ 退役方案提到 %s（%s 行）但文件已删除，且未标明是历史记录\n' \
+                    "src/$mod.rs" "$doc_n"
+            fi
             continue
         fi
         real_n=$(wc -l < "$f" | tr -d ' ')

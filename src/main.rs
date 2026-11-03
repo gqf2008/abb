@@ -25,9 +25,7 @@ mod channel_mcp;
 mod config;
 mod deliver;
 mod deps;
-mod dingtalk;
 mod emoji;
-mod feishu;
 mod guard;
 mod history;
 mod htmlmd;
@@ -59,9 +57,7 @@ mod platform;
 mod proc_group;
 #[cfg(target_os = "macos")]
 mod proc_sysctl;
-mod proto;
 mod redact;
-mod retry;
 mod runtime;
 mod schedule;
 mod screenshot;
@@ -95,8 +91,6 @@ mod ui;
 mod unread;
 mod updater;
 mod virtualbot;
-mod wechat;
-mod ws;
 mod wsver;
 
 /// 运行数据目录的环境变量覆盖；空字符串按未设置处理。
@@ -677,85 +671,6 @@ fn main() {
             std::process::exit(2);
         }
         std::process::exit(run_deps_install_cli());
-    }
-
-    // 隐藏调试 flag：--wx-qr-test（冒烟：真拉一次微信登录二维码，验证协议端点）
-    if args.iter().any(|a| a == "--wx-qr-test") {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            match wechat::fetch_qrcode().await {
-                Ok((qr, img)) => {
-                    println!(
-                        "OK qrcode_len={} qrcode_head={:?}",
-                        qr.len(),
-                        &qr[..qr.len().min(24)]
-                    );
-                    println!(
-                        "img_len={} img_head={:?}",
-                        img.len(),
-                        &img[..img.len().min(80)]
-                    );
-                    match wechat::save_qrcode_image("smoke", &img) {
-                        Ok(p) => println!("saved → {}", p.display()),
-                        Err(e) => println!("save err: {e:#}"),
-                    }
-                }
-                Err(e) => println!("ERR: {e:#}"),
-            }
-        });
-        return;
-    }
-
-    // 隐藏调试 flag：--dump-config / --fetch-bot-info（P2/P3 验证用）
-    if args.iter().any(|a| a == "--dump-config") {
-        match config::Config::load() {
-            Ok(c) => {
-                println!(
-                    "owner={} bot数={} missing={:?}",
-                    c.owner_open_id,
-                    c.bots.len(),
-                    c.missing()
-                );
-                for b in &c.bots {
-                    println!(
-                        "  bot[{}] app_id={} name={} open_id={} primary={}",
-                        b.key(),
-                        b.app_id,
-                        b.bot_name,
-                        b.bot_open_id,
-                        b.primary_chat_id
-                    );
-                }
-            }
-            Err(e) => crate::log!("config 读取失败: {e:#}"),
-        }
-        return;
-    }
-    if args.iter().any(|a| a == "--fetch-bot-info") {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            match config::Config::load() {
-                Ok(c) => {
-                    for b in &c.bots {
-                        let fs = feishu::FeishuClient::new(&b.app_id, &b.app_secret);
-                        match fs.bot_info().await {
-                            Ok((name, oid)) => {
-                                println!("[{}] bot_name={name} bot_open_id={oid}", b.key())
-                            }
-                            Err(e) => crate::log!("[{}] bot_info 失败: {e:#}", b.key()),
-                        }
-                    }
-                }
-                Err(e) => crate::log!("config 读取失败: {e:#}"),
-            }
-        });
-        return;
     }
 
     // GUI：托盘控制器（单实例：已在跑就不再开一个托盘）

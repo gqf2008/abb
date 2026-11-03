@@ -1,13 +1,12 @@
-//! 附件处理（过渡能力，#12）：入站非文本消息（图片/音视频/文件）下载后保存到
-//! `workspaces/<bot_key>/attachments/YYYY-MM-DD/<mid>_<seq><ext>`，旁写 `meta.json`
-//! 记录 mime/大小/sha256/来源/文件名；桥把元数据摘要文本注入 agent prompt，
-//! agent 按本地路径读取文件内容（图片可描述、文件可分析）。
+//! 附件元数据（#12）：一份附件的 kind/来源/文件名/mime/大小/本地路径/sha256，
+//! 以及给 agent 的一行摘要文本。桥把摘要注入 prompt，agent 按本地路径读文件。
 //!
-//! 本模块只负责「落盘 + 元数据 + 摘要文本」；各平台下载在对应 client/messenger 里做。
+//! **落盘与读盘都不在本模块**（2026-11-04 内置渠道退役后）：入站下载落盘由各渠道
+//! server 自己做（契约 §4「ABB 不负责渠道协议细节」），出站读文件 + 体积闸在
+//! `mcp_channel::send_attachment` 里（先 metadata 后 read + `reject_if_too_big`）。
+//! 这里只剩**跨渠道共用**的元数据结构与命名/摘要工具。
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 /// 附件大小上限（字节）：飞书/微信参考实现均限 100MB，这里统一 200MB 兜底防异常超大文件打爆磁盘。
 pub const MAX_ATTACHMENT_BYTES: usize = 200 * 1024 * 1024;
@@ -47,184 +46,25 @@ impl AttachmentMeta {
     }
 }
 
-/// 一条待下载附件的平台引用（桥 → messenger 分发用）。
+/// 一条待下载附件的引用（桥 → messenger 分发用）。
+///
+/// **只有 MCP 一种形态**（2026-11-04 内置渠道退役后）：三个平台变体
+/// （`Feishu` 带 `file_key` / `Dingtalk` 带 `download_code` / `Wechat` 带
+/// `WechatMedia`）随 `src/{feishu,dingtalk,wechat}.rs` 一起删掉了——那些字段
+/// 是**渠道协议细节**，现在住在各自的 MCP server 里（契约 §4）。
+///
+/// 留着这个空枚举而不是把参数整个去掉，是为了让 `download_attachment` 的签名
+/// 保持稳定：将来若某个渠道需要额外提示，加一个变体即可，调用方不用改。
 #[derive(Debug, Clone)]
 pub enum AttachmentDesc {
-    Feishu {
-        message_id: String,
-        file_key: String,
-        /// image | file | audio | video
-        kind: String,
-        file_name: String,
-    },
-    Dingtalk {
-        download_code: String,
-        robot_code: String,
-        /// image | file | audio | video
-        kind: String,
-        file_name: String,
-        voice_text: String,
-    },
-    Wechat(crate::wechat::WechatMedia),
     /// MCP 渠道：**不带任何平台凭据**。
     ///
-    /// 为什么不带 `file_key` 之类：契约 §4「ABB 不负责渠道协议细节」——
-    /// 怎么下载是渠道 server 的事，它自己按消息 id 反查（飞书查消息 API、
+    /// 怎么下载是渠道 server 的事——它自己按消息 id 反查（飞书查消息 API、
     /// 钉钉查 download_code、微信查 media）。ABB 侧只需知道「这是第几个附件」。
     ///
     /// 消息 id 也不放这里：`Messenger::download_attachment` 的 `mid` 参数
     /// 已经给了，放两处只会出现「两处不一致时信哪个」的问题。
     Mcp,
-}
-
-/// 下载/保存失败的占位元数据：路径/sha 为空，note 带原因。
-/// 消息仍会交给 agent（agent 可如实告知用户附件下载失败），不静默丢消息。
-pub fn failed_meta(
-    kind: &str,
-    source: &str,
-    file_name: &str,
-    err: &anyhow::Error,
-) -> AttachmentMeta {
-    AttachmentMeta {
-        kind: kind.to_string(),
-        source: source.to_string(),
-        file_name: file_name.to_string(),
-        mime: String::new(),
-        size: 0,
-        path: String::new(),
-        sha256: String::new(),
-        note: format!("下载失败: {err:#}"),
-    }
-}
-
-/// 附件字节落盘 + 写 meta.json，返回元数据（bot 工作区根由调用方传入，便于测试）。
-/// 目录按本地日期分：`attachments/YYYY-MM-DD/`；文件名 `<mid>_<seq><ext>`（mid 安全化）。
-#[allow(clippy::too_many_arguments)]
-pub fn save_attachment_in(
-    workspace: &Path,
-    mid: &str,
-    seq: usize,
-    kind: &str,
-    source: &str,
-    file_name: &str,
-    mime: &str,
-    bytes: &[u8],
-) -> Result<AttachmentMeta> {
-    if bytes.len() > MAX_ATTACHMENT_BYTES {
-        anyhow::bail!(
-            "附件超过大小上限（{}MB），拒绝保存",
-            MAX_ATTACHMENT_BYTES / 1024 / 1024
-        );
-    }
-    let now = crate::schedule::DateTime::now();
-    let dir = workspace
-        .join("attachments")
-        .join(format!("{:04}-{:02}-{:02}", now.year, now.month, now.day));
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("创建附件目录失败: {}", dir.display()))?;
-
-    let stem = format!("{}_{}", sanitize_mid(mid), seq);
-    let path = dir.join(format!("{stem}{}", ext_from(file_name, mime, kind)));
-    std::fs::write(&path, bytes).with_context(|| format!("写附件失败: {}", path.display()))?;
-
-    let meta = AttachmentMeta {
-        kind: kind.to_string(),
-        source: source.to_string(),
-        file_name: file_name.to_string(),
-        mime: mime.to_string(),
-        size: bytes.len() as u64,
-        path: path.display().to_string(),
-        sha256: sha256_hex(bytes),
-        note: String::new(),
-    };
-    let meta_json = serde_json::to_string_pretty(&meta).context("附件 meta 序列化失败")?;
-    crate::atomic_write_sensitive(&path.with_extension("meta.json"), &meta_json)
-        .with_context(|| format!("写附件 meta 失败: {}.meta.json", path.display()))?;
-    Ok(meta)
-}
-
-/// 生产入口：保存到 `~/.agent-bridge/workspaces/<bot_key>/attachments/...`。
-#[allow(clippy::too_many_arguments)]
-pub fn save_attachment(
-    bot_key: &str,
-    mid: &str,
-    seq: usize,
-    kind: &str,
-    source: &str,
-    file_name: &str,
-    mime: &str,
-    bytes: &[u8],
-) -> Result<AttachmentMeta> {
-    save_attachment_in(
-        &crate::workspace_dir(bot_key),
-        mid,
-        seq,
-        kind,
-        source,
-        file_name,
-        mime,
-        bytes,
-    )
-}
-
-/// mid 安全化：只保留字母数字与 `-_.`，其余换成 `_`（防止目录穿越/文件系统非法字符）。
-fn sanitize_mid(mid: &str) -> String {
-    if mid.is_empty() {
-        return "unknown".to_string();
-    }
-    mid.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// 从文件名/mime/种类推导落盘后缀。文件名后缀优先（安全字符才用），否则按 mime 映射，
-/// 再退到种类兜底。
-fn ext_from(file_name: &str, mime: &str, kind: &str) -> String {
-    if let Some(ext) = file_name.rsplit('.').next() {
-        let ext = ext.trim();
-        if !ext.is_empty() && ext.len() <= 16 && ext.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            return format!(".{}", ext.to_ascii_lowercase());
-        }
-    }
-    let m = mime.split(';').next().unwrap_or("").trim();
-    let from_mime = match m {
-        "image/png" => ".png",
-        "image/jpeg" => ".jpg",
-        "image/gif" => ".gif",
-        "image/webp" => ".webp",
-        "image/heic" => ".heic",
-        "image/bmp" => ".bmp",
-        "audio/mp3" => ".mp3",
-        "audio/mpeg" => ".mp3",
-        "audio/wav" => ".wav",
-        "audio/x-wav" => ".wav",
-        "audio/ogg" => ".ogg",
-        "audio/amr" => ".amr",
-        "audio/silk" => ".silk",
-        "video/mp4" => ".mp4",
-        "video/quicktime" => ".mov",
-        "application/pdf" => ".pdf",
-        "application/zip" => ".zip",
-        "application/x-tar" => ".tar",
-        "text/plain" => ".txt",
-        "application/json" => ".json",
-        _ => "",
-    };
-    if !from_mime.is_empty() {
-        return from_mime.to_string();
-    }
-    match kind {
-        "image" => ".img".to_string(),
-        "audio" => ".audio".to_string(),
-        "video" => ".video".to_string(),
-        _ => ".bin".to_string(),
-    }
 }
 
 /// 按文件名后缀猜 mime（无后缀回落种类默认值）。微信/钉钉没有 Content-Type 时用。
@@ -362,91 +202,6 @@ pub fn extract_urls(text: &str) -> Vec<String> {
     urls
 }
 
-/// 飞书「内联图片」通道可靠渲染的扩展名白名单（`/im/v1/images`）。钉钉的
-/// `/media/upload?type=image` 白名单更窄，见 `dingtalk::dingtalk_image_uploadable`。
-/// `kind_from_name` 会把 svg/ico/heic 这类也归成 image，但它们
-/// 过不了服务端图片格式校验——判定必须看**扩展名**而不只是 kind（审查 #254）。
-/// 飞书判定函数与错误文案共同引用，避免清单漂移。
-pub const IMAGE_UPLOAD_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
-
-/// 文件名是否为可上传的内联图片扩展名（大小写不敏感）。
-pub fn image_ext_uploadable(file_name: &str) -> bool {
-    file_name
-        .rsplit_once('.')
-        .map(|(_, e)| e.trim().to_ascii_lowercase())
-        .is_some_and(|e| IMAGE_UPLOAD_EXTS.contains(&e.as_str()))
-}
-
-/// 读取已保存附件字节（Messenger::send_attachment 真上传前用）。
-/// meta.path 为空或文件缺失 → Err（含文件名/路径提示），由调用方走既有错误语义
-/// （deliver 回源报错），绝不静默降级成「文本元数据」。
-pub fn read_attachment_bytes(meta: &AttachmentMeta) -> Result<Vec<u8>> {
-    if meta.path.is_empty() {
-        anyhow::bail!("附件没有本地路径（{}），无法上传发送", meta.file_name);
-    }
-    // 只接受普通文件：`/dev/zero`、FIFO、字符设备等 metadata().len() 常为 0 却能
-    // 无限读出，`fs::read` 会挂死或吃爆内存（审查 #254）。
-    // 报错文案与旧的直接 `fs::read` 失败同款（既有测试/用户提示都按这串文案认）。
-    let md = std::fs::metadata(&meta.path)
-        .with_context(|| format!("读取附件文件失败: {}（本地路径可能已移动/删除）", meta.path))?;
-    if !md.is_file() {
-        anyhow::bail!("附件不是普通文件，拒绝上传发送: {}", meta.path);
-    }
-    // 兜底上限：调用方已按目的地平台预检过，这里保证**任何**入口都不会把超大对象
-    // 整读进内存（不能只依赖调用方记得预检——审查 #254）。
-    if md.len() > MAX_ATTACHMENT_BYTES as u64 {
-        anyhow::bail!(
-            "附件过大（{} MB > 本地 {} MB 读取上限），拒绝上传发送: {}",
-            md.len() / (1024 * 1024),
-            MAX_ATTACHMENT_BYTES / (1024 * 1024),
-            meta.path
-        );
-    }
-    let bytes = std::fs::read(&meta.path)
-        .with_context(|| format!("读取附件文件失败: {}（本地路径可能已移动/删除）", meta.path))?;
-    if bytes.is_empty() {
-        anyhow::bail!("附件为空文件，拒绝上传发送: {}", meta.file_name);
-    }
-    Ok(bytes)
-}
-
-/// 各目的地平台的上传体积上限（字节）：飞书 image 10MB / file 30MB（官方文档），
-/// 钉钉 image/file 均为 20MB（官方文档）。发送前先按元数据大小预检——整读进内存再被
-/// 服务端拒（HTTP 413 / 尺寸错误）既白烧内存又难诊断（审查 #254）。
-pub const FEISHU_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
-pub const FEISHU_FILE_MAX_BYTES: u64 = 30 * 1024 * 1024;
-pub const DINGTALK_IMAGE_MAX_BYTES: u64 = 20 * 1024 * 1024;
-pub const DINGTALK_FILE_MAX_BYTES: u64 = 20 * 1024 * 1024;
-
-/// 微信外发媒体的本地上限（字节）。**这不是腾讯公布的平台上限**——iLink 没有公开
-/// 文档说明各类型上限，这个值是我们自己的资源兜底：上传走"整块读进内存 → 加密再复制
-/// 一份 → 一次 POST"，50MB 已是 ~100MB 瞬时占用。超限直接本地拒（比读进来再被服务端
-/// 拒更省），真机若发现平台上限更低，改这一个常量即可。
-pub const WECHAT_UPLOAD_MAX_BYTES: u64 = 50 * 1024 * 1024;
-
-/// 读取前的体积预检：按 metadata().len() 对比目的地 caps。
-/// 文件不存在/无路径 → 交由 read_attachment_bytes 报同款错误（这里只量尺寸）。
-pub fn check_sendable_size(meta: &AttachmentMeta, max: u64) -> Result<()> {
-    if meta.path.is_empty() {
-        return Ok(()); // 由 read 报缺路径错误
-    }
-    if let Ok(m) = std::fs::metadata(&meta.path) {
-        if m.len() > max {
-            anyhow::bail!(
-                "附件过大（{} MB > 平台上限 {} MB）：{name}",
-                m.len() / (1024 * 1024),
-                max / (1024 * 1024),
-                name = if meta.file_name.is_empty() {
-                    &meta.path
-                } else {
-                    &meta.file_name
-                }
-            );
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,29 +216,6 @@ mod tests {
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-    }
-
-    #[test]
-    fn sanitize_mid_keeps_safe_chars() {
-        assert_eq!(sanitize_mid("om_123-abc"), "om_123-abc");
-        assert_eq!(sanitize_mid("a/b/c"), "a_b_c");
-        assert_eq!(sanitize_mid("msg+X/=="), "msg_X___");
-        assert_eq!(sanitize_mid(""), "unknown");
-    }
-
-    #[test]
-    fn ext_from_name_prefers_safe_ext() {
-        assert_eq!(ext_from("报告.PDF", "application/pdf", "file"), ".pdf");
-        assert_eq!(ext_from("a.b.png", "image/png", "image"), ".png");
-        // 危险/超长后缀回落 mime
-        assert_eq!(ext_from("a.../../etc", "image/png", "image"), ".png");
-        assert_eq!(
-            ext_from("x.123456789012345678901", "image/png", "image"),
-            ".png"
-        );
-        // 无 mime 映射回落 kind
-        assert_eq!(ext_from("无后缀", "", "image"), ".img");
-        assert_eq!(ext_from("", "", "file"), ".bin");
     }
 
     #[test]
@@ -503,45 +235,6 @@ mod tests {
         assert_eq!(mime_from_name("a.pdf", "file"), "application/pdf");
         assert_eq!(mime_from_name("无后缀", "audio"), "audio/*");
         assert_eq!(mime_from_name("", "file"), "application/octet-stream");
-    }
-
-    #[test]
-    fn save_attachment_writes_file_and_meta() {
-        let dir = crate::testtmp::TempPath::new("abb-att-test");
-        let ws = dir.join("workspaces").join("bot-x");
-        let bytes = b"hello attachment";
-        let meta = save_attachment_in(
-            &ws,
-            "om_1/abc",
-            0,
-            "file",
-            "feishu",
-            "a.txt",
-            "text/plain",
-            bytes,
-        )
-        .expect("保存附件应成功");
-        assert_eq!(meta.kind, "file");
-        assert_eq!(meta.source, "feishu");
-        assert_eq!(meta.mime, "text/plain");
-        assert_eq!(meta.size, bytes.len() as u64);
-        assert_eq!(meta.sha256, sha256_hex(bytes));
-        assert!(meta.file_name == "a.txt");
-        // 路径是绝对路径且落在附件日期目录
-        let p = std::path::Path::new(&meta.path);
-        assert!(p.is_absolute(), "附件路径应绝对: {}", meta.path);
-        assert!(p.starts_with(ws.join("attachments")));
-        // mid 安全化：om_1/abc → om_1_abc
-        let fname = p.file_name().unwrap().to_string_lossy().to_string();
-        assert!(fname.starts_with("om_1_abc_0."), "文件名: {fname}");
-        // meta.json 旁写
-        let meta_path = p.with_extension("meta.json");
-        let meta_text = std::fs::read_to_string(&meta_path).expect("meta.json 应存在");
-        let parsed: serde_json::Value = serde_json::from_str(&meta_text).unwrap();
-        assert_eq!(parsed["sha256"], meta.sha256);
-        assert_eq!(parsed["size"], bytes.len() as u64);
-        // 清理
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -584,171 +277,5 @@ mod tests {
             meta.to_prompt_line(),
             "[image] 来源=feishu 文件名=a.png mime=image/png 大小=10 本地路径=/tmp/a.png sha256=ab"
         );
-    }
-
-    #[test]
-    fn read_attachment_bytes_reads_saved_file() {
-        let dir = crate::testtmp::TempPath::new("abb-read");
-        let ws = dir.join("workspaces").join("bot-x");
-        let bytes = b"hello attachment bytes";
-        let meta = save_attachment_in(
-            &ws,
-            "om_1/abc",
-            0,
-            "file",
-            "feishu",
-            "a.txt",
-            "text/plain",
-            bytes,
-        )
-        .expect("保存附件应成功");
-        let read = read_attachment_bytes(&meta).expect("读取本地附件应成功");
-        assert_eq!(read, bytes);
-    }
-
-    #[test]
-    fn read_attachment_bytes_errors_on_empty_path() {
-        let meta = AttachmentMeta {
-            kind: "file".into(),
-            source: "feishu".into(),
-            file_name: "a.txt".into(),
-            mime: "text/plain".into(),
-            size: 1,
-            path: String::new(),
-            sha256: String::new(),
-            note: String::new(),
-        };
-        let e = read_attachment_bytes(&meta).unwrap_err();
-        assert!(e.to_string().contains("没有本地路径"), "{e:#}");
-    }
-
-    #[test]
-    fn read_attachment_bytes_errors_on_missing_file() {
-        let meta = AttachmentMeta {
-            kind: "file".into(),
-            source: "feishu".into(),
-            file_name: "ghost.txt".into(),
-            mime: "text/plain".into(),
-            size: 1,
-            path: "/definitely/missing/ghost.txt".into(),
-            sha256: String::new(),
-            note: String::new(),
-        };
-        let e = read_attachment_bytes(&meta).unwrap_err();
-        assert!(e.to_string().contains("读取附件文件失败"), "{e:#}");
-    }
-
-    #[test]
-    fn read_attachment_bytes_errors_on_empty_file() {
-        let dir = crate::testtmp::TempPath::new("abb-read-empty");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("empty.bin");
-        std::fs::write(&path, b"").unwrap();
-        let meta = AttachmentMeta {
-            kind: "file".into(),
-            source: "feishu".into(),
-            file_name: "empty.bin".into(),
-            mime: "application/octet-stream".into(),
-            size: 0,
-            path: path.display().to_string(),
-            sha256: String::new(),
-            note: String::new(),
-        };
-        let e = read_attachment_bytes(&meta).unwrap_err();
-        assert!(e.to_string().contains("空文件"), "{e:#}");
-    }
-
-    /// 审查 #254 P3-2①：非普通文件（字符设备/FIFO/目录）`len()` 常为 0 却能无限
-    /// 读出，必须在读之前按 `metadata().is_file()` 拦下——否则 `/dev/zero` 会挂死
-    /// 或吃爆内存，而且错误信息还会误报成「空文件」。
-    #[test]
-    fn read_attachment_bytes_rejects_non_regular_file() {
-        let dir = crate::testtmp::TempPath::new("abb-read-nonfile");
-        std::fs::create_dir_all(&dir).unwrap();
-        let meta = AttachmentMeta {
-            kind: "file".into(),
-            source: "feishu".into(),
-            file_name: "weird".into(),
-            mime: "application/octet-stream".into(),
-            size: 0,
-            path: dir.display().to_string(),
-            sha256: String::new(),
-            note: String::new(),
-        };
-        let e = read_attachment_bytes(&meta).unwrap_err();
-        assert!(e.to_string().contains("不是普通文件"), "目录应被拒: {e:#}");
-        #[cfg(unix)]
-        {
-            // /dev/null 是字符设备：旧实现会读成空 → 误报「空文件」。
-            // 单独克隆一份而不是 `mut` + 改字段——`mut` 只在 cfg(unix) 分支里被用到，
-            // Windows clippy `-D warnings` 会因此报 unused_mut（本机 macOS 门禁看不到）。
-            let dev = AttachmentMeta {
-                path: "/dev/null".into(),
-                ..meta.clone()
-            };
-            let e = read_attachment_bytes(&dev).unwrap_err();
-            assert!(
-                e.to_string().contains("不是普通文件"),
-                "设备文件应被拒: {e:#}"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 调用方平台体积预检必须独立可回归：稀疏文件用 set_len 即可低成本造超限。
-    #[cfg(unix)]
-    #[test]
-    fn check_sendable_size_rejects_over_platform_cap() {
-        let dir = crate::testtmp::TempPath::new("abb-cap");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("too-big.pdf");
-        let f = std::fs::File::create(&path).unwrap();
-        f.set_len(11).unwrap();
-        drop(f);
-        let meta = AttachmentMeta {
-            kind: "file".into(),
-            source: "dingtalk".into(),
-            file_name: "too-big.pdf".into(),
-            mime: "application/pdf".into(),
-            size: 0,
-            path: path.display().to_string(),
-            sha256: String::new(),
-            note: String::new(),
-        };
-        let e = check_sendable_size(&meta, 10).unwrap_err();
-        assert!(e.to_string().contains("平台上限"), "{e:#}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 审查 #254 P3-2②：读之前自己有体积兜底（不能只依赖调用方预检）——稀疏文件
-    /// 一步 set_len 就能造出超大 len 而不占盘。
-    ///
-    /// 限 unix：NTFS 的 `SetEndOfFile` 不保证留稀疏，Windows CI 上可能真写 200MB
-    /// 零页（慢且吃盘）。上限逻辑本身与平台无关。
-    #[cfg(unix)]
-    #[test]
-    fn read_attachment_bytes_rejects_over_hard_cap() {
-        let dir = crate::testtmp::TempPath::new("abb-read-big");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("huge.bin");
-        let f = std::fs::File::create(&path).unwrap();
-        f.set_len(MAX_ATTACHMENT_BYTES as u64 + 1).unwrap();
-        drop(f);
-        let meta = AttachmentMeta {
-            kind: "file".into(),
-            source: "feishu".into(),
-            file_name: "huge.bin".into(),
-            mime: "application/octet-stream".into(),
-            size: 0,
-            path: path.display().to_string(),
-            sha256: String::new(),
-            note: String::new(),
-        };
-        let e = read_attachment_bytes(&meta).unwrap_err();
-        assert!(
-            e.to_string().contains("附件过大"),
-            "超过本地读取上限应被拒: {e:#}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -7,8 +7,6 @@
 //! 打开日志/目录走 platform::open_path（跨平台）。
 
 use crate::config::{first_owner_id, BotConfig, Config, ProviderConfig};
-use crate::dingtalk::DingTalkClient;
-use crate::feishu::FeishuClient;
 use crate::install;
 use crate::platform;
 use crate::virtualbot::{
@@ -38,16 +36,12 @@ enum UiCmd {
     Stop,
     Restart,
     Save(Box<Config>),
-    /// 对某个 bot 拉 name/open_id（仅飞书支持；微信走扫码）
+    /// 对某个 bot 拉 name/open_id。
+    ///
+    /// **显式退役**（2026-11-04）：平台 bot_info API 随内置渠道删除，MCP 契约暂无
+    /// 对应工具 ⇒ 处理器直接回「已退役」错误，保留 `idx` 让 UI 能定位是哪一行。
     FetchBotInfo {
         idx: i32,
-        app_id: String,
-        app_secret: String,
-    },
-    /// 微信扫码登录（对 bots[idx]）。后台拉二维码+长轮询，结果经 wx_rx 回主线程。
-    WxLogin {
-        idx: i32,
-        bot_key: String,
     },
     /// 安装某个依赖（node/lark-cli/dingtalk-cli/git）。结果经 dep_rx 回主线程。
     InstallDep(String),
@@ -71,23 +65,33 @@ enum UiCmd {
     /// items = (角色名, 提示词)。
     VirtualBotCreate {
         bot_key: String,
-        kind: String,
-        app_id: String,
-        app_secret: String,
+        /// 完整 bot 配置：建群现在走 `Messenger::create_chat`（**渠道无关**），
+        /// 需要 `mcp_channel` 才能 `messenger::build`。内置渠道退役后
+        /// 不再有「GUI 直接调平台 API」这条路。
+        bot: crate::config::BotConfig,
         /// 建群群主（飞书必填；点击时从工作副本 bot 解析，None = 未配置 owner）。
         owner: Option<String>,
         items: Vec<(String, String)>,
     },
     /// 编辑保存：PATCH 平台群资料（改名/改介绍）+ 登记表角色名同步。
     VirtualBotUpdate {
+        /// **显式退役**（2026-11-04）：改群资料在 MCP 契约里无对应工具，
+        /// 处理器只回错误，保留 `name` 让结果能定位到是哪个群。
+        #[allow(dead_code)]
         bot_key: String,
+        #[allow(dead_code)]
         kind: String,
+        #[allow(dead_code)]
         app_id: String,
+        #[allow(dead_code)]
         app_secret: String,
+        #[allow(dead_code)]
         chat_id: String,
         name: String,
+        #[allow(dead_code)]
         prompt: String,
         /// owner open_id（权限不足时发授权指引；None = 未配置则不提示）。
+        #[allow(dead_code)]
         owner: Option<String>,
     },
     /// 手动登记（#75 降级路径）：只写登记表，不调平台 API（平台手动建群后登记）。
@@ -103,19 +107,23 @@ enum UiCmd {
     },
     /// 解散群（红色强确认后）：调平台删除接口 + 移除登记。仅飞书有解散 API。
     VirtualBotDisband {
+        #[allow(dead_code)]
         bot_key: String,
+        #[allow(dead_code)]
         kind: String,
+        #[allow(dead_code)]
         app_id: String,
+        #[allow(dead_code)]
         app_secret: String,
         chat_id: String,
         /// owner open_id（权限不足时发授权指引；None = 未配置则不提示）。
+        #[allow(dead_code)]
         owner: Option<String>,
     },
     /// 编辑预填：拉平台群资料（(群名, 群介绍)）→ 回填弹窗。
     VirtualBotFetchInfo {
-        kind: String,
-        app_id: String,
-        app_secret: String,
+        /// 完整 bot 配置（走 `Messenger::get_chat_info`，渠道无关）。
+        bot: crate::config::BotConfig,
         chat_id: String,
     },
     /// 手动刷新（虚拟 Bot section「⟳ 刷新」）：逐个登记群调 get_chat_info 验证存在性——
@@ -124,9 +132,8 @@ enum UiCmd {
     /// 保留登记并提示，避免误删。
     VirtualBotVerify {
         bot_key: String,
-        kind: String,
-        app_id: String,
-        app_secret: String,
+        /// 完整 bot 配置（走 `Messenger::get_chat_info`，渠道无关）。
+        bot: crate::config::BotConfig,
     },
     /// 「✨ 生成」提示词（8-20 需求）：根据角色名让 LLM 写系统提示词（≤100 字符），
     /// 走该 bot 生效后端的一次性轻量 CLI 调用，结果回填弹窗。
@@ -191,16 +198,6 @@ enum TeamEvt {
     Manage {
         result: std::result::Result<String, String>,
     },
-}
-
-/// 微信扫码登录的阶段结果（后台 → 主线程）。
-enum WxEvt {
-    /// 二维码已就绪：携带落盘的 PNG 路径，主线程 load_from_path 渲染进 QrDialog。
-    QrReady(std::path::PathBuf),
-    /// 登录成功：写回该 bot 的 wx_* 字段。
-    Confirmed(i32, crate::wechat::WeixinLogin),
-    /// 失败/过期。
-    Failed(String),
 }
 
 /// 系统级对话事件（后台 → 主线程）：气泡与对话框共用一条通道。
@@ -5101,7 +5098,6 @@ pub fn run_gui() -> Result<()> {
     };
     let (bot_tx, bot_rx) =
         std_mpsc::channel::<(i32, std::result::Result<(String, String), String>)>();
-    let (wx_tx, wx_rx) = std_mpsc::channel::<WxEvt>();
     // 依赖安装 / 供应商测试结果（后台 → 主线程）
     let (dep_tx, dep_rx) = std_mpsc::channel::<DepEvt>();
     let (prov_tx, prov_rx) = std_mpsc::channel::<(i32, std::result::Result<String, String>)>();
@@ -5443,17 +5439,16 @@ pub fn run_gui() -> Result<()> {
                             crate::log!("[gui] 配置保存失败");
                         }
                     }
-                    UiCmd::FetchBotInfo {
-                        idx,
-                        app_id,
-                        app_secret,
-                    } => {
-                        let fs = FeishuClient::new(&app_id, &app_secret);
-                        let r = fs.bot_info().await.map_err(|e| format!("{e:#}"));
-                        let _ = bot_tx.send((idx, r));
-                    }
-                    UiCmd::WxLogin { idx, bot_key } => {
-                        run_wx_login(idx, &bot_key, wx_tx.clone()).await;
+                    UiCmd::FetchBotInfo { idx } => {
+                        // **显式退役**（2026-11-04）：查 bot 资料要平台的 `bot_info` API，
+                        // 契约里没有对应工具，内置渠道已删 ⇒ 没有实现可调。
+                        // 明确报错，别让 UI 停在前端「拉取中」的假状态。
+                        let _ = bot_tx.send((
+                            idx,
+                            Err("查平台 bot 资料随内置渠道退役（MCP 契约无此工具）；\
+                                 请手动填写 bot 名称与 open_id"
+                                .to_string()),
+                        ));
                     }
                     UiCmd::InstallDep(dep_id) => {
                         // #60：与一键装同款 spawn 解耦——recv 循环是单消费者串行处理所有
@@ -5674,9 +5669,7 @@ pub fn run_gui() -> Result<()> {
                     // 结果统一经 vb_tx 回主线程（进度 + 逐项汇总）。
                     UiCmd::VirtualBotCreate {
                         bot_key,
-                        kind,
-                        app_id,
-                        app_secret,
+                        bot,
                         owner,
                         items,
                     } => {
@@ -5684,45 +5677,40 @@ pub fn run_gui() -> Result<()> {
                         tokio::spawn(async move {
                             let total = items.len();
                             let mut results = Vec::with_capacity(total);
-                            // 客户端复用（tenant_token 是实例内缓存）：批量建群只取一次
-                            // token，不用每群现造。kind 已固定，非 dingtalk 才需要 feishu。
-                            let feishu =
-                                (kind != "dingtalk").then(|| FeishuClient::new(&app_id, &app_secret));
+                            // **建群走渠道无关的 `Messenger::create_chat`**
+                            // （2026-11-04：内置渠道退役后不再在 GUI 里直连平台 API）。
+                            // 对 MCP bot 它会调渠道 server 的 `create_chat` 工具；
+                            // 服务没声明该工具时返回明确错误（不是静默失败）。
+                            let msgr = match crate::messenger::build(&bot) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    for (i, (name, _)) in items.into_iter().enumerate() {
+                                        let _ =
+                                            vb_tx.send(VirtualBotEvt::Progress { done: i, total });
+                                        results.push((name, Err(format!("{e:#}"))));
+                                    }
+                                    let _ = vb_tx.send(VirtualBotEvt::Done { results });
+                                    return;
+                                }
+                            };
                             for (i, (name, prompt)) in items.into_iter().enumerate() {
                                 let _ = vb_tx.send(VirtualBotEvt::Progress { done: i, total });
-                                let r = async {
-                                    match kind.as_str() {
-                                        "dingtalk" => DingTalkClient::new(&app_id, &app_secret)
-                                            .create_chat(&name, &prompt)
-                                            .await
-                                            .map_err(|e| format!("{e:#}")),
-                                        _ => {
-                                            // 建群必须带 owner：群里只有机器人时用户飞书
-                                            // 客户端看不到群（8-20 实测）。owner 设为群主 +
-                                            // bot 管理员（set_bot_manager），用户才有编辑
-                                            // 群名/介绍权限（平台为准的核心交互）。
-                                            // owner 在点击时已从工作副本解析（与 app_id/
-                                            // secret 同一 bot 快照）；缺失 = 配置未填 owner。
-                                            let owner = owner
-                                                .as_deref()
-                                                .ok_or_else(|| {
-                                                    "该 bot 未配置 owner_open_id（群主）：虚拟 Bot 建群"
-                                                        .to_string()
-                                                        + "必须有群主，否则群里只有机器人、用户飞书客户端看不到群。"
-                                                        + "请在 bot 设置里填写 owner 白名单后重试，"
-                                                        + "或手动建群后走「手动登记」。"
-                                                })?;
-                                            feishu
-                                                .as_ref()
-                                                .expect("非 dingtalk 分支必有 feishu client")
-                                                .create_chat(&name, &prompt, owner)
-                                                .await
-                                                .map_err(|e| format!("{e:#}"))
-                                        }
-                                    }
-                                }
-                                .await;
+                                // 建群必须带 owner：群里只有机器人时用户客户端看不到群
+                                // （8-20 实测）。owner 在点击时已从工作副本解析。
+                                let r = match owner.as_deref() {
+                                    None => Err(
+                                        "该 bot 未配置 owner（群主）：虚拟 Bot 建群必须有群主，\
+                                         否则群里只有机器人、用户看不到群。\
+                                         请在 bot 设置里填写 owner 白名单后重试，或手动建群后走「手动登记」。"
+                                            .to_string(),
+                                    ),
+                                    Some(owner) => msgr
+                                        .create_chat(&name, &prompt, owner)
+                                        .await
+                                        .map_err(|e| format!("{e:#}")),
+                                };
                                 match r {
+
                                     Ok(chat_id) => {
                                         // 群已建 → 写登记表（群名=角色名）
                                         let reg = VirtualBot {
@@ -5745,44 +5733,13 @@ pub fn run_gui() -> Result<()> {
                                         }
                                     }
                                     Err(e) => {
-                                        // 钉钉建群大概率失败（能力边界）：错误里带降级提示
-                                        let e = if kind == "dingtalk" {
-                                            format!(
-                                                "{e}（钉钉建群能力待实测：可手动建群后走「手动登记」）"
-                                            )
-                                        } else {
-                                            e
-                                        };
-                                        // 飞书权限不足：给 owner 私聊发授权指引（可执行下一步）
-                                        let mut notified = false;
-                                        if kind == "feishu" {
-                                            if let (Some(owner), Some((scopes, link))) =
-                                                (&owner, crate::feishu::scope_hint(&e))
-                                            {
-                                                let fs =
-                                                    FeishuClient::new(&app_id, &app_secret);
-                                                let msg = format!(
-                                                    "⚠️ 虚拟 Bot 操作需要飞书授权\n\
-                                                     操作「创建虚拟 Bot」被拒绝：应用缺少权限 {scopes}\n\
-                                                     请点击开通（任选其一）：\n{link}\n\
-                                                     开通后重新操作即可。"
-                                                );
-                                                crate::log!(
-                                                    "[gui] 创建失败权限不足，向 owner 发送授权指引"
-                                                );
-                                                if fs.send_text_to_user(owner, &msg).await.is_ok()
-                                                {
-                                                    notified = true;
-                                                }
-                                            }
-                                        }
+                                        // 平台能力边界（例如某渠道不支持建群）：如实报错，
+                                        // 并提示可降级为手动建群后登记。
                                         results.push((
                                             name,
-                                            Err(if notified {
-                                                format!("{e}（已向 owner 发送授权指引）")
-                                            } else {
-                                                e
-                                            }),
+                                            Err(format!(
+                                                "{e}（可手动建群后走「手动登记」）"
+                                            )),
                                         ));
                                     }
                                 }
@@ -5791,68 +5748,30 @@ pub fn run_gui() -> Result<()> {
                         });
                     }
                     UiCmd::VirtualBotUpdate {
-                        bot_key,
-                        kind,
-                        app_id,
-                        app_secret,
-                        chat_id,
+                        bot_key: _,
+                        kind: _,
+                        app_id: _,
+                        app_secret: _,
+                        chat_id: _,
                         name,
-                        prompt,
-                        owner,
+                        prompt: _,
+                        owner: _,
                     } => {
+                        // **显式退役**（2026-11-04）：改群资料在契约 §3.4 里**没有**
+                        // 对应工具（三个渠道 crate 都没 `update_chat`），而内置渠道
+                        // 已删 ⇒ 这条路径没有实现可调。
+                        //
+                        // 为什么不悄悄删掉：用户点「保存」会什么也不发生。
+                        // 明确说明 + 指路（手动改群名，或等契约补 `update_chat`）。
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
-                            let r = async {
-                                match kind.as_str() {
-                                    "dingtalk" => DingTalkClient::new(&app_id, &app_secret)
-                                        .update_chat(&chat_id, &name, &prompt)
-                                        .await
-                                        .map_err(|e| format!("{e:#}")),
-                                    _ => FeishuClient::new(&app_id, &app_secret)
-                                        .update_chat(&chat_id, &name, &prompt)
-                                        .await
-                                        .map_err(|e| format!("{e:#}")),
-                                }
-                            }
-                            .await;
-                            let mut result = match r {
-                                Ok(()) => match VirtualBotStore::new().update_role(
-                                    &bot_key,
-                                    &chat_id,
-                                    &name,
-                                ) {
-                                    Ok(()) => Ok("已更新（平台 + 登记同步）".to_string()),
-                                    Err(e) => Err(format!("平台已更新，登记同步失败：{e}")),
-                                },
-                                Err(e) => Err(e),
-                            };
-                            // 权限不足（飞书 99991672）：给 owner 私聊发授权指引
-                            if let (Err(e), Some(owner)) = (&result, &owner) {
-                                if kind == "feishu" {
-                                    if let Some((scopes, link)) = crate::feishu::scope_hint(e) {
-                                        let fs = FeishuClient::new(&app_id, &app_secret);
-                                        let msg = format!(
-                                            "⚠️ 虚拟 Bot 操作需要飞书授权\n\
-                                             操作「编辑群资料」被拒绝：应用缺少权限 {scopes}\n\
-                                             请点击开通（任选其一）：\n{link}\n\
-                                             开通后重新操作即可。"
-                                        );
-                                        crate::log!("[gui] 编辑失败权限不足，向 owner 发送授权指引");
-                                        match fs.send_text_to_user(owner, &msg).await {
-                                            Ok(()) => {
-                                                result = Err(format!(
-                                                    "{e}（已向 owner 发送授权指引）"
-                                                ));
-                                            }
-                                            Err(se) => crate::log!(
-                                                "[gui] 向 owner 发送授权指引失败: {se:#}"
-                                            ),
-                                        }
-                                    }
-                                }
-                            }
                             let _ = vb_tx.send(VirtualBotEvt::Done {
-                                results: vec![(name, result)],
+                                results: vec![(
+                                    name,
+                                    Err("改群资料能力随内置渠道退役（MCP 契约暂无 update_chat 工具）。\
+                                         请到平台客户端手动改群名/介绍，再点「重新登记」"
+                                        .to_string()),
+                                )],
                             });
                         });
                     }
@@ -5912,133 +5831,47 @@ pub fn run_gui() -> Result<()> {
                         });
                     }
                     UiCmd::VirtualBotDisband {
-                        bot_key,
-                        kind,
-                        app_id,
-                        app_secret,
+                        bot_key: _,
+                        kind: _,
+                        app_id: _,
+                        app_secret: _,
                         chat_id,
-                        owner,
+                        owner: _,
                     } => {
+                        // **显式退役**（2026-11-04）：解散群要平台的 `delete_chat` API，
+                        // 契约里没有对应工具，内置渠道已删 ⇒ 没有实现可调。
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
-                            let store = VirtualBotStore::new();
-                            let role = store
-                                .load()
-                                .into_iter()
-                                .find(|v| v.bot_key == bot_key && v.chat_id == chat_id)
-                                .map(|v| v.role_name)
-                                .unwrap_or_else(|| chat_id.clone());
-                            // 先解散平台群（不可恢复；确认弹窗已挡过一次），成功再移除登记
-                            crate::log!(
-                                "[gui] 解散群 bot={} kind={} chat={}",
-                                bot_key,
-                                kind,
-                                crate::agent::truncate(&chat_id, 12)
-                            );
-                            let r = async {
-                                match kind.as_str() {
-                                    "dingtalk" => Err("钉钉暂无解散群 API".to_string()),
-                                    _ => FeishuClient::new(&app_id, &app_secret)
-                                        .delete_chat(&chat_id)
-                                        .await
-                                        .map_err(|e| format!("{e:#}")),
-                                }
-                            }
-                            .await;
-                            let mut result = match r {
-                                Ok(()) => {
-                                    store.remove(&bot_key, &chat_id);
-                                    // #147 双向一致：解散群 → 团队条目对应角色 chat_id 清空
-                                    crate::teamreg::TeamStore::new()
-                                        .clear_chat(&bot_key, &chat_id);
-                                    // 解散成功同样归档会话历史（与事件/刷新路径一致——
-                                    // 8-20 用户追问后补：三路径统一，历史移入 archive/）
-                                    let archived =
-                                        VirtualBotStore::archive_chat_history(&bot_key, &chat_id);
-                                    Ok(if archived > 0 {
-                                        format!("群已解散，登记已移除，历史已归档（{archived} 个文件）")
-                                    } else {
-                                        "群已解散，登记已移除".to_string()
-                                    })
-                                }
-                                Err(e) => {
-                                    // 232017（操作者非群主/管理员）：8-20 实测——群主
-                                    // 转让给 owner 后 bot 降级普通成员，解散被拒。附可执行
-                                    // 指引（飞书里把机器人设为管理员，或把群主转回机器人）。
-                                    let es = e.to_string();
-                                    if es.contains("232017") {
-                                        Err(format!(
-                                            "解散失败（登记保留）：机器人不是该群群主/管理员。请在飞书群设置里把机器人设为管理员（或把群主转回机器人）后重试。{es}"
-                                        ))
-                                    } else {
-                                        Err(format!("解散失败（登记保留）：{e}"))
-                                    }
-                                }
-                            };
-                            // 权限不足（飞书 99991672）：给 owner 私聊发授权指引——平台权限
-                            // 问题不该只躺在状态行/日志里，owner 需要可执行的下一步。
-                            if let Err(e) = &result {
-                                if let Some(owner) = &owner {
-                                    if kind == "feishu" {
-                                        if let Some((scopes, link)) =
-                                            crate::feishu::scope_hint(e)
-                                        {
-                                            let fs = FeishuClient::new(&app_id, &app_secret);
-                                            let msg = format!(
-                                                "⚠️ 虚拟 Bot 操作需要飞书授权\n\
-                                                 操作「解散群」被拒绝：应用缺少权限 {scopes}\n\
-                                                 请点击开通（任选其一）：\n{link}\n\
-                                                 开通后重新操作即可。"
-                                            );
-                                            crate::log!("[gui] 权限不足，向 owner 发送授权指引");
-                                            match fs.send_text_to_user(owner, &msg).await {
-                                                Ok(()) => {
-                                                    result = Err(format!(
-                                                        "解散失败（登记保留）：{e}（已向 owner 发送授权指引）"
-                                                    ));
-                                                }
-                                                Err(se) => crate::log!(
-                                                    "[gui] 向 owner 发送授权指引失败: {se:#}"
-                                                ),
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            crate::log!(
-                                "[gui] 解散群结果: {}",
-                                match &result {
-                                    Ok(s) => s,
-                                    Err(e) => e,
-                                }
-                            );
                             let _ = vb_tx.send(VirtualBotEvt::Done {
-                                results: vec![(role, result)],
+                                results: vec![(
+                                    chat_id.clone(),
+                                    Err("解散群能力随内置渠道退役（MCP 契约无此工具）；\
+                                         请到平台客户端手动解散，再点「注销登记」"
+                                        .to_string()),
+                                )],
                             });
                         });
                     }
                     UiCmd::VirtualBotFetchInfo {
-                        kind,
-                        app_id,
-                        app_secret,
+                        bot,
                         chat_id,
                     } => {
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
-                            let r = async {
-                                match kind.as_str() {
-                                    "dingtalk" => DingTalkClient::new(&app_id, &app_secret)
-                                        .get_chat_info(&chat_id)
-                                        .await
-                                        .map_err(|e| format!("{e:#}")),
-                                    _ => FeishuClient::new(&app_id, &app_secret)
-                                        .get_chat_info(&chat_id)
-                                        .await
-                                        .map_err(|e| format!("{e:#}")),
-                                }
-                            }
-                            .await;
+                            // 走**渠道无关**的 `Messenger::get_chat_info`
+                            // （契约 §3.4 有这个工具；内置渠道退役后不再直连平台 API）。
+                            let r = match crate::messenger::build(&bot) {
+                                Err(e) => Err(format!("{e:#}")),
+                                Ok(msgr) => msgr
+                                    .get_chat_info(&chat_id)
+                                    .await
+                                    .ok_or_else(|| {
+                                        "渠道未返回群资料（可能未声明 get_chat_info 能力）"
+                                            .to_string()
+                                    }),
+                            };
                             match r {
+
                                 Ok((name, desc)) => {
                                     let _ = vb_tx.send(VirtualBotEvt::Fetched {
                                         chat_id,
@@ -6058,12 +5891,7 @@ pub fn run_gui() -> Result<()> {
                             }
                         });
                     }
-                    UiCmd::VirtualBotVerify {
-                        bot_key,
-                        kind,
-                        app_id,
-                        app_secret,
-                    } => {
+                    UiCmd::VirtualBotVerify { bot_key, bot } => {
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
                             // 逐个登记群验证存在性（get_chat_info）——平台解散群的兜底
@@ -6075,14 +5903,18 @@ pub fn run_gui() -> Result<()> {
                                 crate::agent::truncate(&bot_key, 12)
                             );
                             let regs = VirtualBotStore::new().load_for(&bot_key);
-                            let client = match kind.as_str() {
-                                "dingtalk" => None,
-                                _ => Some(FeishuClient::new(&app_id, &app_secret)),
-                            };
+                            // 走**渠道无关**的 `Messenger::get_chat_info`
+                            // （内置渠道退役后不再直连平台 API）。
+                            let client = crate::messenger::build(&bot).ok();
                             let mut results: Vec<(String, Result<String, String>)> = Vec::new();
                             for reg in &regs {
                                 let r = match &client {
-                                    Some(c) => c.get_chat_info(&reg.chat_id).await,
+                                    Some(c) => c
+                                        .get_chat_info(&reg.chat_id)
+                                        .await
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!("渠道未返回群资料")
+                                        }),
                                     // 钉钉无群信息 API（无该能力）：跳过验证，登记保留
                                     None => Err(anyhow::anyhow!("钉钉不支持群验证")),
                                 };
@@ -6949,25 +6781,8 @@ pub fn run_gui() -> Result<()> {
         let work = work.clone();
         settings.on_fetch_bot_info(move |idx| {
             let b = work.borrow();
-            if let Some(bot) = b.get(idx as usize) {
-                let _ = tx.send(UiCmd::FetchBotInfo {
-                    idx,
-                    app_id: bot.app_id.clone(),
-                    app_secret: bot.app_secret.clone(),
-                });
-            }
-        });
-    }
-    {
-        let tx = tx.clone();
-        let work = work.clone();
-        settings.on_wx_login(move |idx| {
-            let b = work.borrow();
-            if let Some(bot) = b.get(idx as usize) {
-                let _ = tx.send(UiCmd::WxLogin {
-                    idx,
-                    bot_key: bot.key(),
-                });
+            if idx >= 0 && (idx as usize) < b.len() {
+                let _ = tx.send(UiCmd::FetchBotInfo { idx });
             }
         });
     }
@@ -7183,15 +6998,13 @@ pub fn run_gui() -> Result<()> {
             };
             // app_id/secret/owner 都取工作副本最新（用户可能改了没保存，用旧值会建到旧
             // 应用下；owner 同理：磁盘配置可能比工作副本旧，且按 key 匹配在改名后失效）。
-            let (app_id, app_secret, owner) = {
+            // 完整 bot 快照：建群改走 `Messenger::create_chat`（渠道无关），
+            // 需要 `mcp_channel` 才能 `messenger::build`——只取 app_id/secret 不够。
+            let (bot_cfg, owner) = {
                 let b = work.borrow();
                 match b.get(idx as usize) {
-                    Some(bot) => (
-                        bot.app_id.clone(),
-                        bot.app_secret.clone(),
-                        first_owner_id(&bot.owner_open_id),
-                    ),
-                    None => (String::new(), String::new(), None),
+                    Some(bot) => (Some(bot.clone()), first_owner_id(&bot.owner_open_id)),
+                    None => (None, None),
                 }
             };
             let mode = d.get_mode();
@@ -7215,9 +7028,7 @@ pub fn run_gui() -> Result<()> {
                     if mode == 0 {
                         let _ = tx.send(UiCmd::VirtualBotCreate {
                             bot_key,
-                            kind,
-                            app_id,
-                            app_secret,
+                            bot: bot_cfg.clone().unwrap_or_default(),
                             owner: owner.clone(),
                             items: vec![(name, prompt)],
                         });
@@ -7235,8 +7046,8 @@ pub fn run_gui() -> Result<()> {
                         let _ = tx.send(UiCmd::VirtualBotUpdate {
                             bot_key,
                             kind,
-                            app_id,
-                            app_secret,
+                            app_id: String::new(),
+                            app_secret: String::new(),
                             chat_id,
                             name,
                             prompt,
@@ -7278,9 +7089,7 @@ pub fn run_gui() -> Result<()> {
                     }
                     let _ = tx.send(UiCmd::VirtualBotCreate {
                         bot_key,
-                        kind,
-                        app_id,
-                        app_secret,
+                        bot: bot_cfg.clone().unwrap_or_default(),
                         owner: owner.clone(),
                         items,
                     });
@@ -7601,9 +7410,7 @@ pub fn run_gui() -> Result<()> {
                 w.set_vb_syncing(true);
                 let _ = tx.send(UiCmd::VirtualBotVerify {
                     bot_key: bot.key(),
-                    kind: bot.kind.clone(),
-                    app_id: bot.app_id.clone(),
-                    app_secret: bot.app_secret.clone(),
+                    bot: bot.clone(),
                 });
             }
         });
@@ -7645,9 +7452,7 @@ pub fn run_gui() -> Result<()> {
                 show_window_and_focus(&d);
             }
             let _ = tx.send(UiCmd::VirtualBotFetchInfo {
-                kind: bot.kind.clone(),
-                app_id: bot.app_id.clone(),
-                app_secret: bot.app_secret.clone(),
+                bot: bot.clone(),
                 chat_id: reg.chat_id.clone(),
             });
         });
@@ -10180,7 +9985,6 @@ pub fn run_gui() -> Result<()> {
         let vb_dialog_weak = vb_dialog.as_weak();
         let team_dialog_weak = team_dialog.as_weak(); // #141 团队弹窗
         let vb_edit_t = vb_edit.clone();
-        let qr_weak = qr_dialog.as_weak();
         let work = work.clone();
         let model = bots_model.clone();
         let tray_hold = tray;
@@ -10664,71 +10468,6 @@ pub fn run_gui() -> Result<()> {
                     }
                 }
                 // 微信扫码登录事件：二维码就绪/成功/失败
-                while let Ok(evt) = wx_rx.try_recv() {
-                    match evt {
-                        WxEvt::QrReady(path) => {
-                            if let Some(d) = qr_weak.upgrade() {
-                                match slint::Image::load_from_path(&path) {
-                                    Ok(img) => {
-                                        d.set_qr_image(img);
-                                        d.set_tip("请用微信扫描下方二维码".into());
-                                        show_window_and_focus(&d);
-                                    }
-                                    Err(_) => {
-                                        if let Some(w) = settings_weak.upgrade() {
-                                            w.set_status_line("二维码加载失败，请重试".into());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        WxEvt::Confirmed(idx, login) => {
-                            // 扫码完成：关掉二维码弹窗即可（设置窗保持打开、置前聚焦，
-                            // 让用户看到「登录成功」并点保存——用户要求扫码后窗口不关）。
-                            dirty.set(true); // 扫码登录写回了 token/name，属于编辑
-                            if let Some(d) = qr_weak.upgrade() {
-                                let _ = d.hide();
-                            }
-                            if let Some(w) = settings_weak.upgrade() {
-                                let mut b = work.borrow_mut();
-                                if let Some(bot) = b.get_mut(idx as usize) {
-                                    bot.wx_token = login.token.clone();
-                                    bot.wx_base_url = login.base_url.clone();
-                                    bot.wx_user_id = login.user_id.clone();
-                                    if bot.bot_name.is_empty() {
-                                        bot.bot_name = format!("微信 {}", login.user_id);
-                                    }
-                                    // 占位名（添加时的 "botN"）登录成功后才覆盖成 wxN
-                                    if bot.name.is_empty() || bot.name.starts_with("bot") {
-                                        bot.name = format!(
-                                            "wx{}",
-                                            crate::agent::truncate(&login.user_id, 6)
-                                        );
-                                    }
-                                }
-                                sync_model(&model, &b);
-                                drop(b);
-                                w.set_status_is_error(false);
-                                w.set_status_line(
-                                    "✅ 微信登录成功！点「保存」写入配置。".into(),
-                                );
-                                // 占位名被自动改成 wxN：编辑框的单元素 model 不自动跟随，须重建，
-                                // 否则名称框残留 botN 诱导用户重名覆盖自动名
-                                refresh_editors(&w, &work);
-                                show_window_and_focus(&w);
-                            }
-                        }
-                        WxEvt::Failed(e) => {
-                            if let Some(d) = qr_weak.upgrade() {
-                                // 子窗口关闭不动 dock（8-20 用户反馈）
-                                let _ = d.hide();
-                            }
-                            if let Some(w) = settings_weak.upgrade() {
-                                w.set_status_line(format!("微信登录失败：{e}").into());
-                            }
-                        }
-                    }
-                }
                 // 气泡首次默认位：事件循环活跃后才能拿到主屏尺寸，按**逻辑像素**算（右上角）。
                 // 气泡位置（首个 tick，事件循环活跃后）：优先进上次保存的位置，没有则按**逻辑屏宽**算
                 // 右上默认位。启动前 set_position 会被 macOS 窗口级联覆盖，所以放到这里统一施加。
@@ -10958,34 +10697,6 @@ async fn test_provider(p: &ProviderConfig) -> std::result::Result<String, String
 
 /// 微信扫码登录后台流程：拉二维码 → 渲染 PNG 落盘 → 路径回主线程在弹窗显示 → 长轮询。
 /// 二维码直接画在 GUI 弹窗里（Image::load_from_path），不依赖系统看图。
-async fn run_wx_login(idx: i32, bot_key: &str, tx: std_mpsc::Sender<WxEvt>) {
-    // 整个登录流程；出错成 String 由调用处统一发 Failed。
-    async fn attempt(idx: i32, bot_key: &str, tx: &std_mpsc::Sender<WxEvt>) -> Result<(), String> {
-        // 1) 拿二维码 → 渲染 PNG 落盘 → 通知主线程显示
-        let (qrcode, img) = crate::wechat::fetch_qrcode()
-            .await
-            .map_err(|e| format!("拉二维码失败: {e:#}"))?;
-        let path = crate::wechat::save_qrcode_image(bot_key, &img)
-            .map_err(|e| format!("二维码渲染失败: {e:#}"))?;
-        let _ = tx.send(WxEvt::QrReady(path));
-        // 2) 长轮询扫码状态（最多 ~5 分钟）
-        for _ in 0..150 {
-            match crate::wechat::poll_qr_status(&qrcode).await {
-                Ok(Some(login)) => {
-                    let _ = tx.send(WxEvt::Confirmed(idx, login));
-                    return Ok(());
-                }
-                Ok(None) => tokio::time::sleep(Duration::from_secs(2)).await,
-                Err(e) => return Err(format!("{e:#}")),
-            }
-        }
-        Err("扫码超时（5 分钟未确认）".into())
-    }
-    if let Err(e) = attempt(idx, bot_key, &tx).await {
-        let _ = tx.send(WxEvt::Failed(e));
-    }
-}
-
 // D2：无头渲染举证台（纯测试模块，`#[path]` 指到单独的 .rs，避免把 ui.rs 再撑长）
 #[cfg(test)]
 #[path = "ui_headless_render_test.rs"]

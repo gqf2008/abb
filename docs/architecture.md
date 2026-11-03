@@ -19,7 +19,7 @@
                                    ▼
               ┌─────────────────────────────────────────────────┐
               │  agent-bridge --service（无头桥守护）            │  锁名 "service"
-              │  src/service.rs 2784 行                          │
+              │  src/service.rs 2608 行                          │
               │  职责：连 IM、收消息、开回合、投递、定时任务      │
               └─────────────────────────────────────────────────┘
 ```
@@ -36,11 +36,16 @@
 
 ```
  ① 入站（渠道 → ABB → agent）
- 飞书 WS ──┐
- 微信轮询 ─┼─→ bridge.on_payload / on_weixin / on_dingtalk
- 钉钉 Stream┘        │  src/bridge/mod.rs 537 / recover.rs 195,276
+ **MCP 渠道**（唯一入站形态；内置渠道 2026-11-04 退役）
+   渠道 server 子进程 ──MCP(JSON-RPC/stdio)──→ mcp_channel_loop::run
+    （crates/abb-channel-{wechat,feishu,dingtalk}）        │
+                     ┌─────────────────────────────────────┘
                      ▼
-              去重 → 频道串行锁 → 排队
+          mcp_inbound_loop（订阅推 或 poll 兜底）
+                     ▼  ChannelMessage（契约 §3.3）
+          mcp_adapter::to_ev → 附件下载 → fill_quoted（引用回查）
+                     ▼
+          bridge.handle（virtualbot.rs）→ 去重 → 频道串行锁 → 排队
                      ▼
          runtime/pool.rs（按会话槽位选 agent）
                      ▼
@@ -48,10 +53,9 @@
                                                               （随包 = ki）
 
  ② 出站（agent 结果 → 渠道）
- 回合返回 → messenger.rs（`Messenger` trait，3 个实现）
-            ├─ FeishuMessenger  (260 行起)
-            ├─ WeixinMessenger  (439 行起)
-            └─ DingTalkMessenger(553 行起)
+ 回合返回 → messenger.rs（`Messenger` trait，**1 个生产实现**：McpChannelMessenger）
+            └─ 每个可选能力（附件/表情/建群/群资料…）按契约 §3.4 的
+               `tools/list` 动态判定，服务没声明就回落 trait 默认
          失败 → outbox.rs 落盘待补发（同一 chat 下次入站时 flush）
 
  ③ 主动投递（CLI / 定时任务 → 渠道）
@@ -111,16 +115,16 @@ $AGENT_BRIDGE_HOME 或 ~/.agent-bridge/        （main.rs:97 bridge_dir）
 |---|---|
 | `src/` 顶层 | 见下表 |
 | `src/runtime/`（从上游移植的会话层）**全目录 13727** | 主要 5 个：acp 4888 / harness 4332 / pool 2173 / queue 1536 / oneshot 571；其余 4 个小文件合计 227 |
-| `src/` 合计 | **119895** |
+| `src/` 合计 | **109853** |
 | `ui/app.slint` | 5964 |
-| GUI 三件合计（ui.rs + syschat.rs + 渲染台） | **26192** |
+| GUI 三件合计（ui.rs + syschat.rs + 渲染台） | **25903** |
 
-MCP 总线拆成七个文件（`mcp_bus` 627 契约与帧 / `mcp_client` 传输 / `mcp_channel` Messenger /
+MCP 总线拆成七个文件（`mcp_bus` 646 契约与帧 / `mcp_client` 传输 / `mcp_channel` Messenger /
 `mcp_inbound` 入站协议 / `mcp_inbound_loop` 驱动 / `mcp_adapter` 翻译 / `mcp_channel_loop` 事件循环）。
 加上 `crates/abb-channel-wechat/`（微信渠道的独立 server）后，渠道实现可以整块搬出主仓。
 
-最大的六个文件：`ui.rs` 12802、`syschat.rs` 7671、`ui_headless_render_test.rs` 5719、
-`task_run.rs` 4563、`platform.rs` 4096、`main.rs` 3457。
+最大的六个文件：`ui.rs` 12513、`syschat.rs` 7671、`ui_headless_render_test.rs` 5719、
+`task_run.rs` 4563、`platform.rs` 4096、`main.rs` 3372。
 
 > **重心在 GUI**：`ui.rs` + `syschat.rs` + 渲染台三件（见上表）比整个 `src/runtime/` 全目录还大。
 > 所以「ABB 是个桥」这个说法在代码量上不成立：它一半是桌面应用。

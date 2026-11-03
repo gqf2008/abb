@@ -444,16 +444,14 @@ pub fn builtin_templates() -> Vec<RoleTemplate> {
 /// 群资料内存缓存（#75）——「改群介绍即时生效」的载体：每次注入前查缓存，
 /// 缓存过期自然刷新（5 分钟 TTL），不做变更推送。
 ///
-/// 两个来源**分开记时**：
-/// - `event_names`：事件自带群名（飞书 message.chat_name / 钉钉 conversationTitle），
-///   每条群消息刷新——平台改群名，下一条消息注入的就是新名；
-/// - `api`：`Messenger::get_chat_info` 拉取的 (群名, 群介绍)，5 分钟过期。
+/// 唯一来源是 `api`：`Messenger::get_chat_info` 拉取的 (群名, 群介绍)，5 分钟过期。
 ///
-/// 分开的关键：事件名刷新**不能**顺带延长群介绍的有效期——否则活跃群里改了群介绍
-/// 永远不生效（TTL 被消息频率不断续期），「改群介绍=改角色，即时生效」就名存实亡。
+/// 原设计的第二个来源 `event_names`（事件自带群名，飞书 `message.chat_name` /
+/// 钉钉 `conversationTitle`，每条群消息刷新、且刷新**不得**延长群介绍有效期）
+/// 随内置渠道退役一并删除（2026-11-04）：写入它的 `note_event_name` 唯一调用点是
+/// 已删的渠道事件处理器，留着就只剩「永远为空、却仍被 `get` 优先读取」的死分支。
 pub struct ChatInfoCache {
     api: Mutex<HashMap<String, (String, String, Instant)>>,
-    event_names: Mutex<HashMap<String, (String, Instant)>>,
     ttl: Duration,
 }
 
@@ -469,69 +467,34 @@ impl ChatInfoCache {
     fn with_ttl(ttl: Duration) -> ChatInfoCache {
         ChatInfoCache {
             api: Mutex::new(HashMap::new()),
-            event_names: Mutex::new(HashMap::new()),
             ttl,
         }
     }
 
-    /// 事件自带群名入库（on_payload / on_dingtalk 每条群消息调一次；空名忽略）。
-    pub fn note_event_name(&self, chat_id: &str, name: &str) {
-        if name.is_empty() {
-            return;
-        }
-        self.event_names
-            .lock()
-            .unwrap()
-            .insert(chat_id.to_string(), (name.to_string(), Instant::now()));
-    }
-
-    /// 注入用取数：返回 (群名, 群介绍)。群名优先事件名（最新），回落 API 名；
-    /// 群介绍缓存过期/缺失时经 messenger 拉一次（best-effort，失败不阻塞）。
-    /// 两者都拿不到 → None（调用方跳过注入）。
+    /// 注入用取数：返回 (群名, 群介绍)。缓存命中直接用（重新计时靠 TTL，不靠读取）；
+    /// 过期/缺失时经 messenger 拉一次（best-effort，失败不阻塞）。
+    /// 拿不到 → None（调用方跳过注入）。
     pub async fn get(
         &self,
         chat_id: &str,
         msgr: &dyn crate::messenger::Messenger,
     ) -> Option<(String, String)> {
         let now = Instant::now();
-        let event_name: Option<String> = self
-            .event_names
-            .lock()
-            .unwrap()
-            .get(chat_id)
-            .filter(|(_, ts)| now.duration_since(*ts) <= self.ttl)
-            .map(|(n, _)| n.clone());
-        let api_entry = self
+        if let Some((n, d, _)) = self
             .api
             .lock()
             .unwrap()
             .get(chat_id)
             .filter(|(_, _, ts)| now.duration_since(*ts) <= self.ttl)
-            .cloned();
-        let (name, desc): (Option<String>, Option<String>) = match api_entry {
-            Some((n, d, _)) => (event_name.or(Some(n)), Some(d)),
-            None => match msgr.get_chat_info(chat_id).await {
-                Some((n, d)) => {
-                    // 拉取成功入库（重新计时）；事件名仍优先（可能比 API 更新）
-                    self.api
-                        .lock()
-                        .unwrap()
-                        .insert(chat_id.to_string(), (n.clone(), d.clone(), Instant::now()));
-                    (event_name.or(Some(n)), Some(d))
-                }
-                // 拉取失败：事件名还在 → 只有名；都不在 → None（跳过注入）
-                None => match event_name {
-                    Some(n) => (Some(n), None),
-                    None => (None, None),
-                },
-            },
-        };
-        match (name, desc) {
-            (Some(n), Some(d)) => Some((n, d)),
-            (Some(n), None) => Some((n, String::new())),
-            (None, Some(d)) => Some((String::new(), d)),
-            (None, None) => None,
+        {
+            return Some((n.clone(), d.clone()));
         }
+        let (n, d) = msgr.get_chat_info(chat_id).await?;
+        self.api
+            .lock()
+            .unwrap()
+            .insert(chat_id.to_string(), (n.clone(), d.clone(), Instant::now()));
+        Some((n, d))
     }
 }
 
@@ -756,26 +719,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_uses_event_name_over_api_and_caches_desc() {
-        let cache = ChatInfoCache::new();
-        let msgr = FakeMsgr::new(Some(("群旧名".to_string(), "介绍A".to_string())));
-        // 事件名更权威（可能比 API 新）
-        cache.note_event_name("oc_1", "后端开发");
-        let (name, desc) = cache.get("oc_1", &msgr).await.unwrap();
-        assert_eq!(name, "后端开发");
-        assert_eq!(desc, "介绍A");
-        // 第二次：缓存命中，不再拉 API
-        cache.get("oc_1", &msgr).await.unwrap();
-        assert_eq!(msgr.calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn cache_falls_back_to_api_name_without_event() {
+    async fn cache_fetches_api_once_then_serves_from_memory() {
         let cache = ChatInfoCache::new();
         let msgr = FakeMsgr::new(Some(("产品经理".to_string(), "介绍B".to_string())));
-        let (name, desc) = cache.get("oc_2", &msgr).await.unwrap();
+        let (name, desc) = cache.get("oc_1", &msgr).await.unwrap();
         assert_eq!(name, "产品经理");
         assert_eq!(desc, "介绍B");
+        // 第二次：缓存命中，不再拉 API
+        let (name2, desc2) = cache.get("oc_1", &msgr).await.unwrap();
+        assert_eq!((name2.as_str(), desc2.as_str()), ("产品经理", "介绍B"));
+        assert_eq!(msgr.calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -786,32 +739,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_returns_event_name_when_api_fails() {
-        let cache = ChatInfoCache::new();
-        let msgr = FakeMsgr::new(None);
-        cache.note_event_name("oc_4", "运营");
-        let (name, desc) = cache.get("oc_4", &msgr).await.unwrap();
-        assert_eq!(name, "运营");
-        assert_eq!(desc, "");
-    }
-
-    #[tokio::test]
-    async fn cache_refreshes_after_ttl_and_event_refresh_keeps_desc_fresh_check() {
-        // TTL 过期后：事件名刷新能续期自己，但群介绍必须重新拉——否则「改群介绍
-        // 即时生效」在活跃群里永不生效（这正是事件名与 API 分开记时的原因）。
+    async fn cache_refreshes_after_ttl_so_desc_edits_take_effect() {
+        // TTL 过期后必须重新拉——否则「改群介绍即时生效」在活跃群里永不生效。
         let cache = ChatInfoCache::with_ttl(Duration::from_millis(200));
         let msgr = FakeMsgr::new(Some(("后端开发".to_string(), "旧介绍".to_string())));
-        cache.note_event_name("oc_5", "后端开发");
         let (_, desc) = cache.get("oc_5", &msgr).await.unwrap();
         assert_eq!(desc, "旧介绍");
         assert_eq!(msgr.calls.load(Ordering::Relaxed), 1);
-        // 改平台群介绍（API 侧变化）……
+        // 改平台群介绍（API 侧变化），TTL 内仍读旧缓存
         *msgr.info.lock().unwrap() = Some(("后端开发".to_string(), "新介绍".to_string()));
-        // ……TTL 内事件名刷新（又来了一条群消息）→ 只续事件名
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        cache.note_event_name("oc_5", "后端开发");
-        // TTL 到期后再取：事件名与群介绍都过期 → 重新拉（拿到新介绍；事件名
-        // 仍优先，此处与 API 同名所以结果一致）
         tokio::time::sleep(Duration::from_millis(250)).await;
         let (name, desc) = cache.get("oc_5", &msgr).await.unwrap();
         assert_eq!(name, "后端开发");

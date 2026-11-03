@@ -22,7 +22,8 @@ impl Bridge {
         }
         // 归一化入队键：任务的 created_by.chat_id 可能是注入的 bot key / ABB 频道 UUID，
         // 直接入队会与补发侧的平台 receive_id 键错位（缺陷 abb-wx-outbox-flush-mismatch-20260917）。
-        // 入队与补发共用同一归一化函数，保证 store.take 命中。
+        // 入队键归一化：与（已随渠道退役的）补发侧共用同一函数，保证历史积压与
+        // 现存入队路径写出同一种 chat_key。
         let chat_id = crate::outbox::resolve_delivery_chat(&self.bot.key(), chat_id);
         if chat_id.is_empty() {
             return;
@@ -44,23 +45,9 @@ impl Bridge {
         );
     }
 
-    /// 微信入站刷新 context_token 后调用：把该 chat 的积压消息一次性补发。
-    /// 与 handle 共用 per-chat 串行锁，避免补发与消息处理交错；失败的项保留待下次入站再试。
-    pub async fn flush_outbox(&self, chat_id: &str) {
-        if !self.bot.is_wechat() {
-            return;
-        }
-        // 与入队侧共用归一化：入站 from_user_id（平台 id）幂等；若拿到的是 bot key /
-        // 频道 UUID 也归一到平台 receive_id，杜绝「入队键 ≠ 补发键」的黑洞。
-        let chat_id = crate::outbox::resolve_delivery_chat(&self.bot.key(), chat_id);
-        if chat_id.is_empty() {
-            return;
-        }
-        let lock = self.chat_lock(&chat_id);
-        let _guard = lock.lock().await;
-        crate::outbox::flush_pending(self.msgr.as_ref(), &self.outbox, &chat_id).await;
-    }
-
+    // 群聊 @ 判定：入站事件解析随内置渠道退役（MCP 契约暂无「是否被 @」字段）。
+    // 缺口已记入 docs/channel-retirement-plan.md。
+    #[allow(dead_code)]
     /// 群消息 mentions 里是否 @了本机器人（name/app_id/open_id 三重冗余）。
     pub(super) fn bot_is_mentioned(&self, mentions: &[serde_json::Value]) -> bool {
         for m in mentions {

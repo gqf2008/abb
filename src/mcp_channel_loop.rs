@@ -148,7 +148,12 @@ impl InboundSink for BridgeSink {
         // 顺序与内置渠道一致（`bridge/mod.rs` 的飞书路径也是先下载再建 Ev）：
         // 下载失败**不丢消息**——`download_attachment` 返回的 meta 自带 `note`，
         // agent 会如实告诉用户「附件拿不到」。
-        let ev = download_attachments(self.bridge.msgr.as_ref(), &self.bridge.bot.key(), ev).await;
+        let mut ev =
+            download_attachments(self.bridge.msgr.as_ref(), &self.bridge.bot.key(), ev).await;
+        // 引用/回复：渠道只给 `parent_id`，内容由 ABB 回查（渠道无关）。
+        // 放在 `handle` 之前、本条附件下载之后：`fill_quoted` 内部也下载引用附件，
+        // 它用 `100 + i` 的 seq 段，与本条消息的 `0..n` 不冲突。
+        self.bridge.fill_quoted(&mut ev, &msg.parent_id).await;
         self.bridge.handle(ev).await;
         Ok(())
     }
@@ -711,6 +716,7 @@ mod tests {
             text: "hi".into(),
             ts: 1,
             attachments: vec![],
+            parent_id: String::new(),
         }
     }
 

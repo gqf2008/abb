@@ -859,19 +859,9 @@ mod tests {
             "缺工具应返回 None"
         );
         assert!(
-            m.download_attachment(
-                "k",
-                "mid",
-                0,
-                &crate::attachments::AttachmentDesc::Feishu {
-                    message_id: "mid".into(),
-                    file_key: "fk".into(),
-                    kind: "image".into(),
-                    file_name: "a.png".into(),
-                }
-            )
-            .await
-            .is_none(),
+            m.download_attachment("k", "mid", 0, &crate::attachments::AttachmentDesc::Mcp)
+                .await
+                .is_none(),
             "缺工具应返回 None"
         );
         // create_chat 的默认是 **Err**（不是 None）——它要告诉调用方「只能手动建群」。
@@ -911,17 +901,7 @@ mod tests {
         assert_eq!(q.msg_type, "text");
 
         let a = m
-            .download_attachment(
-                "k",
-                "mid",
-                0,
-                &crate::attachments::AttachmentDesc::Feishu {
-                    message_id: "mid".into(),
-                    file_key: "fk".into(),
-                    kind: "image".into(),
-                    file_name: "a.png".into(),
-                },
-            )
+            .download_attachment("k", "mid", 0, &crate::attachments::AttachmentDesc::Mcp)
             .await
             .expect("应当拿到附件元数据");
         assert_eq!(a.path, "/tmp/a.png");

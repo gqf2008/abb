@@ -52,6 +52,9 @@ pub const TOOL_SEND_ATTACHMENT: &str = "send_attachment";
 // **顺序即优先级**：A 档（用户可感知）在前，B 档（平台细节）在后。
 // 分档的判据是「丢了用户会不会发现」，不是实现难度。
 
+// 注意：ABB 侧暂时没有调用方（GUI 直接显示配置里的名字），但**契约必须有**——
+// 删掉它会让 `mcp_channel` 里对应实现变成孤儿，且渠道 server 声明了也没处对账
+// （`tools/check_channel_tool_names.sh` 会报「契约里没有的工具名」）。
 /// A：取一条被引用消息的内容（引用/回复进 prompt 用）。
 ///
 /// 缺它 ⇒ 引用消息只剩 `message_id`，agent 看不到上文。
@@ -65,8 +68,15 @@ pub const TOOL_DOWNLOAD_ATTACHMENT: &str = "download_attachment";
 /// 缺它 ⇒ 建群只能手动，聊天侧回落登记制指引。
 pub const TOOL_CREATE_CHAT: &str = "create_chat";
 /// A：反查用户展示名（授权记录里显示人名而不是一串 id）。
+#[allow(dead_code)] // 契约常量：见上方说明（渠道 server 侧在用，ABB 主仓暂无调用方）
 pub const TOOL_USER_DISPLAY_NAME: &str = "user_display_name";
 
+// 注意：ABB 侧暂时没有调用方（钉钉群聊 @ 由 server 处理），但**契约必须有**——
+// 删掉它会让 `mcp_channel` 里对应实现变成孤儿，且渠道 server 声明了也没处对账
+// （`tools/check_channel_tool_names.sh` 会报「契约里没有的工具名」）。
+// 注意：ABB 侧暂时没有调用方（微信的 context_token 现由 server 内部维护），但**契约必须有**——
+// 删掉它会让 `mcp_channel` 里对应实现变成孤儿，且渠道 server 声明了也没处对账
+// （`tools/check_channel_tool_names.sh` 会报「契约里没有的工具名」）。
 /// B：处理中表情（打字机效果）。返回 reaction id 供 `del_typing`/`done` 用。
 pub const TOOL_TYPING: &str = "typing";
 /// B：撤销处理中表情。
@@ -76,8 +86,10 @@ pub const TOOL_DONE: &str = "done";
 /// B：记下会话的回复上下文（微信 `context_token` 用）。
 ///
 /// **无返回**——它是状态同步，不是查询。
+#[allow(dead_code)] // 契约常量：见上方说明（渠道 server 侧在用，ABB 主仓暂无调用方）
 pub const TOOL_NOTE_CONTEXT: &str = "note_context";
 /// B：记下会话最近的发送者（钉钉群聊回复时 @ 对方）。
+#[allow(dead_code)] // 契约常量：见上方说明（渠道 server 侧在用，ABB 主仓暂无调用方）
 pub const TOOL_NOTE_SENDER: &str = "note_sender";
 /// B：会话类型 + 会话名（历史回填用）。
 pub const TOOL_CHAT_BRIEF: &str = "chat_brief";
@@ -110,6 +122,13 @@ pub struct ChannelMessage {
     pub ts: i64,
     #[serde(default)]
     pub attachments: Vec<ChannelAttachment>,
+    /// 被引用（回复）的消息 id；空 = 不是引用消息。
+    ///
+    /// 渠道把它自己平台的 `parent_id` 填这里，ABB 侧再按 id 回查内容
+    /// （`Bridge::fill_quoted`）。**不要求渠道自己给出被引用内容**——那会让
+    /// 每个渠道各写一份解析，且附件还要走 `download_attachment`。
+    #[serde(default)]
+    pub parent_id: String,
 }
 
 /// 入站附件（只留定位信息，下载仍由渠道侧负责——ABB 不碰各渠道的文件 API）。
