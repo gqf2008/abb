@@ -8,8 +8,23 @@
 //! | 方向 | 契约 | 本进程的实现 |
 //! |---|---|---|
 //! | 出站 | 工具 `send_text`（必需）/ `send_thread_reply`（可选） | 微信无话题概念 ⇒ 只实现 `send_text` |
+//! | 出站附件 | `send_attachment`（可选） | 已实现（`send_media`：图片/文件/视频，base64 内联） |
+//! | 入站附件 | `download_attachment`（可选，`{message_id, seq}`） | 已实现（CDN AES 解密后落盘；入站时缓存媒体句柄） |
+//! | 回复上下文 | `note_context`（可选） | 已实现（写进 `send_text` 用的同一份 `contexts`） |
 //! | 入站 | `poll`（兜底）或 `channel://` 资源订阅 | 本进程用 `poll`：微信 `get_updates` 天然是游标长轮询 |
 //! | 登录 | —— | 工具 `login`（二维码写到 `--dir`，路径打 stderr） |
+//!
+//! ## 可选能力里**明确不声明**的那些（微信做不到，声明了就是骗 ABB）
+//!
+//! | 工具 | 为什么不声明 |
+//! |---|---|
+//! | `typing` / `del_typing` / `done` | ilink 协议没有表情/reaction API |
+//! | `create_chat` | 没有建群 API（单聊只有会话对象，无群实体） |
+//! | `chat_brief` / `get_chat_info` | 微信侧没有群概念，也没有会话资料查询 |
+//! | `user_display_name` | 没有联系人/资料 API，入站消息只带 `from_user_id`（没有人名） |
+//! | `note_sender` | 单聊里 `sender_id == chat_id`，没有「另一个发送者」可记 |
+//! | `get_quoted_message` | ilink 的 `ref_msg` **不带原消息 id**，也没有消息库 API ⇒ 按 id 反查不可能；
+//!   被引用内容只随入站那一帧内联到达（见 `weixin::WeixinMessage::quoted_text`） |
 //!
 //! ## 三个必须做对的地方
 //!
@@ -25,17 +40,62 @@ mod weixin;
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
-use weixin::{WeixinClient, WeixinMessage};
+use weixin::{WechatMedia, WeixinClient, WeixinMessage};
+
+/// 入站媒体缓存：`message_id → 该消息的媒体列表`（**列表下标就是 `download_attachment` 的 `seq`**）。
+///
+/// 为什么必须在进程内缓存：ilink **没有消息库/历史 API**，一条消息的
+/// `encrypt_query_param` + `aes_key` 只随入站那一帧来一次；不在那时记下来，
+/// 之后谁也拿不到（契约里 `download_attachment` 只传 `{message_id, seq}`）。
+#[derive(Default)]
+struct MediaCache {
+    /// 旧 → 新。超过 [`MAX_CACHED_MESSAGES`] 从最旧的丢。
+    entries: Vec<(String, Vec<WechatMedia>)>,
+}
+
+/// 缓存多少条消息：ABB 的入站循环「拉到就处理」，几十条够用；
+/// 无上限会让长跑进程随消息量线性吃内存。
+const MAX_CACHED_MESSAGES: usize = 64;
+
+impl MediaCache {
+    /// 记下一条消息的媒体。同 `message_id` 覆盖（并把位置移到队尾 = 最新）。
+    ///
+    /// 空列表直接返回：没媒体的消息不该占缓存位（否则几条纯文本就能把带图的那条挤掉）。
+    fn put(&mut self, message_id: &str, items: Vec<WechatMedia>) {
+        if items.is_empty() {
+            return;
+        }
+        self.entries.retain(|(id, _)| id != message_id);
+        self.entries.push((message_id.to_string(), items));
+        while self.entries.len() > MAX_CACHED_MESSAGES {
+            self.entries.remove(0);
+        }
+    }
+
+    fn get(&self, message_id: &str) -> Option<&Vec<WechatMedia>> {
+        self.entries
+            .iter()
+            .find(|(id, _)| id == message_id)
+            .map(|(_, v)| v)
+    }
+}
+
+/// 附件落盘目录（相对 `--dir`）。
+const ATTACHMENTS_DIR: &str = "attachments";
+/// 单个附件落盘上限，与 ABB `attachments::MAX_ATTACHMENT_BYTES` 同口径。
+const MAX_ATTACHMENT_BYTES: usize = 200 * 1024 * 1024;
 
 /// 渠道进程的共享状态。
 struct Channel {
     client: WeixinClient,
     /// `chat_id → context_token`。微信发消息要它，契约里没有 ⇒ 本进程记。
     contexts: Mutex<HashMap<String, String>>,
+    /// 入站媒体句柄（`download_attachment` 的查找表）。
+    media: Mutex<MediaCache>,
     /// 长轮询游标（`get_updates_buf`）。**只在成功后推进**。
     cursor: Mutex<String>,
     /// 扫码得到的 `wx_user_id`（= ABB 侧的 owner 标识；`chat_id` 就是它）。
@@ -71,6 +131,7 @@ fn main() {
     let ch = Arc::new(Channel {
         client,
         contexts: Mutex::new(HashMap::new()),
+        media: Mutex::new(MediaCache::default()),
         cursor: Mutex::new(String::new()),
         user_id: Mutex::new(user_id),
         dir,
@@ -194,6 +255,32 @@ fn tools() -> Value {
                     "data_b64": {"type": "string", "description": "文件内容的 base64"}
                 },
                 "required": ["chat_id", "name", "data_b64"]
+            }
+        },
+        {
+            "name": "download_attachment",
+            "description": "下载入站附件（微信 CDN 加密媒体在这里解密后落盘，返回本地路径）。\
+                            message_id 必须是本进程 poll 过的消息；seq 是该消息附件列表的下标",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string", "description": "入站消息 id（poll 结果里的 message_id）"},
+                    "seq": {"type": "integer", "description": "第几个附件，从 0 开始"}
+                },
+                "required": ["message_id", "seq"]
+            }
+        },
+        {
+            "name": "note_context",
+            "description": "显式记下会话的 context_token（与 poll 自动记的是同一份）。\
+                            crate 重启后 ABB 可用它把 token 补回来，不用等对方先说话",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string", "description": "会话键（微信 = user id）"},
+                    "context_token": {"type": "string"}
+                },
+                "required": ["chat_id", "context_token"]
             }
         },
         {
@@ -326,6 +413,80 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 .map_err(|e| format!("send_attachment 失败：{e}"))?;
             Ok(json!({"content": [{"type": "text", "text": "ok"}]}))
         }
+        "download_attachment" => {
+            let mid = a.get("message_id").and_then(|v| v.as_str()).unwrap_or("");
+            if mid.is_empty() {
+                return Err("download_attachment 缺 message_id".into());
+            }
+            // `seq` 不给默认值：默认 0 会让调用方“猜错附件”时静默拿到另一个文件。
+            let seq = a
+                .get("seq")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| "download_attachment 缺 seq（整数，从 0 开始）".to_string())?
+                as usize;
+            let media = ch
+                .media
+                .lock()
+                .map_err(|_| "media 缓存锁中毒".to_string())?
+                .get(mid)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "message_id={mid} 不在媒体缓存里：只缓存本进程 poll 见过的最近 \
+                         {MAX_CACHED_MESSAGES} 条带附件消息（ilink 没有历史消息 API，\
+                         进程重启前的附件已无法下载）"
+                    )
+                })?;
+            let item = media.get(seq).cloned().ok_or_else(|| {
+                format!(
+                    "seq={seq} 越界：message_id={mid} 只有 {} 个附件",
+                    media.len()
+                )
+            })?;
+            let rt = rt();
+            let got = rt
+                .block_on(ch.client.download_media(&item))
+                .map_err(|e| format!("download_attachment 失败：{e}"))?;
+            let Some((bytes, mime, file_name, note)) = got else {
+                return Err(format!(
+                    "message_id={mid} seq={seq} 没有可下载地址（无 full_url / encrypt_query_param）"
+                ));
+            };
+            let mut meta =
+                save_attachment(&ch.dir, mid, seq, &item.kind, &file_name, &mime, &bytes)?;
+            if !note.is_empty() {
+                meta["note"] = json!(note);
+            }
+            Ok(json!({"content": [{"type": "text", "text": meta.to_string()}]}))
+        }
+        "note_context" => {
+            let chat_id = a.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+            let token = a
+                .get("context_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // 两个都非空才记：空 token 入表等于把“能发”变成“发不出去”。
+            if chat_id.is_empty() {
+                return Err("note_context 缺 chat_id".into());
+            }
+            if token.is_empty() {
+                return Err("note_context 缺 context_token".into());
+            }
+            let chats = {
+                let mut m = ch
+                    .contexts
+                    .lock()
+                    .map_err(|_| "contexts 锁中毒".to_string())?;
+                m.insert(chat_id.to_string(), token.to_string());
+                m.len()
+            };
+            Ok(json!({"content": [{"type": "text", "text": json!({
+                "chat_id": chat_id,
+                "stored": true,
+                "chats": chats,
+            })
+            .to_string()}]}))
+        }
         "poll" => {
             let limit = a.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
             let cursor = a
@@ -414,6 +575,100 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
     }
 }
 
+/// 把下载到的字节落盘，返回给 ABB 的附件元数据。
+///
+/// 文件名 `<mid>_<seq><ext>`：与 ABB `attachments::save_attachment_in` 同构
+/// （mid 安全化、扩展名从原文件名/mime 推）。目录是 `<--dir>/attachments/`。
+fn save_attachment(
+    dir: &Path,
+    mid: &str,
+    seq: usize,
+    kind: &str,
+    file_name: &str,
+    mime: &str,
+    bytes: &[u8],
+) -> Result<Value, String> {
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "附件太大（{}MB，上限 {}MB），拒绝落盘",
+            bytes.len() / 1024 / 1024,
+            MAX_ATTACHMENT_BYTES / 1024 / 1024
+        ));
+    }
+    let d = dir.join(ATTACHMENTS_DIR);
+    std::fs::create_dir_all(&d).map_err(|e| format!("创建附件目录失败（{}）：{e}", d.display()))?;
+    let name = format!(
+        "{}_{}{}",
+        sanitize_mid(mid),
+        seq,
+        ext_from(file_name, mime, kind)
+    );
+    let path = d.join(&name);
+    std::fs::write(&path, bytes).map_err(|e| format!("写附件失败（{}）：{e}", path.display()))?;
+    Ok(json!({
+        "kind": kind,
+        // 微信的图片/语音不带文件名（`file_name` 空）⇒ 用落盘名兵底，
+        // 否则 ABB 的 `AttachmentMeta.file_name` 会是空串，agent 无法引用它。
+        "file_name": if file_name.is_empty() { name.clone() } else { file_name.to_string() },
+        "mime": mime,
+        "size": bytes.len(),
+        "path": path.display().to_string(),
+        "note": "",
+    }))
+}
+
+/// 把消息 id 变成安全的文件名片段（防路径穿越、防过长）。
+///
+/// 只留 ASCII alnum 与 `-` `_`；其余（含 `/` `.`）一律 `_`。
+fn sanitize_mid(mid: &str) -> String {
+    let mut out = String::new();
+    for c in mid.chars().take(64) {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+/// 推扩展名：先用原文件名的后缀，没有就按 kind/mime 推。
+///
+/// 无扩展名时返回空串（**不编造**）：ABB 靠 mime 也能把文件交给 agent。
+fn ext_from(file_name: &str, mime: &str, kind: &str) -> String {
+    if let Some(ext) = file_name.rsplit_once('.').map(|(_, e)| e) {
+        let ok =
+            !ext.is_empty() && ext.len() <= 10 && ext.chars().all(|c| c.is_ascii_alphanumeric());
+        if ok {
+            return format!(".{}", ext.to_ascii_lowercase());
+        }
+    }
+    let e = match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "application/pdf" => "pdf",
+        "audio/mpeg" => "mp3",
+        "video/mp4" => "mp4",
+        "text/plain" => "txt",
+        _ => match kind {
+            "image" => "img",
+            "audio" | "voice" => "audio",
+            "video" => "video",
+            _ => "",
+        },
+    };
+    if e.is_empty() {
+        String::new()
+    } else {
+        format!(".{e}")
+    }
+}
+
 /// 微信消息 → 契约 §3.3 的 `ChannelMessage`。
 ///
 /// **顺手把 `context_token` 记下来**——这是原 ABB `note_context` 的归宿。
@@ -432,6 +687,28 @@ fn to_channel_message(ch: &Arc<Channel>, m: &WeixinMessage) -> Option<Value> {
             c.insert(from.to_string(), m.context_token.clone());
         }
     }
+    // 媒体句柄先缓下来：`encrypt_query_param` / `aes_key` 只随这一帧来一次，
+    // 丢了就再也拿不到（`download_attachment` 只给 `{message_id, seq}`）。
+    let media = m.media_items();
+    if !media.is_empty() {
+        if let Ok(mut c) = ch.media.lock() {
+            c.put(&m.message_id, media.clone());
+        }
+    }
+    // 附件列表只报**本条消息自带**的媒体（引用消息里的媒体是另一回事，
+    // 契约的 `ChannelMessage` 没有引用字段）。顺序 = 缓存顺序 = `seq`。
+    let attachments: Vec<Value> = media
+        .iter()
+        .map(|wm| {
+            json!({
+                "kind": wm.kind,
+                "name": wm.file_name,
+                // 位置留空是有意的：微信媒体是**加密 CDN 引用**，ABB 拿到 URL
+                // 也读不出内容（没有 aes_key）。真正下载走 `download_attachment`。
+                "url_or_path": "",
+            })
+        })
+        .collect();
     let text = m.text();
     Some(json!({
         "chat_id": from,
@@ -440,7 +717,7 @@ fn to_channel_message(ch: &Arc<Channel>, m: &WeixinMessage) -> Option<Value> {
         "sender_name": "",
         "text": text,
         "ts": if m.create_time_ms > 0 { m.create_time_ms / 1000 } else { 0 },
-        "attachments": [],
+        "attachments": attachments,
     }))
 }
 
@@ -462,6 +739,7 @@ mod tests {
         Arc::new(Channel {
             client: WeixinClient::new("http://127.0.0.1:1", "t", "http://127.0.0.1:1"),
             contexts: Mutex::new(HashMap::new()),
+            media: Mutex::new(MediaCache::default()),
             cursor: Mutex::new(String::new()),
             user_id: Mutex::new("me".into()),
             dir: PathBuf::from("."),
@@ -486,6 +764,9 @@ mod tests {
                 "send_text",
                 "poll",
                 "send_attachment",
+                // 下面两个是契约 §3.4 的可选能力里**微信真能做**的那两个。
+                "download_attachment",
+                "note_context",
                 "login",
                 "login_status"
             ]
@@ -494,6 +775,229 @@ mod tests {
             !names.contains(&"send_thread_reply".to_string()),
             "微信无话题概念，不该声明它（否则 ABB 不回落 send_text）"
         );
+    }
+
+    /// **做不了的可选能力一个都不许声明**（声明了 ABB 就会去调，然后失败）。
+    ///
+    /// 这条是反向断言，和上面的精确列表互补：精确列表防「误增」，本条防
+    /// 「为了让能力清单好看而凑数」——两种毛病都会被 ABB 当真。
+    #[test]
+    fn unsupported_optional_tools_are_not_declared() {
+        let names: Vec<String> = tools()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        // 逐条带原因，不只断言不包含：后人加回去时会先看到原因。
+        for (tool, why) in [
+            (
+                "get_quoted_message",
+                "ilink 的 ref_msg 不带原消息 id，也没有消息库 API",
+            ),
+            ("create_chat", "微信无建群 API"),
+            (
+                "user_display_name",
+                "没有联系人/资料 API，入站只带 from_user_id",
+            ),
+            ("typing", "没有表情/reaction API"),
+            ("del_typing", "没有表情/reaction API"),
+            ("done", "没有表情/reaction API"),
+            (
+                "note_sender",
+                "单聊里 sender_id == chat_id，无另一个发送者可记",
+            ),
+            ("chat_brief", "微信无群概念，也没有会话资料查询"),
+            ("get_chat_info", "微信无群概念，也没有群资料查询"),
+        ] {
+            assert!(
+                !names.contains(&tool.to_string()),
+                "不该声明 `{tool}`：{why}（声明了 ABB 会去调）"
+            );
+        }
+    }
+
+    /// 媒体缓存容量上限真的生效（否则长跑进程随消息量线性吃内存）。
+    #[test]
+    fn media_cache_is_bounded_and_keeps_newest() {
+        let mut c = MediaCache::default();
+        for i in 0..(MAX_CACHED_MESSAGES + 10) {
+            c.put(&format!("m{i}"), vec![sample_media("image")]);
+        }
+        assert_eq!(c.entries.len(), MAX_CACHED_MESSAGES, "缓存必须封顶");
+        let newest = format!("m{}", MAX_CACHED_MESSAGES + 9);
+        assert!(c.get(&newest).is_some(), "最新的必须还在");
+        assert!(c.get("m0").is_none(), "最旧的必须被挤掉");
+    }
+
+    /// 同一条消息重复入站（重拉/重试）不得在缓存里出现两份，且不占两个位置。
+    #[test]
+    fn media_cache_overwrites_same_message() {
+        let mut c = MediaCache::default();
+        c.put("m1", vec![sample_media("image")]);
+        c.put("m1", vec![sample_media("image"), sample_media("file")]);
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.get("m1").unwrap().len(), 2);
+    }
+
+    /// 没媒体的消息不占缓存位（否则几条纯文本就能把带图的那条挤掉）。
+    #[test]
+    fn media_cache_ignores_messages_without_media() {
+        let mut c = MediaCache::default();
+        c.put("m1", vec![]);
+        assert!(c.entries.is_empty());
+    }
+
+    fn sample_media(kind: &str) -> WechatMedia {
+        WechatMedia {
+            kind: kind.into(),
+            file_name: if kind == "file" {
+                "报告.pdf".into()
+            } else {
+                String::new()
+            },
+            encrypt_query_param: "qp".into(),
+            aes_key: String::new(),
+            aeskey_hex: String::new(),
+            full_url: "https://cdn.example/x".into(),
+            voice_text: String::new(),
+        }
+    }
+
+    /// 入站媒体必须**既进缓存又进 attachments**，且两处顺序一致（`seq` 就是这个下标）。
+    #[test]
+    fn incoming_media_is_cached_and_listed() {
+        let ch = fake_channel();
+        let m: WeixinMessage = serde_json::from_value(json!({
+            "from_user_id": "user-a",
+            "message_id": "9001",
+            "message_type": 1,
+            "item_list": [
+                {"type": 2, "image_item": {"media": {"encrypt_query_param": "qp1"}}},
+                {"type": 4, "file_item": {"file_name": "a.pdf", "media": {"encrypt_query_param": "qp2", "aes_key": "k"}}}
+            ]
+        }))
+        .unwrap();
+        let cm = to_channel_message(&ch, &m).expect("应当转出一条");
+        assert_eq!(cm["attachments"].as_array().unwrap().len(), 2);
+        assert_eq!(cm["attachments"][0]["kind"], "image");
+        assert_eq!(cm["attachments"][1]["name"], "a.pdf");
+        // 位置留空：ABB 拿到加密 URL 也读不出内容，下载必须走工具
+        assert_eq!(cm["attachments"][0]["url_or_path"], "");
+        let cached = ch.media.lock().unwrap();
+        let items = cached
+            .get("9001")
+            .expect("媒体句柄必须被缓存（丢掉就再也拿不到）");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].encrypt_query_param, "qp1");
+    }
+
+    /// 未知 `message_id` ⇒ 明确报错（不是回空串/假路径）。
+    #[test]
+    fn download_unknown_message_errors() {
+        let e = call_tool(
+            &fake_channel(),
+            &json!({"name":"download_attachment","arguments":{"message_id":"nope","seq":0}}),
+        )
+        .unwrap_err();
+        assert!(e.contains("媒体缓存"), "报因要说清缓存里没有：{e}");
+    }
+
+    /// `seq` 越界 ⇒ 报错并带上真实附件数（否则调用方无从判断是自己算错还是渠道丢件）。
+    #[test]
+    fn download_seq_out_of_range_errors() {
+        let ch = fake_channel();
+        ch.media
+            .lock()
+            .unwrap()
+            .put("m1", vec![sample_media("image")]);
+        let e = call_tool(
+            &ch,
+            &json!({"name":"download_attachment","arguments":{"message_id":"m1","seq":3}}),
+        )
+        .unwrap_err();
+        assert!(e.contains("越界"), "要指名是越界：{e}");
+        assert!(e.contains('1'), "要带上实际附件数：{e}");
+    }
+
+    /// 缺 `seq` ⇒ 报错（默认 0 会让调用方“猜错附件”时静默拿到另一个文件）。
+    #[test]
+    fn download_missing_seq_errors() {
+        let e = call_tool(
+            &fake_channel(),
+            &json!({"name":"download_attachment","arguments":{"message_id":"m1"}}),
+        )
+        .unwrap_err();
+        assert!(e.contains("seq"), "报因要点名缺哪个字段：{e}");
+    }
+
+    /// 落盘的路径、大小、文件名都要对；图片无文件名时用落盘名兵底（不能是空串）。
+    #[test]
+    fn save_attachment_writes_bytes_and_reports_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "abb-wx-attach-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let meta = save_attachment(&dir, "9001/../x", 2, "image", "", "image/png", b"hello")
+            .expect("应当落盘");
+        let path = std::path::PathBuf::from(meta["path"].as_str().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert_eq!(meta["size"], 5);
+        assert_eq!(meta["kind"], "image");
+        assert_eq!(
+            meta["file_name"], "9001____x_2.png",
+            "无原文件名时用落盘名兵底"
+        );
+        assert!(
+            path.starts_with(dir.join("attachments")),
+            "必须落在 <dir>/attachments 下：{}",
+            path.display()
+        );
+        assert!(
+            !meta["file_name"].as_str().unwrap().contains('/'),
+            "文件名里不得残留路径分隔符"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `note_context` 写的是 `send_text` 用的**同一份** map（否则记了也没用）。
+    #[test]
+    fn note_context_feeds_send_text() {
+        let ch = fake_channel();
+        let r = call_tool(
+            &ch,
+            &json!({"name":"note_context","arguments":{
+                "chat_id":"user-a","context_token":"ctx-9"}}),
+        )
+        .expect("应当成功");
+        assert!(r["content"][0]["text"].as_str().unwrap().contains("stored"));
+        assert_eq!(
+            ch.contexts.lock().unwrap().get("user-a"),
+            Some(&"ctx-9".to_string())
+        );
+    }
+
+    /// 空 `chat_id` / 空 token ⇒ 报错：空 token 入表等于把“能发”变成“发不出去”。
+    #[test]
+    fn note_context_rejects_empty_fields() {
+        let ch = fake_channel();
+        let e = call_tool(
+            &ch,
+            &json!({"name":"note_context","arguments":{"chat_id":"u","context_token":""}}),
+        )
+        .unwrap_err();
+        assert!(e.contains("context_token"), "报因要点名缺哪个字段：{e}");
+        let e = call_tool(
+            &ch,
+            &json!({"name":"note_context","arguments":{"chat_id":"","context_token":"t"}}),
+        )
+        .unwrap_err();
+        assert!(e.contains("chat_id"), "报因要点名缺哪个字段：{e}");
+        assert!(ch.contexts.lock().unwrap().is_empty(), "失败不得写进去");
     }
 
     /// resources/list 必须是空数组（不是 null）：ABB 的 `capabilities_from`

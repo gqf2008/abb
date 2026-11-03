@@ -11,14 +11,16 @@
 //!
 //! ## 关于 `allow(dead_code)`
 //!
-//! 搬过来的 1144 行里，**媒体收发**（`send_media` / `upload_media` /
-//! `download_media` / `WechatMedia` / `OutboundMediaKind` 等）本批还没接进 MCP 契约
-//! ——契约的 `send_text` 只发文本。这些代码**能用且要留**，只是暂时没有调用方。
+//! ## 关于 `dead_code`
 //!
-//! 所以这里是模块级 `allow`，但**解除条件明确**：W3 把媒体做成
-//! `send_attachment` + 入站附件下载之后就移除。这与本仓「先关警告」的禁令不冲突
-//! ——区别在于它写清了还剩哪一步，而不是"反正先让它绿"。
-#![allow(dead_code)]
+//! 搬过来时整个模块挂着 `#![allow(dead_code)]`，解除条件是「媒体收发接进契约」——
+//! 那一步已经做完了（`send_attachment` + `download_attachment`），所以模块级 allow **已移除**。
+//!
+//! 只剩引用（quote/reply）三个提取函数仍无调用方：`ref_msg` 的内容只随入站那一帧
+//! 内联到达，而契约 §3.3 的 `ChannelMessage` **没有引用字段**，`get_quoted_message`
+//! 那种「按 id 反查」在 ilink 上也不成立（`ref_msg` 不带原消息 id）。
+//! 所以它们只能等着契约长出引用字段——那时**移除这两个 `allow` 就是接线**，
+//! 不是「先关警告」：它们各自都写清了还剩哪一步。
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -427,6 +429,10 @@ impl WeixinMessage {
     /// 提取被引用消息的媒体附件（图片/文件/音视频；引用/回复场景）。
     /// ref_msg.message_item 与入站 item 同构，复用 media() 提取 CDN 引用，
     /// 由桥下载成附件元数据进 prompt。
+    ///
+    /// `dead_code`：契约的 `ChannelMessage` 没有引用字段 ⇒ 当前没有调用方
+    /// （见模块头「关于 `dead_code`」）。
+    #[allow(dead_code)]
     pub fn quoted_media(&self) -> Vec<WechatMedia> {
         self.item_list
             .iter()
@@ -439,6 +445,9 @@ impl WeixinMessage {
     /// 提取被引用消息的文本（引用/回复场景）。协议里 ref_msg 带 title 摘要 +
     /// message_item 原内容（原内容可为文本/媒体/再嵌套引用）；这里拼成
     /// `摘要 | 原文本`，供 agent 读到「上面被引用的消息内容」。
+    ///
+    /// `dead_code`：同 [`Self::quoted_media`]——等契约长出引用字段就接线。
+    #[allow(dead_code)]
     pub fn quoted_text(&self) -> String {
         for it in &self.item_list {
             if let Some(ref_msg) = &it.ref_msg {
@@ -467,6 +476,7 @@ impl WeixinMessage {
 }
 
 /// 递归提取某条 MessageItem 自身携带的引用文本（ref_msg.message_item 可能再嵌套）。
+#[allow(dead_code)] // 只被 `quoted_text` 调用，理由同它
 fn quoted_text_of_item(item: &MessageItem) -> Option<String> {
     let ref_msg = item.ref_msg.as_ref()?;
     let mut parts: Vec<String> = Vec::new();

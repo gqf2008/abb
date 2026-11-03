@@ -91,6 +91,103 @@ fn satisfies_channel_contract() {
     );
 }
 
+/// **工具列表精确等于实测清单**。
+///
+/// 为什么不能只写 `contains`：契约 §3.4 的可选能力是开放集合，每多声明一个
+/// ABB 就会真去调它——微信做不了的能力一旦混进来，用户看到的是「调用无提示地失败」。
+/// 这条断言把「声明了什么」钉在代码里，改工具面必须同时改这里（= 一次有意识的决定）。
+#[test]
+fn tool_list_is_exactly_the_implemented_set() {
+    let got = roundtrip(&[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#]);
+    let names: Vec<&str> = got[0]["result"]["tools"]
+        .as_array()
+        .expect("tools 数组")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            // 契约必需 / 入站 / 出站附件
+            "send_text",
+            "poll",
+            "send_attachment",
+            // 契约 §3.4 里微信真能做的两个
+            "download_attachment",
+            "note_context",
+            // 扫码登录（本渠道专有）
+            "login",
+            "login_status",
+        ],
+        "工具面变了：新增/删除必须是刻意决定，并同步 README、main.rs 的单测"
+    );
+}
+
+/// 可选能力里微信做不到的那些**一个都不许出现**（声明了 ABB 就会去调）。
+#[test]
+fn unsupported_optional_tools_never_appear() {
+    let got = roundtrip(&[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#]);
+    let names: Vec<&str> = got[0]["result"]["tools"]
+        .as_array()
+        .expect("tools 数组")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for tool in [
+        "get_quoted_message",
+        "create_chat",
+        "user_display_name",
+        "typing",
+        "del_typing",
+        "done",
+        "note_sender",
+        "chat_brief",
+        "get_chat_info",
+        "send_thread_reply",
+    ] {
+        assert!(
+            !names.contains(&tool),
+            "微信做不到 `{tool}`，不得声明（原因见 README 与 main.rs 头部）。实际：{names:?}"
+        );
+    }
+}
+
+/// 未实现的工具被调用 ⇒ JSON-RPC `error`（不是静默空串），
+/// 且**进程不崩**（一条坏请求不能把整个渠道带走）。
+#[test]
+fn calling_unknown_tool_errors_and_stays_alive() {
+    let got = roundtrip(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"typing","arguments":{"message_id":"m"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+    ]);
+    assert!(
+        got[0].get("error").is_some(),
+        "调用未声明的工具必须回 error：{:?}",
+        got[0]
+    );
+    assert!(
+        got[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("typing"),
+        "报因要指名是哪个工具：{:?}",
+        got[0]
+    );
+    assert_eq!(got.len(), 2, "一条坏请求不得终止进程（后面那条仍要回）");
+}
+
+/// `download_attachment` 对没见过的消息必须回 error，而不是给一个假路径。
+#[test]
+fn download_attachment_on_unknown_message_errors() {
+    let got = roundtrip(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"download_attachment","arguments":{"message_id":"never-seen","seq":0}}}"#,
+    ]);
+    assert!(got[0].get("error").is_some(), "必须回 error：{:?}", got[0]);
+    let msg = got[0]["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("缓存"), "报因要说清缓存里没有：{msg}");
+    assert!(!msg.is_empty(), "不许回空串当报错");
+}
+
 /// 未知方法要回 error，不是静默成功。
 #[test]
 fn unknown_method_errors() {
