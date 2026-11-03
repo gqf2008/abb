@@ -56,12 +56,32 @@ done
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-git ls-tree -r "$old" | awk '{print $1, $3, $4}' | sort -k3 > "$tmp/old"
-git ls-tree -r "$new" | awk '{print $1, $3, $4}' | sort -k3 > "$tmp/new"
+# **用 `-z` + NUL 分隔**：路径可以含空格（甚至换行），按空白分列会把
+# `d x/with space.txt` 截成 `d`，同前缀的多个路径还会塌成同一个键。
+# 这是评审 4bb6ba04 的 N1——本仓当前 0 条含空格路径，但工具会误导人。
+#
+# 输出格式（每条记录内用 TAB 分隔三个字段）：
+#     <mode>\t<blob>\t<path>
+git ls-tree -r -z "$old" | while IFS= read -r -d '' rec; do
+    # rec 形如 "100644 blob <sha>\t<path>"：先按 TAB 切出元信息与路径
+    meta=${rec%%"$(printf '\t')"*}
+    path=${rec#*"$(printf '\t')"}
+    set -- $meta
+    printf '%s\t%s\t%s\n' "$1" "$3" "$path"
+done | LC_ALL=C sort -t"$(printf '\t')" -k3 > "$tmp/old"
 
-# 用 join 按键（路径，第 3 列）做外连接。
-join -j 3 -a 1 -a 2 -e '-' -o 0,1.1,1.2,2.1,2.2 "$tmp/old" "$tmp/new" 2>/dev/null \
-| while read -r path omode oblob nmode nblob; do
+git ls-tree -r -z "$new" | while IFS= read -r -d '' rec; do
+    meta=${rec%%"$(printf '\t')"*}
+    path=${rec#*"$(printf '\t')"}
+    set -- $meta
+    printf '%s\t%s\t%s\n' "$1" "$3" "$path"
+done | LC_ALL=C sort -t"$(printf '\t')" -k3 > "$tmp/new"
+
+# 用 join 按键（路径 = 第 3 个 TAB 字段）做外连接。`-t` 显式指定分隔符，
+# 这样路径里的空格不会被当成分隔。
+TAB=$(printf '\t')
+join -t"$TAB" -j 3 -a 1 -a 2 -e '-' -o 0,1.1,1.2,2.1,2.2 "$tmp/old" "$tmp/new" 2>/dev/null \
+| while IFS="$TAB" read -r path omode oblob nmode nblob; do
     if [ "$omode" = "-" ]; then
         printf 'NEW  %s\n' "$path"
     elif [ "$nmode" = "-" ]; then
