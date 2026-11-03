@@ -237,6 +237,23 @@ echo "== ABB 门禁：crates/abb-chart（独立包，中间产物外置于 ${cha
   cargo test --manifest-path "$chart_manifest" --offline
 )
 
+# crates/abb-channel-feishu 同构（独立包，root 碰不到）。
+#
+# 2026-11-03 的教训：微信 crate 从建成到功能做完一直「有测试但没人跑」——
+# 加到门禁后立刻抓到「从未跑过 fmt」与一条 MSRV 违规。飞书这组从一开始就加。
+feishu_manifest="$repo_root/crates/abb-channel-feishu/Cargo.toml"
+feishu_target="$CARGO_TARGET_DIR-feishu"
+mkdir -p "$feishu_target"
+
+echo "== ABB 门禁：crates/abb-channel-feishu（独立包，中间产物外置于 ${feishu_target}）=="
+(
+  export CARGO_TARGET_DIR="$feishu_target"
+  cargo fmt --manifest-path "$feishu_manifest" --check
+  cargo clippy --manifest-path "$feishu_manifest" --locked --all-targets -- -D warnings
+  cargo build --manifest-path "$feishu_manifest" --locked
+  cargo test --manifest-path "$feishu_manifest" --locked
+)
+
 # 协作门禁（crates/* 之外，跑得快、不联网、不编译）：这两条守的是「合并闸门本身」，
 # 之前只在 .walgit/ci.toml 里跑，本地 gates.sh 漏了 —— 而协调者合并前跑的是 gates.sh
 # （评审 NB-6）。放在最后：前面任何一条失败都不会掩盖它们。
