@@ -18,13 +18,14 @@
 //!    一次失败就退出会让「渠道静默失效」——托盘里看不到任何提示。
 //!    但也**不能无限重试同一批**：失败的批次记下并继续，下一轮再取。
 //! 3. **游标只在成功后推进**。失败却推进游标 = 那批消息永久丢失。
+//!    （游标本身不在这里：它是 `PollSource` 的 `state_cursor`（`mcp_channel_loop.rs`）。
+//!    本模块原来也有个 `cursor` 字段，但那是游标职责下沉前的残留——2026-11-03 实测
+//!    生产代码零调用后删掉，连同两个只被它自己用的方法。）
 
 // 本步骤（S2b）把驱动逻辑做成**可单测的纯逻辑**，但还没接进 `service::run_bot`
 // 的 bot 循环（S2c：真渠道 + 真 Bridge 的接线）。
 //
 // 与 `mcp_bus`/`mcp_client` 同口径：**移除它必须是「真接上了」**，不是「先关警告」。
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 
 use crate::mcp_bus::ChannelMessage;
@@ -44,8 +45,6 @@ pub struct InboundState {
     /// 已见过的 `(chat_id, message_id)`，按到达顺序（满了从头丢）。
     seen: VecDeque<(String, String)>,
     seen_cap: usize,
-    /// B 方案游标：**只在成功后推进**。
-    cursor: Option<String>,
     /// 累计投递失败条数（给状态行/日志看；不因失败而停）。
     pub failed: u64,
     /// 累计丢弃的重复条数。
@@ -57,20 +56,8 @@ impl InboundState {
         Self {
             seen: VecDeque::new(),
             seen_cap: seen_cap.max(1),
-            cursor: None,
             failed: 0,
             deduped: 0,
-        }
-    }
-
-    pub fn cursor(&self) -> Option<&str> {
-        self.cursor.as_deref()
-    }
-
-    /// 记下游标（调用方保证只在成功后调）。
-    pub fn advance_cursor(&mut self, next: Option<String>) {
-        if next.is_some() {
-            self.cursor = next;
         }
     }
 
@@ -266,18 +253,6 @@ mod tests {
         deliver_batch(&mut st, &sink, &[msg("c", "3")]).await;
         let r = deliver_batch(&mut st, &sink, &[msg("c", "1")]).await;
         assert_eq!(r.deduped, 1, "1 刚被刷新过，不该被淘汰：{r:?}");
-    }
-
-    #[test]
-    fn cursor_only_advances_on_success() {
-        let mut st = InboundState::new(4);
-        assert_eq!(st.cursor(), None);
-        st.advance_cursor(None);
-        assert_eq!(st.cursor(), None, "None 不该覆盖已有游标");
-        st.advance_cursor(Some("c1".into()));
-        assert_eq!(st.cursor(), Some("c1"));
-        st.advance_cursor(None);
-        assert_eq!(st.cursor(), Some("c1"), "None 不该清掉游标");
     }
 
     #[test]

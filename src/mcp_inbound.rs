@@ -27,8 +27,6 @@
 
 // 入站还没接进 service 的轮询循环（S2b），故部分成员暂未用。
 // **移除必须是「真接上了」**，与 S1c/S1d 同口径。
-#![allow(dead_code)]
-
 use serde_json::{json, Value};
 
 use crate::mcp_bus::{updated_uri, ChannelMessage, Inbound, TOOL_POLL};
