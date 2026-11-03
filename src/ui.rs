@@ -2124,6 +2124,33 @@ fn bots_struct_sig(c: &Config) -> String {
     for b in &c.bots {
         parts.push(format!("prov|route|{}|{}", b.key(), b.provider));
     }
+    // mcp 渠道入签名：拉起什么程序是 service 启动时的事（`run_bot` 按 kind 分派），
+    // GUI 改 command/args/env 后不重启就还是旧程序在跑。env 值含 token 的性质与供应商
+    // api_key 相同 ⇒ 只把 sha256 摘要入串，明文绝不进签名（它会被日志/UI 侧读到）。
+    for b in &c.bots {
+        let Some(m) = b.mcp_channel.as_ref() else {
+            continue;
+        };
+        let env_hash: String = sha2::Sha256::digest(
+            m.env
+                .iter()
+                .map(|e| format!("{}={};", e.name, e.value))
+                .collect::<String>()
+                .as_bytes(),
+        )
+        .iter()
+        .take(8)
+        .map(|x| format!("{x:02x}"))
+        .collect();
+        parts.push(format!(
+            "mcp|{}|{}|{}|{}|{}",
+            b.key(),
+            m.name,
+            m.command,
+            m.args.join("\u{1f}"),
+            env_hash
+        ));
+    }
     parts.sort();
     parts.join(";")
 }
@@ -2151,7 +2178,115 @@ fn bot_to_row(b: &BotConfig) -> BotRow {
         ding_owner_ids: b.ding_owner_ids.clone().into(),
         ding_robot_code: b.ding_robot_code.clone().into(),
         tidy_enabled: b.tidy_enabled,
+        // mcp 渠道（总线 S3）：没配就是三个空串，界面显示为「未配」，不是错误状态。
+        mcp_command: b
+            .mcp_channel
+            .as_ref()
+            .map(|m| m.command.clone())
+            .unwrap_or_default()
+            .into(),
+        mcp_args: b
+            .mcp_channel
+            .as_ref()
+            .map(mcp_args_text)
+            .unwrap_or_default()
+            .into(),
+        mcp_env: b
+            .mcp_channel
+            .as_ref()
+            .map(mcp_env_text)
+            .unwrap_or_default()
+            .into(),
     }
+}
+
+/// `mcp_channel.args` → 单行输入框文本（空格分隔）。
+///
+/// 与 [`parse_mcp_args`] 成反函数关系（`parse(args_to_text(a)) == a`），前提是参数
+/// 本身不含空白——界面上这是硬限制（带空格的参数要写成 wrapper 脚本）。
+fn mcp_args_text(m: &crate::channel_mcp::McpServerConfig) -> String {
+    m.args.join(" ")
+}
+
+/// `mcp_channel.env` → 多行输入框文本（每行 `KEY=VALUE`）。
+fn mcp_env_text(m: &crate::channel_mcp::McpServerConfig) -> String {
+    m.env
+        .iter()
+        .map(|e| format!("{}={}", e.name, e.value))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 单行输入框文本 → `args`：按空白切分。
+fn parse_mcp_args(text: &str) -> Vec<String> {
+    text.split_whitespace().map(|s| s.to_string()).collect()
+}
+
+/// 多行输入框文本 → `env`：每行 `KEY=VALUE`。
+///
+/// **畸形的行跳过，不报错也不 panic**（GUI 里用户边打边存，中间态必然有半行）：
+/// 空行 / 没有 `=` / `=` 左边是空串（`=v`）都不构成环境变量。值侧不 trim——
+/// 用户显式打的空格要原样保留；行首尾空白已被 `trim` 吃掉，所以回写再解析是稳定的。
+fn parse_mcp_env(text: &str) -> Vec<crate::channel_mcp::McpEnvVar> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        out.push(crate::channel_mcp::McpEnvVar {
+            name: name.to_string(),
+            value: value.to_string(),
+        });
+    }
+    out
+}
+
+/// 取 `mcp_channel` 的可变引用；`None` 时先建一个**空壳**（name=bot 名或 "channel"，
+/// command 空）。
+///
+/// 为什么允许「半配」：界面是按字段回写的，用户先填 args/env 再填 command 是常见顺序；
+/// 中途落盘的空 command 由装配侧按 `is_usable()` 判掉（不静默拉起半个 server）。
+fn ensure_mcp_channel(bot: &mut BotConfig) -> &mut crate::channel_mcp::McpServerConfig {
+    let name = {
+        let trimmed = bot.name.trim();
+        if trimmed.is_empty() {
+            "channel".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    bot.mcp_channel
+        .get_or_insert(crate::channel_mcp::McpServerConfig {
+            name,
+            command: String::new(),
+            args: Vec::new(),
+            env: Vec::new(),
+        })
+}
+
+/// `mcp_command` / `mcp_args` / `mcp_env` 三个字段的回写。
+///
+/// 返回 `true` = 认领了该 field（调用方的 match 不再往下走）。抽成函数而不是塞进
+/// 回调闭包里，是为了让解析规则（尤其「畸形 env 行跳过」）能被单元测试直接揍。
+fn apply_mcp_field_edit(bot: &mut BotConfig, field: &str, value: &str) -> bool {
+    if !matches!(field, "mcp_command" | "mcp_args" | "mcp_env") {
+        return false;
+    }
+    let channel = ensure_mcp_channel(bot);
+    match field {
+        "mcp_command" => channel.command = value.trim().to_string(),
+        "mcp_args" => channel.args = parse_mcp_args(value),
+        _ => channel.env = parse_mcp_env(value),
+    }
+    true
 }
 
 /// 供应商工作副本 → Slint ProviderRow。is-default 由名字与 default_provider_work 比对得出。
@@ -6606,19 +6741,15 @@ pub fn run_gui() -> Result<()> {
         let dirty = dirty.clone();
         settings.on_add_bot(move || {
             dirty.set(true);
-            // 新 bot 默认类型跟随当前选中的 bot（没有选中则用 feishu 默认），
-            // 避免旧默认 wechat 让用户以为新加的 bot 是微信（参数区显示微信登录框）。
-            let sel = sw.upgrade().map(|w| w.get_selected()).unwrap_or(-1);
+            // 新 bot 默认 kind = mcp（总线 S3，owner 要求「不再支持在界面中配置渠道」）。
+            // 曾经是「跟随选中 bot，否则 feishu」——那是渠道配置还在界面上的时代：
+            // 新建 bot 的意义就是再挂一个内置渠道。现在渠道改由该 bot 的 mcp_channel
+            // 指定（command/args/env），界面不再承载渠道语义，默认 mcp 才和产品方向一致。
             let mut b = work.borrow_mut();
             let n = b.len() + 1;
-            let kind = if sel >= 0 && (sel as usize) < b.len() {
-                b[sel as usize].kind.clone()
-            } else {
-                crate::config::default_kind()
-            };
             b.push(BotConfig {
                 name: format!("bot{n}"), // 占位名；微信扫码登录成功后自动改成 wxN
-                kind,
+                kind: "mcp".to_string(),
                 ..Default::default()
             });
             let idx = b.len() as i32 - 1;
@@ -6687,6 +6818,10 @@ pub fn run_gui() -> Result<()> {
                         "ding_user_id" => bot.ding_user_id = value.trim().to_string(),
                         "ding_owner_ids" => bot.ding_owner_ids = value.trim().to_string(),
                         "ding_robot_code" => bot.ding_robot_code = value.trim().to_string(),
+                        // mcp 渠道三字段（解析规则在 apply_mcp_field_edit 里，有单测）
+                        "mcp_command" | "mcp_args" | "mcp_env" => {
+                            apply_mcp_field_edit(bot, field.as_str(), value.as_str());
+                        }
                         _ => {}
                     }
                 }
@@ -11891,7 +12026,7 @@ mod tests {
         let s0 = bots_struct_sig(&base());
         /// 一条字段翻转用例：字段名（失败信息用）+ 就地改写 bot 的闭包。
         type FieldCase = (&'static str, fn(&mut crate::config::BotConfig));
-        let cases: [FieldCase; 9] = [
+        let cases: [FieldCase; 10] = [
             ("name/key", |b| b.name = "bot2".into()),
             ("enabled", |b| b.enabled = !b.enabled),
             ("kind", |b| b.kind = "dingtalk".into()),
@@ -11901,6 +12036,15 @@ mod tests {
             ("wx_user_id", |b| b.wx_user_id = "wxu".into()),
             ("ding_user_id", |b| b.ding_user_id = "dingu".into()),
             ("ding_robot_code", |b| b.ding_robot_code = "rc".into()),
+            // 总线 S3：mcp 渠道决定拉起什么程序 ⇒ 改了必须重启，必须入签名
+            ("mcp_channel", |b| {
+                b.mcp_channel = Some(crate::channel_mcp::McpServerConfig {
+                    name: "ch".into(),
+                    command: "/opt/channel-mcp".into(),
+                    args: vec!["--root".into()],
+                    env: Vec::new(),
+                })
+            }),
         ];
         for (field, mutate) in cases {
             let mut c = base();
@@ -12437,6 +12581,177 @@ mod tests {
             archived.iter().all(|r| r.tag.as_str() != "当前"),
             "归档视图不许有任何一项被标成「当前」：{:?}",
             archived.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── 总线 S3：mcp 渠道三字段（BotRow ↔ config.mcp_channel 的转换与回写）──────────
+
+    /// 造一个 mcp 渠道配置（args/env 都有内容，才能验拼接与解析）。
+    fn mcp_channel_sample() -> crate::channel_mcp::McpServerConfig {
+        crate::channel_mcp::McpServerConfig {
+            name: "ch".into(),
+            command: "/opt/channel-mcp".into(),
+            args: vec!["--root".into(), "/tmp/x".into()],
+            env: vec![
+                crate::channel_mcp::McpEnvVar {
+                    name: "TOKEN".into(),
+                    value: "t1".into(),
+                },
+                crate::channel_mcp::McpEnvVar {
+                    name: "MODE".into(),
+                    value: "a=b".into(),
+                },
+            ],
+        }
+    }
+
+    fn bot_with(kind: &str, channel: Option<crate::channel_mcp::McpServerConfig>) -> BotConfig {
+        crate::config::BotConfig {
+            name: "bot1".into(),
+            kind: kind.into(),
+            mcp_channel: channel,
+            ..Default::default()
+        }
+    }
+
+    /// `mcp_channel: None` 的 bot：三个字段全是空串（界面显示「未配」），不得 panic。
+    #[test]
+    fn bot_to_row_leaves_mcp_fields_empty_without_channel() {
+        let row = bot_to_row(&bot_with("mcp", None));
+        assert_eq!(row.mcp_command.as_str(), "");
+        assert_eq!(row.mcp_args.as_str(), "");
+        assert_eq!(row.mcp_env.as_str(), "");
+    }
+
+    /// `mcp_channel: Some(..)`：command 原样；args 空格 join；env 每行 `KEY=VALUE`。
+    #[test]
+    fn bot_to_row_formats_mcp_command_args_env() {
+        let row = bot_to_row(&bot_with("mcp", Some(mcp_channel_sample())));
+        assert_eq!(row.mcp_command.as_str(), "/opt/channel-mcp");
+        assert_eq!(row.mcp_args.as_str(), "--root /tmp/x");
+        assert_eq!(row.mcp_env.as_str(), "TOKEN=t1\nMODE=a=b");
+        // 值里的 `=` 不能被当成新的分隔（不然 token 里带 `=` 就会被截断）
+        assert_eq!(
+            parse_mcp_env(row.mcp_env.as_str()),
+            mcp_channel_sample().env
+        );
+    }
+
+    /// 回写解析：command 去首尾空白；args 按空白切（多空格/tab/空串）；
+    /// env 按行拆、`=` 左边是名字、右边全部是值，**畸形行跳过不 panic**。
+    #[test]
+    fn mcp_field_edit_parses_args_and_env() {
+        let mut bot = bot_with("mcp", None);
+
+        assert!(apply_mcp_field_edit(
+            &mut bot,
+            "mcp_command",
+            "  /opt/channel-mcp  "
+        ));
+        let ch = bot
+            .mcp_channel
+            .as_ref()
+            .expect("command 回写必须建出渠道配置");
+        assert_eq!(ch.command, "/opt/channel-mcp", "command 要 trim");
+
+        assert!(apply_mcp_field_edit(
+            &mut bot,
+            "mcp_args",
+            "  --root\t/tmp/x  "
+        ));
+        assert_eq!(
+            bot.mcp_channel.as_ref().unwrap().args,
+            vec!["--root", "/tmp/x"]
+        );
+        // 空串 ⇒ 空参数表（不是 `vec![""]`）
+        assert!(apply_mcp_field_edit(&mut bot, "mcp_args", "   "));
+        assert!(bot.mcp_channel.as_ref().unwrap().args.is_empty());
+
+        // 正常两行 + 四类畸形行（空行 / 无 `=` / `=` 左边空 / 纯空白）
+        assert!(apply_mcp_field_edit(
+            &mut bot,
+            "mcp_env",
+            "TOKEN=t1\n\nnoseparator\n=onlyvalue\n   \nMODE = a=b\n"
+        ));
+        let env = bot.mcp_channel.as_ref().unwrap().env.clone();
+        assert_eq!(env.len(), 2, "畸形行必须被跳过，实得 {env:?}");
+        assert_eq!(env[0].name, "TOKEN");
+        assert_eq!(env[0].value, "t1");
+        assert_eq!(env[1].name, "MODE", "名字要 trim");
+        assert_eq!(env[1].value, " a=b", "`=` 右边全部归值，且不动内部空白");
+
+        // 回写 → 读回：往返稳定（GUI 刷新面板时不会把用户输入改形）
+        assert!(apply_mcp_field_edit(&mut bot, "mcp_args", "--root /tmp/x"));
+        let row = bot_to_row(&bot);
+        assert_eq!(
+            parse_mcp_args(row.mcp_args.as_str()),
+            vec!["--root", "/tmp/x"]
+        );
+        assert_eq!(parse_mcp_env(row.mcp_env.as_str()), env);
+    }
+
+    /// 回写时 `mcp_channel` 为 `None` ⇒ 先建空壳：name 取 bot 名，bot 名为空用 "channel"。
+    #[test]
+    fn mcp_field_edit_creates_channel_when_missing() {
+        let mut bot = bot_with("mcp", None);
+        assert!(apply_mcp_field_edit(&mut bot, "mcp_env", "A=1"));
+        let ch = bot.mcp_channel.as_ref().expect("应先建出渠道配置");
+        assert_eq!(
+            ch.name, "bot1",
+            "空壳的 name 取 bot 名（会出现在工具名前缀里）"
+        );
+        assert_eq!(
+            ch.command, "",
+            "command 空壳留给用户填，装配侧按 is_usable 判掉"
+        );
+        assert_eq!(ch.env.len(), 1);
+
+        let mut unnamed = bot_with("mcp", None);
+        unnamed.name = "   ".into();
+        assert!(apply_mcp_field_edit(&mut unnamed, "mcp_command", "x"));
+        assert_eq!(unnamed.mcp_channel.as_ref().unwrap().name, "channel");
+    }
+
+    /// 非 mcp 字段不被这件回写认领（否则 name/provider 等写入会被吞掉）。
+    #[test]
+    fn mcp_field_edit_ignores_other_fields() {
+        let mut bot = bot_with("mcp", None);
+        assert!(!apply_mcp_field_edit(&mut bot, "name", "x"));
+        assert!(!apply_mcp_field_edit(&mut bot, "provider", "ds"));
+        assert!(bot.mcp_channel.is_none(), "不认领的字段不得建出渠道配置");
+    }
+
+    /// mcp 渠道入签名：command / args / env 任一项变了都要翻签名（否则 service 不重启，
+    /// 继续拉起旧程序），而 env 里的**明文值绝不进签名串**（与供应商 api_key 同策）。
+    #[test]
+    fn bots_struct_sig_covers_mcp_channel_without_leaking_env() {
+        let mk = |channel: Option<crate::channel_mcp::McpServerConfig>| {
+            let mut c = Config::default();
+            c.bots = vec![bot_with("mcp", channel)];
+            bots_struct_sig(&c)
+        };
+        let base = mk(Some(mcp_channel_sample()));
+
+        let mut cmd = mcp_channel_sample();
+        cmd.command = "/opt/other-mcp".into();
+        assert_ne!(base, mk(Some(cmd)), "改 command 必须翻签名");
+
+        let mut args = mcp_channel_sample();
+        args.args = vec!["--root".into(), "/tmp/y".into()];
+        assert_ne!(base, mk(Some(args)), "改 args 必须翻签名");
+
+        let mut env = mcp_channel_sample();
+        env.env[0].value = "t2".into();
+        assert_ne!(
+            base,
+            mk(Some(env)),
+            "改 env 值必须翻签名（否则新 token 不生效）"
+        );
+
+        assert_ne!(base, mk(None), "删掉渠道配置也必须翻签名");
+        assert!(
+            !base.contains("TOKEN") && !base.contains("a=b"),
+            "env 明文（名与值）不得进签名串：{base}"
         );
     }
 }

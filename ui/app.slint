@@ -194,6 +194,11 @@ export struct BotRow {
     ding-owner-ids: string,  // 钉钉：owner（管理员）白名单（逗号分隔 staffId）
     ding-robot-code: string, // 钉钉：机器人编码（空=默认 AppKey）
     tidy-enabled: bool, // 每日工作目录整理（默认关：孤儿会话/临时文件/超期历史/文档归档 + git 留痕）
+    // kind == "mcp" 的渠道服务（总线 S3）：ABB 只负责拉起，渠道语义由该 MCP server 决定。
+    // 三字段与 config 的 mcp_channel 一一对应；Slint 侧 kebab-case 自动映射 Rust 的 snake_case。
+    mcp-command: string, // 可执行文件（空 = 没配）
+    mcp-args: string,    // 空格分隔的参数（单行输入框；Rust 侧按空白切分 ⇒ 带空格的参数不可表达）
+    mcp-env: string,     // 每行 KEY=VALUE（多行输入框；Rust 侧按行解析，解析不了的行跳过）
 }
 
 // 单个模型供应商行的数据（与 Rust 侧 ProviderRow 对应）
@@ -1804,8 +1809,10 @@ export component SettingsWindow inherits Window {
                                                     HorizontalBox {
                                                         horizontal-stretch: 1;
                                                         for opt[i] in root.kind-editor-options: PixelComboBox {
-                                                            model: ["feishu", "wechat", "dingtalk"];
-                                                            index: opt.value == "feishu" ? 0 : opt.value == "wechat" ? 1 : 2;
+                                                            // mcp 也列出来：新 bot 默认就是 mcp（渠道配置不再由界面决定），
+                                                            // 不列会让新 bot 的下拉显示成「dingtalk」，与真实 kind 不符。
+                                                            model: ["feishu", "wechat", "dingtalk", "mcp"];
+                                                            index: opt.value == "feishu" ? 0 : opt.value == "wechat" ? 1 : opt.value == "dingtalk" ? 2 : 3;
                                                             horizontal-stretch: 1;
                                                             selected(idx) => { root.bot-field-edited(root.selected, "kind", self.model[idx]); }
                                                         }
