@@ -161,6 +161,35 @@ for key in 'src/ 合计' 'runtime 合计' 'GUI 三件合计'; do
     fi
 done
 
+# ── 退役方案文档里的行数也必须对得上 ────────────────────────────────
+#
+# 为什么单独校验它（评审 fa7c2cb9 的 non-blocking）：那份文档的核心就是
+# 「S4 要删多少行」，而这些数字**会随删除本身变小**。S4 阶段 1 删完钉钉后
+# 1764 就该消失，但没人检查的话文档会一直写着旧值——而 owner 正是按这些
+# 数字做授权决定。**错的决策依据比没有依据更糟。**
+plan=docs/channel-retirement-plan.md
+if [ -f "$plan" ]; then
+    for mod in feishu dingtalk wechat ws; do
+        f="src/$mod.rs"
+        # 文档里该模块行的行数列（表格列 3，形如 "| `src/feishu.rs` | 2206 |"）
+        doc_n=$(awk -F'|' -v m="src/$mod.rs" '
+            index($2, m) { gsub(/[^0-9]/, "", $3); print $3; exit }' "$plan")
+        [ -n "$doc_n" ] || continue
+        if [ ! -f "$f" ]; then
+            fail=$((fail + 1))
+            printf '❌ 退役方案仍提到 %s（%s 行），但该文件已删除 ⇒ 退役后忘了更新方案\n' \
+                "src/$mod.rs" "$doc_n"
+            continue
+        fi
+        real_n=$(wc -l < "$f" | tr -d ' ')
+        if [ "$doc_n" != "$real_n" ]; then
+            fail=$((fail + 1))
+            printf '❌ 退役方案写 src/%s.rs 为 %s 行，实测 %s 行 ⇒ 数字漂移（owner 按它做授权决定）\n' \
+                "$mod" "$doc_n" "$real_n"
+        fi
+    done
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "✅ docs/architecture.md 与代码一致（规模数字与结构断言全部对上）"
     exit 0
