@@ -436,28 +436,41 @@ mod tests {
         assert_eq!(backoff(MAX_CONSECUTIVE_FAILURES), BACKOFF_MAX);
     }
 
-    /// 超过阈值转「稳定慢重试」，**且永不放弃**（owner 决定 2026-11-03）。
+    /// 阈值之后**每个**失败次数都落在同一个值上：`RETRY_SLOW`（30s）。
     ///
-    /// 两段的分工：前 10 次快（快速暴露配置错误），之后慢但**一直试**
-    /// （MCP 服务半夜崩了也要能自己回来）。
+    /// 这是「永不放弃 + 稳定重试」的**数值**保证：服务恢复后最多等 30s 就重新取到消息，
+    /// 长期故障时也还是每 30s 一条日志（不会随失败次数继续拉长，也不会溢出）。
+    /// 逐个值扫而不是只点三四个样本：删掉 `backoff` 里那个 `> MAX_CONSECUTIVE_FAILURES`
+    /// 的早返回分支时，指数段会把间隔算成 15s 封顶——**必须**在第一个越界值上就咬住。
     #[test]
-    fn switches_to_slow_retry_instead_of_giving_up() {
-        // 刚好超过阈值 ⇒ 切 30s，且比指数段更慢
+    fn backoff_after_many_failures_is_stable_30s() {
+        // 刚过阈值
         assert_eq!(backoff(MAX_CONSECUTIVE_FAILURES + 1), RETRY_SLOW);
-        assert!(RETRY_SLOW > BACKOFF_MAX, "慢档必须真的更慢");
-        // 远超阈值仍是同一个间隔（**不继续增长，也不溢出**）
-        assert_eq!(backoff(MAX_CONSECUTIVE_FAILURES + 50), RETRY_SLOW);
+        assert_eq!(backoff(MAX_CONSECUTIVE_FAILURES + 2), RETRY_SLOW);
+        // 远超阈值
+        assert_eq!(backoff(100), RETRY_SLOW);
+        // 极端值不溢出、不回落到指数段
         assert_eq!(backoff(u32::MAX), RETRY_SLOW);
+        // 阈值之后**全部**等长（含 500 这种远超样本）
+        for n in (MAX_CONSECUTIVE_FAILURES + 1)..=500 {
+            assert_eq!(
+                backoff(n),
+                RETRY_SLOW,
+                "连续失败 {n} 次后的间隔必须稳定在 {RETRY_SLOW:?}"
+            );
+        }
+        // 慢档要真的更慢，否则「10 次后转慢」这个策略没有意义
+        assert!(RETRY_SLOW > BACKOFF_MAX, "慢档必须真的更慢");
+    }
 
-        // 关键断言：**任何次数都不放弃**
-        for n in [
-            0,
-            1,
-            MAX_CONSECUTIVE_FAILURES,
-            MAX_CONSECUTIVE_FAILURES + 1,
-            1000,
-            u32::MAX,
-        ] {
+    /// **任何**连续失败次数都不放弃（owner 决定 2026-11-03）。
+    ///
+    /// 这条钉的是「进程死了渠道不会静默失效」：旧策略在 10 次处返回 `true`，
+    /// 于是一次夜间崩溃就把渠道永久关掉。逐个值扫 0..=300 再补上极端值——
+    /// 把 `should_give_up` 改回 `consecutive >= 10` 时，10 这个点会立刻红。
+    #[test]
+    fn consecutive_failures_never_trigger_give_up() {
+        for n in (0..=300).chain([1000, MAX_CONSECUTIVE_FAILURES, u32::MAX]) {
             assert!(
                 !should_give_up(n),
                 "连续失败 {n} 次也不得放弃——owner 决定：永不退出，每 30s 重试"
@@ -554,6 +567,79 @@ mod tests {
         assert!(tick(&mut st, &mut src, &sink).await.is_err());
         let r = tick(&mut st, &mut src, &sink).await.unwrap();
         assert_eq!(r.delivered, 1);
+    }
+
+    /// **source 连续报错不会杀死循环**：前两轮 `fetch` 返回 `Err`，第三轮恢复。
+    ///
+    /// 断言三件事：
+    /// 1. 失败轮**都**以 `Err` 冒泡（循环据此计数/退避），不是伪装成「没消息」；
+    /// 2. 失败轮之后 source 还能被同一个循环继续用（恢复那轮真的投出去）；
+    /// 3. `InboundState`（去重/LRU）**没被污染**——恢复后同一 mid 仍按去重处理。
+    ///
+    /// 第 3 点才是「静默失效」的判据：若失败轮把状态清掉/占了坑，渠道会看起来在线
+    /// 却把消息重复投递或整批丢掉。
+    #[tokio::test]
+    async fn source_error_does_not_kill_the_loop() {
+        let mut st = InboundState::new(10);
+        let mut src = FakeSource::new(vec![None, None, Some(vec![msg("1")]), Some(vec![msg("1")])]);
+        let sink = CountSink::new();
+
+        // 1、2 轮：失败要冒泡，且状态与 source 都还活着
+        for round in 1..=2 {
+            let err = tick(&mut st, &mut src, &sink).await.unwrap_err();
+            assert!(
+                err.contains("拉取失败"),
+                "第 {round} 轮失败原因应原样冒泡，实际：{err}"
+            );
+            assert!(
+                sink.got.lock().unwrap().is_empty(),
+                "第 {round} 轮失败不该投出任何消息"
+            );
+        }
+
+        // 第 3 轮：恢复，消息正常投递
+        let r = tick(&mut st, &mut src, &sink).await.unwrap();
+        assert_eq!(r.delivered, 1, "恢复轮必须把消息投出去");
+        assert_eq!(*sink.got.lock().unwrap(), vec!["1".to_string()]);
+
+        // 第 4 轮：同一 mid 仍按去重处理 ⇒ 失败轮没有污染去重状态
+        let r = tick(&mut st, &mut src, &sink).await.unwrap();
+        assert_eq!(r.delivered, 0);
+        assert_eq!(r.deduped, 1, "恢复后去重记录要还在（失败轮不得清状态）");
+    }
+
+    /// **越过旧上限（10 次）之后仍然能恢复**：失败 12 轮再成功，照旧投递。
+    ///
+    /// 这是「进程挂了很久」的回归：旧策略在第 11 次失败时就退出渠道，
+    /// 于是 MCP 服务夜间崩溃 ⇒ 渠道静默死到人发现为止。这条从**循环决策**的角度
+    /// 钉住恢复能力：0..=12 全都不放弃 + 第 12 次之后仍是 30s 慢重试 +
+    /// 第 13 轮恢复投递。
+    #[tokio::test]
+    async fn recovers_after_more_failures_than_the_old_give_up_threshold() {
+        const ROUNDS: u32 = 12;
+        let mut scroll: Vec<Option<Vec<ChannelMessage>>> = vec![None; ROUNDS as usize];
+        scroll.push(Some(vec![msg("late")]));
+        let mut src = FakeSource::new(scroll);
+        let mut st = InboundState::new(10);
+        let sink = CountSink::new();
+
+        for consecutive in 1..=ROUNDS {
+            assert!(tick(&mut st, &mut src, &sink).await.is_err());
+            // 每一轮都按循环的口径复查决策——包括恰好越过旧上限的 11、12 轮
+            assert!(
+                !should_give_up(consecutive),
+                "第 {consecutive} 轮失败后不得放弃重连"
+            );
+            let delay = backoff(consecutive);
+            assert!(delay <= RETRY_SLOW, "退避不得超过慢档 {RETRY_SLOW:?}");
+            if consecutive > MAX_CONSECUTIVE_FAILURES {
+                assert_eq!(delay, RETRY_SLOW, "越过阈值后必须稳定在 30s");
+            }
+        }
+
+        let r = tick(&mut st, &mut src, &sink).await.unwrap();
+        assert_eq!(r.delivered, 1, "越过旧上限的失败之后仍要能恢复投递");
+        assert_eq!(*sink.got.lock().unwrap(), vec!["late".to_string()]);
     }
 
     /// 同一批消息第二轮应全部去重（跨 tick 的状态要保留）。
