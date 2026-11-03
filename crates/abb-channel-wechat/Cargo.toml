@@ -1,0 +1,45 @@
+# abb-channel-wechat —— 微信渠道的**独立 MCP server**。
+#
+# 为什么独立成 crate（与「删掉内置渠道」的关键差异）：
+#   搬迁不是退役。`src/wechat.rs` 的 1640 行是**能用的实现**，删掉换「理论上能接」
+#   是净损失；搬到独立进程则功能不丢、只换进程边界，且随时能搬回来。
+#
+# 为什么能搬得动（已核实）：
+#   - 入站 `get_updates(cursor)` **天然符合** MCP 的 `poll` 契约
+#   - 出站 `send_text` 需要的 `context_token` 每条入站消息都带 ⇒ server 内部记，
+#     **ABB 不再需要 `Messenger::note_context` 那个渠道特例**
+#   - 对 ABB 内部的依赖只有 5 处小工具（truncate / log / unix_secs /
+#     mime_from_name / bridge_dir），本 crate 自备
+#
+# 自带 manifest + lock（与 abb-agent / abb-chart 同构），root 的 fmt/clippy/test 不碰它。
+#
+# 构建：cargo build --release --manifest-path crates/abb-channel-wechat/Cargo.toml
+[package]
+name = "abb-channel-wechat"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+repository = "https://github.com/gqf2008/abb"
+description = "微信渠道的独立 MCP server（ABB 总线的渠道侧实现）"
+
+[[bin]]
+name = "abb-channel-wechat"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+qrcode = { version = "0.14", default-features = false, features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+# 媒体加解密与随机 key：与 ABB root 同版本，搬家不改行为
+aes = "0.8"
+uuid = { version = "1", features = ["v4"] }
+fastrand = "2"
+md5 = "0.7"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
