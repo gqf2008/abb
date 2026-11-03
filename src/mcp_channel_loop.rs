@@ -231,6 +231,19 @@ async fn wait_or_cancel(
 }
 
 /// 建连 + 协商入站方式（同步；由调用方放进 `spawn_blocking`）。
+/// 测试可见的建连入口（端到端全链路用）。
+///
+/// 与生产 [`run`] 走同一个 `build_source`，避免"测试走另一条路"的假绿。
+#[cfg(test)]
+pub fn build_source_for_test(
+    name: &str,
+    program: &str,
+    args: &[String],
+    envs: &[(String, String)],
+) -> Result<Box<dyn InboundSource>, String> {
+    build_source(name, program, args, envs)
+}
+
 fn build_source(
     name: &str,
     program: &str,

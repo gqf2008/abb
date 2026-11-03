@@ -19,6 +19,8 @@ mod attachments;
 mod botstatus;
 mod bridge;
 mod channel_dir;
+#[cfg(test)]
+mod channel_full_chain_test;
 mod channel_mcp;
 mod config;
 mod deliver;
