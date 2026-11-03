@@ -134,7 +134,7 @@ fn dir_channel_receives_and_translates() {
     assert_eq!(batch.messages.len(), 1, "应取到 1 条");
     assert_eq!(batch.messages[0].text, "来自真渠道");
 
-    let ev = crate::mcp_adapter::to_ev(&batch.messages[0]).expect("翻译");
+    let ev = crate::mcp_adapter::to_ev(&batch.messages[0], &[]).expect("翻译");
     assert_eq!(ev.chat_id, "c1");
     assert_eq!(ev.text, "来自真渠道");
     assert_eq!(

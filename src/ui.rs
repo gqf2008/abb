@@ -2143,12 +2143,17 @@ fn bots_struct_sig(c: &Config) -> String {
         .map(|x| format!("{x:02x}"))
         .collect();
         parts.push(format!(
-            "mcp|{}|{}|{}|{}|{}",
+            "mcp|{}|{}|{}|{}|{}|{}",
             b.key(),
             m.name,
             m.command,
             m.args.join("\u{1f}"),
-            env_hash
+            env_hash,
+            // owner 名单也入签名：`to_ev` 读的是 `bridge.bot` 的**构造时快照**，
+            // 改了不重启就还是旧名单在判档位——**删掉一个 owner 会静默继续给全权限**，
+            // 这比「新加的不生效」严重得多，所以两边都必须翻签名。
+            // 名单本身不是秘密（是 id，不是 token），明文入串即可。
+            m.owner_ids.join("\u{1f}")
         ));
     }
     parts.sort();
@@ -2269,6 +2274,9 @@ fn ensure_mcp_channel(bot: &mut BotConfig) -> &mut crate::channel_mcp::McpServer
             command: String::new(),
             args: Vec::new(),
             env: Vec::new(),
+            // owner 名单**不由本界面维护**（与 env 里的 token 同性质的高权字段，
+            // 手改 config.json）；在这里保留已存在的值不被回写清空。
+            owner_ids: Vec::new(),
         })
 }
 
@@ -12052,6 +12060,7 @@ mod tests {
                     command: "/opt/channel-mcp".into(),
                     args: vec!["--root".into()],
                     env: Vec::new(),
+                    owner_ids: Vec::new(),
                 })
             }),
         ];
@@ -12611,6 +12620,7 @@ mod tests {
                     value: "a=b".into(),
                 },
             ],
+            owner_ids: vec!["ou_owner".into()],
         }
     }
 

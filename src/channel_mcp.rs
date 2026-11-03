@@ -131,6 +131,15 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<McpEnvVar>,
+    /// 哪些 `sender_id` 算 owner（全权限）。**空 = 全部受限**（fail-closed 保持）。
+    ///
+    /// 为什么要显式名单而不是「渠道说了算」：MCP 渠道的消息由外部程序产出，
+    /// `sender_id` 是**对方自报**的字符串，没有任何平台侧鉴权。若按「有 sender_id 就给
+    /// 全权限」，接一个渠道就等于把全权限交给该渠道的任意上游。
+    /// 匹配是**逐字节精确**（大小写敏感、不 trim）：改名即失效，不会因为
+    /// 大小写归一而把不相干的 id 认成 owner。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_ids: Vec<String>,
 }
 
 /// 下发给 MCP 子进程的环境变量（与 `runtime/acp.rs::EnvVar` 逐字对应）。
@@ -264,6 +273,7 @@ mod tests {
             command: " c ".into(),
             args: Vec::new(),
             env: Vec::new(),
+            owner_ids: Vec::new(),
         };
         assert!(ok.is_usable());
         assert!(!McpServerConfig {

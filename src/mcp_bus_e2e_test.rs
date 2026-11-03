@@ -148,7 +148,7 @@ fn subscribe_end_to_end_reaches_ev() {
     );
 
     // 翻译成 Ev：真实链路最后一环
-    let ev = crate::mcp_adapter::to_ev(&msgs[0]).expect("应当能翻译");
+    let ev = crate::mcp_adapter::to_ev(&msgs[0], &[]).expect("应当能翻译");
     assert_eq!(ev.chat_id, "mcp-chat");
     assert_eq!(ev.mid, "m1");
     assert_eq!(ev.text, "第一条");

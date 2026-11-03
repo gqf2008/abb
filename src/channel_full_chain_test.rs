@@ -79,6 +79,7 @@ fn mcp_bot(dir: &std::path::Path) -> crate::config::BotConfig {
                 "--no-resources".into(),
             ],
             env: vec![],
+            owner_ids: Vec::new(),
         }),
         ..Default::default()
     }

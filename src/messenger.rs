@@ -983,6 +983,7 @@ mod tests {
                 command: "/bin/sh".into(),
                 args: vec!["-c".into(), "exit 0".into()],
                 env: vec![],
+                owner_ids: Vec::new(),
             }),
             ..Default::default()
         };

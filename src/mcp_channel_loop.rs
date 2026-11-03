@@ -108,12 +108,26 @@ impl BridgeSink {
     pub fn new(bridge: Arc<Bridge>) -> Self {
         Self { bridge }
     }
+
+    /// 本 bot 的 owner 名单（`mcp_channel.owner_ids` 的构造时快照）。
+    ///
+    /// 取 `bridge.bot` 而不是每次热读 config.json：渠道循环持有的本来就是启动快照
+    /// （`run_bot` 传进来的那个 bot），用同一份才能与「拉起哪个程序」保持口径一致。
+    /// 名单改动要生效就得重启 service——所以 `bots_struct_sig` 把名单也入了签名。
+    fn owner_ids(&self) -> &[String] {
+        self.bridge
+            .bot
+            .mcp_channel
+            .as_ref()
+            .map(|c| c.owner_ids.as_slice())
+            .unwrap_or(&[])
+    }
 }
 
 #[async_trait::async_trait]
 impl InboundSink for BridgeSink {
     async fn deliver(&self, msg: &ChannelMessage) -> Result<(), String> {
-        let ev = match to_ev(msg) {
+        let ev = match to_ev(msg, self.owner_ids()) {
             Ok(ev) => ev,
             Err(e) => {
                 // 翻译失败 ⇒ 这条进不了桥。**记日志但不让整批失败**：

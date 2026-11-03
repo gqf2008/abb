@@ -75,7 +75,7 @@ case "${1:-}" in
         sleep 1
         kill -9 "$pid" 2>/dev/null
         rm -f "$pid_file"
-        echo "已停（pid $pid）"
+        echo "已停（pid ${pid}）"
         ;;
     status)
         if running; then
