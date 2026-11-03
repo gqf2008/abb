@@ -12,20 +12,20 @@
 //! 与本 crate 的测试无关（那些测试验的是 ABB 侧的 mock server 与 bridge 接线），
 //! 本 crate 的契约测试在 `tests/contract.rs`，单测在 `src/main.rs` 底部。
 //!
-//! ## 关于 `allow(dead_code)`
+//! ## 关于 `dead_code`
 //!
-//! 搬过来的 1165 行里，**媒体/群管理等能力本批没接进 MCP 契约**：契约只用到
+//! 这份文件从 ABB 整份搬来时挂着**模块级** `allow(dead_code)`，因为当时契约只用到
 //! `send_text` / `reply_text` / `upload_image` / `upload_file` / `send_media_message`
-//! 这五条，剩下的（`download_resource` / `get_quoted_message` / `add_reaction` /
-//! `del_reaction` / `bot_info` / `create_chat` / `add_managers` / `chat_brief` /
-//! `get_chat_info` / `update_chat` / `delete_chat` / `send_text_to_user` /
-//! `user_name` / `scope_hint` …）**能用且要留**，只是暂时没有调用方。
+//! 这五条，其余能力“能用但暂时没调用方”。注释里写了拆除条件：等入站附件下载
+//! （`download_resource`）、引用消息（`get_quoted_message`）、表情
+//! （`add_reaction`/`del_reaction`）与群管理依次接进契约之后移除。
 //!
-//! 所以这里是模块级 `allow`，但**解除条件明确**：等入站附件下载（`download_resource`）、
-//! 引用消息（`get_quoted_message`）、表情（`add_reaction`/`del_reaction`）与群管理
-//! 依次接进契约之后移除。这与本仓「先关警告」的禁令不冲突——区别在于它写清了
-//! 还剩哪几步，而不是「反正先让它绿」。
-#![allow(dead_code)]
+//! **那些能力已经接上了**（`get_quoted_message` / `download_attachment` / `create_chat` /
+//! `user_display_name` / `typing` / `del_typing` / `done` / `chat_brief` / `get_chat_info`，
+//! 见 `src/main.rs` 的 `tools()`），所以模块级 `allow` 已拆除，只剩逐条标记：
+//! `bot_info` / `update_chat` / `delete_chat` / `send_text_to_user` / `scope_hint`
+//! ——它们属于**群管理与虚拟 Bot 后台**的 GUI 流程，不在 MCP 契约里，且已超出
+//! “可选能力”那一条的范围。只标记这五个而不是整个模块，警告才能继续当信号用。
 
 //! 飞书直连 REST —— tenant_access_token 缓存、发消息（分段）、表情、bot 信息。
 //! base: https://open.feishu.cn/open-apis。token 即 bot 身份（不需要 user token）。
@@ -46,6 +46,14 @@ pub struct FeishuResource {
     /// 下载用的 file_key / image_key
     pub file_key: String,
     pub file_name: String,
+}
+
+/// 一条消息的定位结果：内容 + 「它回复的是哪条」（见 `get_message`）。
+#[derive(Debug, Clone, Default)]
+pub struct FeishuMessage {
+    pub parsed: FeishuParsed,
+    /// 回复消息的原消息 id；非回复消息为空串。
+    pub parent_id: String,
 }
 
 /// 解析后的飞书消息内容：文本 + 资源列表（含富文本里全部图片/资源）。
@@ -260,7 +268,13 @@ impl FeishuClient {
     }
 
     /// 测试用：基址指向本地 mock 服务器（请求形状断言）。与 new 的唯一差异是 base。
+    ///
+    /// 本 crate **目前没有**用它的测试（搬过来的那份 `#[cfg(test)] mod tests` 留在 ABB
+    /// 侧，验的是 mock server 与 bridge 接线）。留着它是因为它是协议层唯一的「可注入基址」
+    /// 入口：将来要在渠道侧做请求形状断言（假 green 清单第 4 条：没测试的能力等于没有），
+    /// 得从它开始。标记 allow 而不是删掉——删了就只剩“以后再写一遍”。
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn with_base(app_id: &str, app_secret: &str, base: &str) -> FeishuClient {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -478,6 +492,16 @@ impl FeishuClient {
     /// `data.items[0]`，`body.content` 是 JSON 字符串（text/post/…），复用 parse_content
     /// 抽取纯文本与全部资源引用。失败返回 Err（调用方 best-effort：拿不到不阻塞回复）。
     pub async fn get_quoted_message(&self, message_id: &str) -> Result<FeishuParsed> {
+        Ok(self.get_message(message_id).await?.parsed)
+    }
+
+    /// 拉取一条消息的**完整定位信息**：内容解析结果 + `parent_id`。
+    ///
+    /// `parent_id` 是「这条消息回复的是哪条」——MCP 侧的 `download_attachment` 只能拿到
+    /// `{message_id, seq}`（ABB 的契约就这么宽），而引用消息的附件用 `seq >= 100` 表示
+    /// （与内置渠道同约定：`bridge/mod.rs` 里 `100 + i`）。渠道要自己从 `parent_id`
+    /// 反查原消息，才能把那个 `file_key` 找出来。
+    pub async fn get_message(&self, message_id: &str) -> Result<FeishuMessage> {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
             .http
@@ -499,10 +523,11 @@ impl FeishuClient {
         let item = &resp["data"]["items"][0];
         let raw = item["body"]["content"].as_str().unwrap_or("");
         let mut parsed = parse_content(raw);
-        // 被引用消息的类型：内容解析不出东西时，这行是唯一能说明「为什么读不到」的线索
+        // 消息的类型：内容解析不出东西时，这行是唯一能说明「为什么读不到」的线索
         // （例如 merge_forward / sticker / 卡片类消息）。
         parsed.msg_type = item["msg_type"].as_str().unwrap_or("").to_string();
-        Ok(parsed)
+        let parent_id = item["parent_id"].as_str().unwrap_or("").to_string();
+        Ok(FeishuMessage { parsed, parent_id })
     }
 
     /// 下载消息内资源（图片/文件/音视频，≤100MB）。返回 (字节, Content-Type)。
@@ -742,6 +767,7 @@ impl FeishuClient {
     }
 
     /// bot 信息（设置窗自动填充 bot_name/bot_open_id）。GET /open-apis/bot/v3/info。
+    #[allow(dead_code)] // 托盘设置窗的自动填充流程不在 MCP 契约里（见文件头 dead_code 说明）
     pub async fn bot_info(&self) -> Result<(String, String)> {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
@@ -910,6 +936,7 @@ impl FeishuClient {
     /// ⚠️ 方法是 **PUT** 不是 PATCH（8-20 真机实测：PATCH /im/v1/chats/:id 返回
     /// 404 page not found——mock 只验形状不验路由，假绿；lark-cli im.chats.update
     /// dry-run 显示 PUT）。owner_id 字段可顺带转让群主（新群主必须在群里）。
+    #[allow(dead_code)] // 虚拟 Bot 编辑：群资料修改（GUI 流程，不是契约能力）
     pub async fn update_chat(&self, chat_id: &str, name: &str, description: &str) -> Result<()> {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
@@ -936,6 +963,7 @@ impl FeishuClient {
 
     /// 解散群（虚拟 Bot 解散：DELETE /im/v1/chats/:chat_id，不可恢复——GUI 侧强确认）。
     /// 需要应用开通 im:chat 或 im:chat:delete 权限（99991672 权限拒绝见 scope_hint）。
+    #[allow(dead_code)] // 虚拟 Bot 解散：不可恢复动作，只应由 GUI 强确认触发
     pub async fn delete_chat(&self, chat_id: &str) -> Result<()> {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self
@@ -960,6 +988,7 @@ impl FeishuClient {
     /// 用途：权限不足时给 owner 发授权指引（见 scope_hint）。与 send_text 同款
     /// 卡片 markdown 分段，只是收件人从 chat_id 换成 open_id（不依赖 primary_chat
     /// 是否可用）。
+    #[allow(dead_code)] // 主动给用户发消息（虚拟 Bot 流程；MCP 契约只按 chat_id 发）
     pub async fn send_text_to_user(&self, open_id: &str, text: &str) -> Result<()> {
         let token = self.tenant_token().await?;
         let chunks = split_text(text, FEISHU_MSG_LIMIT);
@@ -984,6 +1013,7 @@ impl FeishuClient {
 /// 平台权限问题不该只躺在日志/状态行里，owner 需要可执行的下一步。
 /// 参数是任意 API 失败后的完整错误字符串（含 code=… msg=…，见各方法 bail 格式）；
 /// 检测「99991672 或 Access denied」出现才解析，避免误判其它错误码。
+#[allow(dead_code)] // 权限报错的「怎么开通」提示，托盘侧用；本 crate 只向 stderr 报原因
 pub fn scope_hint(err: &str) -> Option<(String, String)> {
     if !err.contains("99991672") && !err.contains("Access denied") {
         return None;

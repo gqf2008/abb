@@ -113,6 +113,57 @@ fn inbox_resource_is_declared_and_readable() {
     assert!(parsed.is_array(), "正文必须是消息数组：{parsed}");
 }
 
+/// **可选能力（契约 §3.4）一个都不能漏声明**：ABB 侧靠 `tools/list` 判能力，
+/// 没声明的工具它永远不会调 —— 代码写了也是死代码。
+///
+/// 这里列的是「本渠道真实现了」的九个：ABB 缺了它们会回落 trait 默认，
+/// 但飞书有能力做到，所以声明面必须与实现同步。
+/// （未声明的只有 `poll` 与 `note_context`/`note_sender`，原因见 README。）
+#[test]
+fn declares_the_optional_contract_tools() {
+    let got = roundtrip(&[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#]);
+    let tools = got[0]["result"]["tools"].as_array().expect("tools 数组");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for want in [
+        "get_quoted_message",
+        "download_attachment",
+        "create_chat",
+        "user_display_name",
+        "typing",
+        "del_typing",
+        "done",
+        "chat_brief",
+        "get_chat_info",
+    ] {
+        assert!(
+            names.contains(&want),
+            "缺 `{want}`：ABB 永远不会调没声明的工具。实际：{names:?}"
+        );
+    }
+    // 每个新增工具的必需参数也要在 schema 里（ABB 按这些 key 传参）。
+    for (tool, required) in [
+        ("get_quoted_message", vec!["message_id"]),
+        ("download_attachment", vec!["message_id", "seq"]),
+        ("create_chat", vec!["name", "owner_user_id"]),
+        ("user_display_name", vec!["user_id"]),
+        ("typing", vec!["message_id"]),
+        ("del_typing", vec!["message_id"]),
+        ("done", vec!["message_id"]),
+        ("chat_brief", vec!["chat_id"]),
+        ("get_chat_info", vec!["chat_id"]),
+    ] {
+        let t = tools
+            .iter()
+            .find(|t| t["name"] == tool)
+            .unwrap_or_else(|| panic!("{tool} 未声明"));
+        assert_eq!(
+            t["inputSchema"]["required"],
+            serde_json::json!(required),
+            "{tool} 的 required 与契约不一致"
+        );
+    }
+}
+
 /// 未知方法要回 error，不是静默成功。
 #[test]
 fn unknown_method_errors() {

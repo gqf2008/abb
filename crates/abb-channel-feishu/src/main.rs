@@ -10,7 +10,43 @@
 //! | 出站 | 工具 `send_text`（必需） | ✅ 走 `feishu::FeishuClient::send_text` |
 //! | 出站 | 工具 `send_thread_reply`（可选） | ✅ 飞书**有话题** ⇒ 声明并走 `reply_text` |
 //! | 出站 | 工具 `send_attachment`（可选） | ✅ base64 内联 → 上传 → 媒体消息 |
+//! | 出站 | 工具 `get_quoted_message` / `create_chat` / `typing` / `del_typing` / `done` / `chat_brief` / `get_chat_info` / `user_display_name` / `download_attachment`（均为可选） | ✅ 见「可选能力」一节 |
 //! | 入站 | `poll` 或 `channel://` 资源订阅 | ✅ **资源订阅**（`channel://inbox`），见下 |
+//!
+//! ## 可选能力（契约 §3.4）
+//!
+//! ABB 侧全部走 `call_optional`：**缺失 / 调用失败 / 返回非 JSON ⇒ 一律 `None`**，
+//! 由 `Messenger` trait 默认值兜底，不阻断主流程。所以这些工具出错**不必假装成功**——
+//! 如实回 JSON-RPC `error`，日志里能看见真因，ABB 那边只是回落默认行为。
+//!
+//! | 工具 | 底层 | 备注 |
+//! |---|---|---|
+//! | `get_quoted_message` | `get_quoted_message` | 回 `{text, msg_type}` |
+//! | `download_attachment` | `download_resource` | 参数只有 `{message_id, seq}`，file_key 由渠道反查（见下）|
+//! | `create_chat` | `create_chat` | 群主=bot、owner 拉进群并设管理员 |
+//! | `user_display_name` | `user_name` | 通讯录 scope 缺失时报错（ABB 用 id 兜底）|
+//! | `typing` / `done` | `add_reaction` | emoji 与内置渠道一致：`Typing` / `DONE` |
+//! | `del_typing` | `del_reaction` | `reaction_id` 可为 null（无表情可撤）|
+//! | `chat_brief` | `chat_brief` | 回 `{chat_type, chat_name}` |
+//! | `get_chat_info` | `get_chat_info` | 回 `{name, description}` |
+//!
+//! **为什么本渠道没有 `note_context` / `note_sender`**：那两项服务于微信（回复要回显
+//! `context_token`）与钉钉（群聊 @ 要记住最近发送者）。飞书的消息事件自带
+//! `message_id` / `chat_id` / `sender_id`，发送不需要回显凭证，也没有这两个状态。
+//! 声明一个内部空转的工具只会让 ABB 误以为它有语义。
+//!
+//! ## `download_attachment` 怎么在只有 `{message_id, seq}` 的条件下拿到 file_key
+//!
+//! 契约刻意不给 `file_key`（§4「ABB 不负责协议细节」），飞书这边也不需要本地缓存：
+//! 用 `GET /im/v1/messages/:id` 反查那条消息的 `body.content`，`parse_content` 抽出的
+//! `resources` 顺序**与入站时 `attachments` 的顺序完全一致**（同一份解析函数），
+//! 所以 `seq` 直接就是下标。
+//!
+//! `seq >= 100` 是 ABB 的**引用消息约定**（`bridge/mod.rs` 的 `100 + i`，与内置渠道同口径）：
+//! 那批附件属于「被回复的那条」，而传进来的 `message_id` 是**回复消息**的 id，
+//! 所以先读它的 `parent_id` 再拉原消息，取 `seq - 100`。
+//! 下载落盘目录默认 `<tmp>/abb-channel-feishu/attachments`，可用
+//! `ABB_FEISHU_DOWNLOAD_DIR` 覆盖（ABB 的 `mcp_channel.env` 下发）。
 //!
 //! ## 为什么入站选「订阅」而不是 `poll`
 //!
@@ -60,6 +96,18 @@ use std::sync::{Arc, Mutex};
 
 use feishu::FeishuClient;
 use serde_json::{json, Value};
+
+/// 「处理中」表情。与内置渠道同一个 emoji（`src/messenger.rs` 的 `typing`），
+/// 换名字会让用户看到两种回执，而对端无从区分。
+const EMOJI_TYPING: &str = "Typing";
+/// 「完成」表情（同上）。
+const EMOJI_DONE: &str = "DONE";
+
+/// 引用消息附件的 `seq` 偏移：ABB 用 `100 + i` 表示「被引用那条消息的第 i 个附件」。
+/// 这是**跨渠道约定**（`bridge/mod.rs`），渠道侧不能自己改。
+const QUOTED_SEQ_BASE: usize = 100;
+/// 下载落盘目录的环境变量名（ABB 的 `mcp_channel.env` 下发；缺省走临时目录）。
+const DOWNLOAD_DIR_ENV: &str = "ABB_FEISHU_DOWNLOAD_DIR";
 
 /// 入站资源的 URI（契约 §3.2 的 A 方案，整渠道一个 inbox）。
 pub const INBOX_URI: &str = "channel://inbox";
@@ -356,6 +404,115 @@ fn tools() -> Value {
                 },
                 "required": ["chat_id", "name", "data_b64"]
             }
+        },
+        {
+            "name": "get_quoted_message",
+            "description": "按 message_id 拉一条历史消息的全文与类型（引用/回复场景读上文）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string", "description": "被引用的消息 id（om_…）"}
+                },
+                "required": ["message_id"]
+            }
+        },
+        {
+            "name": "download_attachment",
+            "description": "下载入站消息的第 seq 个附件到本进程的下载目录，返回本地路径",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string", "description": "消息 id（om_…）"},
+                    "seq": {
+                        "type": "integer",
+                        "description": "第几个附件（从 0 起）；>= 100 表示被引用消息的第 seq-100 个"
+                    }
+                },
+                "required": ["message_id", "seq"]
+            }
+        },
+        {
+            "name": "create_chat",
+            "description": "建群（群主=机器人，owner 拉进群并设为管理员），返回 chat_id",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "群名"},
+                    "description": {"type": "string", "description": "群介绍（可为空）"},
+                    "owner_user_id": {
+                        "type": "string",
+                        "description": "owner 的 open_id（ou_…）：会被拉进群并设为管理员"
+                    }
+                },
+                "required": ["name", "owner_user_id"]
+            }
+        },
+        {
+            "name": "user_display_name",
+            "description": "按 open_id 反查用户显示名（需通讯录 scope）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "用户 open_id（ou_…）"}
+                },
+                "required": ["user_id"]
+            }
+        },
+        {
+            "name": "typing",
+            "description": "给消息加「处理中」表情，返回 reaction_id（供 del_typing 撤销）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string"}
+                },
+                "required": ["message_id"]
+            }
+        },
+        {
+            "name": "del_typing",
+            "description": "撤掉 typing 加上的「处理中」表情（reaction_id 为 null 时无事可做，算成功）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string"},
+                    "reaction_id": {"type": ["string", "null"]}
+                },
+                "required": ["message_id"]
+            }
+        },
+        {
+            "name": "done",
+            "description": "给消息加「完成」表情（处理结束的可见回执）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string"}
+                },
+                "required": ["message_id"]
+            }
+        },
+        {
+            "name": "chat_brief",
+            "description": "查会话类型与名字（历史回填用）；chat_type = p2p | group",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string", "description": "飞书 chat_id（oc_…）"}
+                },
+                "required": ["chat_id"]
+            }
+        },
+        {
+            "name": "get_chat_info",
+            "description": "查群资料（群名 + 群介绍）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string", "description": "飞书 chat_id（oc_…）"}
+                },
+                "required": ["chat_id"]
+            }
         }
     ])
 }
@@ -396,6 +553,168 @@ fn upload_name(name: &str, mime: &str, kind: &str) -> String {
 /// 内联 base64 后体积还要 ×4/3，所以本地先兜一道，别等上传被服务端拒。
 const FEISHU_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 const FEISHU_FILE_MAX_BYTES: usize = 30 * 1024 * 1024;
+
+/// 工具结果的文本段：把结果 JSON 序列化进 `content[0].text`。
+///
+/// ABB 侧 `call_optional` 拿到文本后就是 `serde_json::from_str` —— 所以这里必须是
+/// **JSON 文本**（不是自然语言描述），否则对端只能当作「不支持」。
+fn json_text(v: Value) -> Value {
+    json!({"content": [{"type": "text", "text": v.to_string()}]})
+}
+
+/// 取必填字符串参数。空串与纯空白都算缺：空 `chat_id` / `message_id` 只会换来一个
+/// 费解的飞书 API 错误码，不如在这里就把名字说清楚。
+fn need<'a>(a: &'a Value, tool: &str, key: &str) -> Result<&'a str, String> {
+    a.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{tool} 缺 `{key}`"))
+}
+
+/// 取可选字符串参数（缺失与 `null` 都当空串）。
+fn opt(a: &Value, key: &str) -> String {
+    a.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 把 `{message_id, seq}` 解析成「哪个 file_key、属于哪条消息」。
+///
+/// 飞书契约刻意不给 `file_key`（怎么下载是渠道的事），但也不需要本地缓存消息：
+/// 用 `GET /im/v1/messages/:id` 反查 `body.content`，`parse_content` 抽出的 `resources`
+/// 顺序与入站 `attachments` 完全一致（同一份解析函数），`seq` 直接就是下标。
+///
+/// `seq >= 100` 是 ABB 的引用消息约定（比回复消息自己多 100，`bridge/mod.rs` 的 `100 + i`）：
+/// 那批附件属于**被回复的那条**，而传进来的 `message_id` 是回复消息的 id。
+async fn resolve_resource(
+    ch: &Arc<Channel>,
+    message_id: &str,
+    seq: usize,
+) -> Result<(feishu::FeishuResource, String), String> {
+    let (owner_mid, parsed, idx) = if seq < QUOTED_SEQ_BASE {
+        let m = ch
+            .client
+            .get_message(message_id)
+            .await
+            .map_err(|e| format!("拉消息 {message_id} 失败：{e:#}"))?;
+        (message_id.to_string(), m.parsed, seq)
+    } else {
+        let m = ch
+            .client
+            .get_message(message_id)
+            .await
+            .map_err(|e| format!("拉消息 {message_id} 失败：{e:#}"))?;
+        if m.parent_id.is_empty() {
+            return Err(format!(
+                "seq={seq} 表示**被引用消息**的附件，但消息 {message_id} 不是回复消息\
+                 （事件/接口都没给 parent_id）——是不是把索引算错了？"
+            ));
+        }
+        let parent = ch
+            .client
+            .get_message(&m.parent_id)
+            .await
+            .map_err(|e| format!("拉被引用消息 {} 失败：{e:#}", m.parent_id))?;
+        (m.parent_id, parent.parsed, seq - QUOTED_SEQ_BASE)
+    };
+    let res = parsed.resources.get(idx).cloned().ok_or_else(|| {
+        format!(
+            "消息 {owner_mid} 只有 {} 个附件，没有第 {idx} 个（seq 从 0 起）",
+            parsed.resources.len()
+        )
+    })?;
+    Ok((res, owner_mid))
+}
+
+/// 下载落盘目录：`ABB_FEISHU_DOWNLOAD_DIR` 优先，否则临时目录下的固定子目录。
+fn download_dir() -> std::path::PathBuf {
+    match std::env::var(DOWNLOAD_DIR_ENV) {
+        Ok(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
+        _ => std::env::temp_dir().join("abb-channel-feishu"),
+    }
+}
+
+/// 消息 id 消毒（只用于拼文件名）：只留字母数字与 `-_.`。
+fn sanitize_mid(mid: &str) -> String {
+    let s: String = mid
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "unknown".to_string()
+    } else {
+        s
+    }
+}
+
+/// 文件名消毒：**发送方能完全控制这个字符串** ⇒ 不消毒就能用 `../../x` 写到目录外。
+/// 只取末段（`/` 与 `\\` 都算分隔符）、去控制字符、去前导点（`.` / `..` / 隐藏文件）。
+/// 中文等非 ASCII 字符保留——它们是文件名的一部分，不是风险。
+fn sanitize_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    base.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .trim_start_matches('.')
+        .to_string()
+}
+
+/// 按 mime 补一个扩展名（只在发送方没给文件名时用）。
+fn ext_from_mime(mime: &str) -> &'static str {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match base.as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/ogg" => "ogg",
+        "video/mp4" => "mp4",
+        _ => "bin",
+    }
+}
+
+/// 附件的落盘文件名：优先用发送方给的名字（消毒过），没有就按 mime / `seq` 补。
+fn download_file_name(res: &feishu::FeishuResource, seq: usize, mime: &str) -> String {
+    let given = sanitize_name(res.file_name.trim());
+    if !given.is_empty() {
+        return given;
+    }
+    let stem = if res.kind == "image" { "image" } else { "file" };
+    format!("{stem}_{seq}.{}", ext_from_mime(mime))
+}
+
+/// 把下载到的字节写到 `download_dir()/attachments/<mid>_<seq>_<name>`。
+fn save_download(
+    message_id: &str,
+    seq: usize,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    let dir = download_dir().join("attachments");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("建下载目录失败（{}）：{e}", dir.display()))?;
+    let path = dir.join(format!("{}_{seq}_{file_name}", sanitize_mid(message_id)));
+    std::fs::write(&path, bytes).map_err(|e| format!("写附件失败（{}）：{e}", path.display()))?;
+    Ok(path.display().to_string())
+}
 
 fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -470,6 +789,138 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             })
             .map_err(|e| format!("send_attachment 失败：{e:#}"))?;
             Ok(json!({"content": [{"type": "text", "text": "ok"}]}))
+        }
+        // ── 契约 §3.4 的可选能力 ────────────────────────────────────────
+        //
+        // 这些工具的错误都用 `Err` 上报（不是静默空串）：ABB 侧 `call_optional` 会把它
+        // 记成一行日志并回落 trait 默认值，所以「如实报错」对它无害，而「假装成功」
+        // （比如回空 path）反而会把一次下载失败变成一个读不到的假文件。
+        "get_quoted_message" => {
+            let message_id = need(&a, "get_quoted_message", "message_id")?;
+            let parsed = rt()
+                .block_on(ch.client.get_quoted_message(message_id))
+                .map_err(|e| format!("get_quoted_message 失败：{e:#}"))?;
+            // `msg_type` 是「为什么读不到内容」的唯一线索（merge_forward/sticker/卡片），
+            // 文本为空时也得交出去。
+            // 未识别的富文本元素同样落 stderr：不带这行就只能看到「内容为空」而猜不原因。
+            if !parsed.unparsed_tags.is_empty() {
+                eprintln!(
+                    "[feishu-mcp] 引用消息 {message_id} 含未识别元素 {:?}（可能因此读不全）",
+                    parsed.unparsed_tags
+                );
+            }
+            Ok(json_text(json!({
+                "text": parsed.text,
+                "msg_type": parsed.msg_type,
+            })))
+        }
+        "download_attachment" => {
+            let message_id = need(&a, "download_attachment", "message_id")?;
+            let seq = a.get("seq").and_then(|v| v.as_u64()).ok_or_else(|| {
+                "download_attachment 缺 `seq`（第几个附件，从 0 起；>=100 表示被引用消息）"
+                    .to_string()
+            })? as usize;
+            let rt = rt();
+            let (res, owner_mid) = rt.block_on(resolve_resource(ch, message_id, seq))?;
+            let (bytes, mime) = rt
+                .block_on(
+                    ch.client
+                        .download_resource(&owner_mid, &res.file_key, &res.kind),
+                )
+                .map_err(|e| format!("download_attachment 下载失败：{e:#}"))?;
+            let mime = if mime.trim().is_empty() {
+                "application/octet-stream".to_string()
+            } else {
+                mime
+            };
+            let file_name = download_file_name(&res, seq, &mime);
+            let path = save_download(message_id, seq, &file_name, &bytes)?;
+            eprintln!(
+                "[feishu-mcp] 附件已下载 mid={message_id} seq={seq} kind={} size={} → {path}",
+                res.kind,
+                bytes.len()
+            );
+            Ok(json_text(json!({
+                "kind": res.kind,
+                "file_name": file_name,
+                "mime": mime,
+                "size": bytes.len(),
+                "path": path,
+            })))
+        }
+        "create_chat" => {
+            let name = need(&a, "create_chat", "name")?;
+            let description = opt(&a, "description");
+            // owner 不能为空：群主是机器人，owner 靠 `user_id_list` 被拉进群
+            // （不传的话用户在飞书里根本看不到这个群，实测踩过）。
+            let owner = need(&a, "create_chat", "owner_user_id")?;
+            let chat_id = rt()
+                .block_on(ch.client.create_chat(name, &description, owner))
+                .map_err(|e| format!("create_chat 失败：{e:#}"))?;
+            eprintln!("[feishu-mcp] 已建群 {chat_id} name={name} owner={owner}");
+            Ok(json_text(json!({"chat_id": chat_id})))
+        }
+        "user_display_name" => {
+            let user_id = need(&a, "user_display_name", "user_id")?;
+            let name = rt().block_on(ch.client.user_name(user_id)).ok_or_else(|| {
+                format!(
+                    "user_display_name 查不到 {user_id} 的姓名\
+                         （缺通讯录 scope、用户离职或机器人看不到该用户）"
+                )
+            })?;
+            Ok(json_text(json!({"name": name})))
+        }
+        "typing" => {
+            let message_id = need(&a, "typing", "message_id")?;
+            let reaction_id = rt()
+                .block_on(ch.client.add_reaction(message_id, EMOJI_TYPING))
+                .ok_or_else(|| {
+                    format!(
+                        "typing 加表情（{EMOJI_TYPING}）失败\
+                         ：消息不可见 / 缺 im:message.reaction 权限"
+                    )
+                })?;
+            Ok(json_text(json!({"reaction_id": reaction_id})))
+        }
+        "del_typing" => {
+            let message_id = need(&a, "del_typing", "message_id")?;
+            // `reaction_id` 允许 null（ABB 的 `Option<String>`）：没加成功过就无事可撤，
+            // 算成功——这跟「删不掉却报成功」不是一回事（真给了 id 才真去删）。
+            let reaction_id = opt(&a, "reaction_id");
+            rt().block_on(ch.client.del_reaction(message_id, &reaction_id));
+            Ok(json_text(json!({})))
+        }
+        "done" => {
+            let message_id = need(&a, "done", "message_id")?;
+            if rt()
+                .block_on(ch.client.add_reaction(message_id, EMOJI_DONE))
+                .is_none()
+            {
+                return Err(format!(
+                    "done 加表情（{EMOJI_DONE}）失败：消息不可见 / 缺 im:message.reaction 权限"
+                ));
+            }
+            Ok(json_text(json!({})))
+        }
+        "chat_brief" => {
+            let chat_id = need(&a, "chat_brief", "chat_id")?;
+            let (chat_type, chat_name) = rt()
+                .block_on(ch.client.chat_brief(chat_id))
+                .map_err(|e| format!("chat_brief 失败：{e:#}"))?;
+            Ok(json_text(json!({
+                "chat_type": chat_type,
+                "chat_name": chat_name,
+            })))
+        }
+        "get_chat_info" => {
+            let chat_id = need(&a, "get_chat_info", "chat_id")?;
+            let (name, description) = rt()
+                .block_on(ch.client.get_chat_info(chat_id))
+                .map_err(|e| format!("get_chat_info 失败：{e:#}"))?;
+            Ok(json_text(json!({
+                "name": name,
+                "description": description,
+            })))
         }
         other => Err(format!("未知工具 `{other}`")),
     }
@@ -550,10 +1001,12 @@ mod tests {
         handle(ch, &req).expect("要回包")
     }
 
-    /// 三个出站工具必须全部声明——`send_thread_reply` 尤其重要：
+    /// 所有工具必须全部声明。`send_thread_reply` 尤其重要：
     /// 飞书**有话题**，不声明它 ABB 就会把所有回复拍平到主聊天。
+    /// 剩下的九个是契约 §3.4 的可选能力：ABB 侧缺了就回落 trait 默认，
+    /// 但本渠道**能实现**，所以一个都不该漏。
     #[test]
-    fn tools_list_declares_all_three_outbound_tools() {
+    fn tools_list_declares_the_whole_contract_surface() {
         let names: Vec<String> = tools()
             .as_array()
             .unwrap()
@@ -562,8 +1015,177 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["send_text", "send_thread_reply", "send_attachment"]
+            vec![
+                "send_text",
+                "send_thread_reply",
+                "send_attachment",
+                "get_quoted_message",
+                "download_attachment",
+                "create_chat",
+                "user_display_name",
+                "typing",
+                "del_typing",
+                "done",
+                "chat_brief",
+                "get_chat_info",
+            ],
+            "声明面 = ABB 能看到的全部能力，改动要同步 README 与 tests/contract.rs"
         );
+    }
+
+    /// 每个工具都要有 `inputSchema.required`（空的也要是数组）：
+    /// 只写名字不写 schema 等于让调用方猜参数名，猜错就是运行时错误。
+    #[test]
+    fn every_tool_declares_an_input_schema() {
+        for t in tools().as_array().unwrap() {
+            let name = t["name"].as_str().unwrap();
+            assert_eq!(
+                t["inputSchema"]["type"], "object",
+                "{name} 的 schema 是对象"
+            );
+            assert!(
+                t["inputSchema"]["required"].is_array(),
+                "{name} 的 required 必须是数组（哪怕是空的）：{t}"
+            );
+            assert!(
+                !t["description"].as_str().unwrap_or("").is_empty(),
+                "{name} 缺 description（ABB 面板靠它展示能力）"
+            );
+        }
+    }
+
+    /// **结果必须是「`content[0].text` 里装一份 JSON」**：ABB 的 `call_optional`
+    /// 拿到文本就 `serde_json::from_str`，解不了就当作「该渠道不支持」（静默丢能力）。
+    #[test]
+    fn tool_result_carries_json_in_text_segment() {
+        let v = json_text(json!({"chat_id": "oc_1"}));
+        assert_eq!(v["content"][0]["type"], "text");
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(text).unwrap()["chat_id"],
+            "oc_1"
+        );
+    }
+
+    /// 必填参数缺失要**点名是哪个**（不是模糊的“参数错误”）。
+    /// 这些路径在触网之前就返回，所以能离线跑。
+    #[test]
+    fn missing_required_arguments_name_the_field() {
+        let ch = fake_channel();
+        for (tool, args, want) in [
+            ("get_quoted_message", json!({}), "message_id"),
+            (
+                "get_quoted_message",
+                json!({"message_id": "  "}),
+                "message_id",
+            ),
+            ("download_attachment", json!({}), "message_id"),
+            ("download_attachment", json!({"message_id": "om_1"}), "seq"),
+            ("create_chat", json!({}), "name"),
+            ("create_chat", json!({"name": "群"}), "owner_user_id"),
+            ("user_display_name", json!({}), "user_id"),
+            ("typing", json!({}), "message_id"),
+            ("del_typing", json!({}), "message_id"),
+            ("done", json!({}), "message_id"),
+            ("chat_brief", json!({}), "chat_id"),
+            ("get_chat_info", json!({}), "chat_id"),
+        ] {
+            let e = call_tool(&ch, &json!({"name": tool, "arguments": args}))
+                .expect_err("缺参数必须报错，不能静默成功");
+            assert!(e.contains(want), "{tool} 的报因要点名缺 `{want}`：{e}");
+        }
+    }
+
+    /// `del_typing` 的 `reaction_id` 为 null / 缺失时要**当成无事可做而成功**：
+    /// 没加成功过就没有东西可撤（`del_reaction` 遇到空 id 直接返回，不触网）。
+    #[test]
+    fn del_typing_without_reaction_id_is_a_noop_success() {
+        let ch = fake_channel();
+        for args in [
+            json!({"message_id": "om_1"}),
+            json!({"message_id": "om_1", "reaction_id": Value::Null}),
+        ] {
+            let r = call_tool(&ch, &json!({"name": "del_typing", "arguments": args}))
+                .expect("无 reaction_id 不该报错");
+            let text = r["content"][0]["text"].as_str().unwrap();
+            assert_eq!(serde_json::from_str::<Value>(text).unwrap(), json!({}));
+        }
+    }
+
+    /// 发送方能控制 `file_name` ⇒ 必须抽掉目录分隔符与前导点，否则能写到目录外。
+    #[test]
+    fn download_name_cannot_escape_the_directory() {
+        assert_eq!(sanitize_name("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_name("..\\..\\win.ini"), "win.ini");
+        assert_eq!(sanitize_name(".."), "");
+        assert_eq!(sanitize_name(".hidden"), "hidden");
+        assert_eq!(
+            sanitize_name("报表 2026.xlsx"),
+            "报表 2026.xlsx",
+            "中文名是合法的"
+        );
+        assert_eq!(sanitize_name("a\u{7}b"), "ab", "控制字符要去掉");
+        // 消息 id 同样只用于拼名字，也消毒。
+        assert_eq!(sanitize_mid("om_1/../x"), "om_1_.._x");
+        assert_eq!(sanitize_mid(""), "unknown");
+    }
+
+    /// 没给文件名时按 mime 补一个（飞书图片消息常带空 file_name）：
+    /// ABB 拿 `file_name` 判图片/文件并抽扩展名，空名字会让它整份失真。
+    #[test]
+    fn download_file_name_falls_back_to_mime() {
+        let img = feishu::FeishuResource {
+            kind: "image".into(),
+            file_key: "img_1".into(),
+            file_name: String::new(),
+        };
+        assert_eq!(download_file_name(&img, 0, "image/png"), "image_0.png");
+        assert_eq!(
+            download_file_name(&img, 2, "application/octet-stream; charset=x"),
+            "image_2.bin"
+        );
+        let doc = feishu::FeishuResource {
+            kind: "file".into(),
+            file_key: "file_1".into(),
+            file_name: "报表.xlsx".into(),
+        };
+        assert_eq!(download_file_name(&doc, 1, "text/plain"), "报表.xlsx");
+        assert_eq!(ext_from_mime("application/pdf"), "pdf");
+        assert_eq!(ext_from_mime("image/jpeg"), "jpg");
+        assert_eq!(ext_from_mime(""), "bin");
+    }
+
+    /// 下载目录：env 覆盖优先，否则临时目录下的固定子目录；落盘后读得回来，
+    /// 且文件名带 mid/seq 前缀（同一消息的多个附件不会互盖）。
+    ///
+    /// **两件事写在一个用例里是故意的**：中间要改 `ABB_FEISHU_DOWNLOAD_DIR`，
+    /// 而 env 是进程级共享状态，拆成两个用例会在并行执行时互相干扰。
+    #[test]
+    fn download_dir_env_override_and_save_download() {
+        // 默认值形状：绝对路径 + 带渠道名（同一台机器上能认出是谁写的）。
+        // 前提是本文件里只有这个用例碰该 env（见上）。
+        std::env::remove_var(DOWNLOAD_DIR_ENV);
+        let d = download_dir();
+        assert!(d.is_absolute(), "下载目录必须是绝对路径：{d:?}");
+        assert!(
+            d.ends_with("abb-channel-feishu"),
+            "默认目录应带渠道名：{d:?}"
+        );
+
+        let dir = std::env::temp_dir().join(format!("abb-cfs-test-{}", std::process::id()));
+        std::env::set_var(DOWNLOAD_DIR_ENV, &dir);
+        assert_eq!(download_dir(), dir, "env 覆盖必须生效");
+        let written = (|| {
+            let p1 = save_download("om_1", 0, "a.txt", b"hello")?;
+            let p2 = save_download("om_1", 1, "a.txt", b"world")?;
+            Ok::<_, String>((p1, p2))
+        })();
+        std::env::remove_var(DOWNLOAD_DIR_ENV);
+        let (p1, p2) = written.expect("写附件");
+        assert_ne!(p1, p2, "同一消息的不同 seq 不能互相覆盖");
+        assert_eq!(std::fs::read(&p1).unwrap(), b"hello");
+        assert!(p1.ends_with("om_1_0_a.txt"), "实际：{p1}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 入站资源必须列出来（不是空数组——那会让 ABB 判「无入站」）。
