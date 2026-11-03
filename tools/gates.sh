@@ -336,6 +336,12 @@ tools/check-prose-claims.sh
 # 两次都表现为「跨包 e2e 静默 skip」——而 skip 默认等于通过。
 tools/check_gates_order.sh
 tools/check_script_modes.sh
+# 「渠道 crate 声明的工具名」与「契约 TOOL_* 常量」逐字对齐。
+# 写错一个字母的后果不是报错而是**静默降级**：ABB 调 get_quoted_message、
+# crate 声明 get_quote_message ⇒ has_tool 返回 false ⇒ 回落 trait 默认（返回 None）
+# ⇒ 引用消息悄悄不进 prompt，日志里什么也看不到。
+# 双向查：crate 多出契约没有的名字（拼错/自造）、契约有名字但没人实现。
+tools/check_channel_tool_names.sh
 # 变异自测：证明上面那些自测**真的能咬住回归**（评审 B3 的教训——手工变异逃逸过两次）。
 # 它在临时副本里改代码、跑自测、销毁，主检出不受影响。
 tools/review-cadence/mutation-selftest.sh
