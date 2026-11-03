@@ -299,6 +299,10 @@ tools/check-prose-claims.sh
 # （mutation-selftest.sh 与 arch-check.sh 先后提交成 644）。两次都是**本地绿、
 # 干净检出红**（chmod 只改工作区，git 索引仍 644），所以「跑一遍门禁」发现不了它。
 # 它读的是 git ls-files 的 mode，不是文件系统权限。
+# gates.sh 自己的**顺序约束**：crate 组 → 各自 export → root 组。
+# 这个顺序 2026-11-03 一天错了两次（微信的 export 在测试之后、飞书的整组在 root 之后），
+# 两次都表现为「跨包 e2e 静默 skip」——而 skip 默认等于通过。
+tools/check_gates_order.sh
 tools/check_script_modes.sh
 # 变异自测：证明上面那些自测**真的能咬住回归**（评审 B3 的教训——手工变异逃逸过两次）。
 # 它在临时副本里改代码、跑自测、销毁，主检出不受影响。

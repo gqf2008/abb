@@ -1,0 +1,49 @@
+# abb-channel-dingtalk —— 钉钉渠道的**独立 MCP server**。
+#
+# 与飞书版（`crates/abb-channel-feishu`）同构：协议层整份搬、只换进程边界。
+# 为什么搬迁而不是删除：`src/dingtalk.rs` 的 1764 行是**能用的实现**（Stream 长连接、
+# 加签/回调解析、媒体上传、群管理），删掉换「理论上能接」是净损失；搬到独立进程则
+# 功能不丢、只换边界，且随时能搬回来。
+#
+# 与飞书版的**唯一结构差异**在出站工具集：钉钉**没有话题概念** ⇒ 不声明
+# `send_thread_reply`（飞书有，声明了才不会被拍平到主聊天）。入站两边一致：
+# 都是服务端推的长连接 ⇒ 用 `channel://inbox` 资源订阅（A 方案），不是 `poll`。
+#
+# 依赖只列**实际用到**的：
+#   - `reqwest`（v1.0 OpenAPI + 旧网关 topapi + multipart 上传）
+#   - `tokio-tungstenite`（Stream 长连接，文本帧 JSON）
+#   - `futures-util`（ws split / SinkExt / StreamExt）
+#   - `fastrand`（重连抖动，与 ABB root 同一个 crate）
+# 与飞书版相比**少**了 `pulldown-cmark`（钉钉没有卡片 markdown 清洗）与 `uuid`
+# （`create_chat` 的幂等键钉钉用不上）；**多**了什么都没加——钉钉的加签（HMAC）与
+# 回调加解密（AES）属于**回调模式**，Stream 模式下不经过它们，所以既不用 `hmac`
+# 也不用 `aes`。多一个依赖就多一份编译时间与攻击面。
+#
+# 自带 manifest + lock（与 abb-agent / abb-chart / abb-channel-feishu /
+# abb-channel-wechat 同构），root 的 fmt/clippy/test 不碰它。
+#
+# 构建：cargo build --release --manifest-path crates/abb-channel-dingtalk/Cargo.toml
+[package]
+name = "abb-channel-dingtalk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+repository = "https://github.com/gqf2008/abb"
+description = "钉钉渠道的独立 MCP server（ABB 总线的渠道侧实现）"
+
+[[bin]]
+name = "abb-channel-dingtalk"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls-webpki-roots"] }
+# Stream 长连接：鉴权靠 `open_connection` 换一次性 ticket，连上就是 JSON 文本帧
+# （与 ABB root 同版本；与飞书版的差别是钉钉不用自定义二进制帧编解码，所以没有 `proto.rs`）
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+# 重连抖动（3s + 0..1s）——与 ABB root 同一个 crate
+fastrand = "2"
