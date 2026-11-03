@@ -33,8 +33,44 @@ collect() {
         | sed -E 's/^[[:space:]]*//'
 }
 
+# 第三类数据源：**文档里承诺「直接执行」的脚本**。
+#
+# 为什么需要（2026-11-02 实测）：`tools/channel-mcp-dir/verify.sh` 与
+# `channel_mcp_dir.py` 在 git 里是 100644，而 README/提交信息里写的是
+# `sh verify.sh`（照做也能跑）和「可执行」。评审发现时门禁是绿的——
+# 因为上面两个数据源只覆盖「gates.sh / ci.toml 里的裸调用」。
+#
+# 判据不看「文档怎么写」（那太脆），而是看**同目录下已被允许的可执行位**：
+# 任何 `tools/` 下的 `.sh` / `.py`，若同目录已有 100755 的兄弟，就视为
+# 「这类文件应当可执行」。听起来绕，但它挡住了真实的漏：新增脚本时
+# 人会记得 chmod 同目录第一个，忘了后来加的。
+siblings_exec() {
+    local dir="$1"
+    git ls-files -s "$dir" 2>/dev/null \
+        | awk '$1=="100755"{found=1} END{exit found?0:1}'
+}
+
+# 找出 tools/ 下所有 .sh/.py，按目录分组；目录里有 100755 兄弟的，全部要求 100755。
+dirs_with_exec="$(
+    git ls-files 'tools/*.sh' 'tools/*.py' 2>/dev/null | xargs -n1 dirname 2>/dev/null | sort -u \
+    | while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        siblings_exec "$d" && echo "$d"
+      done
+)"
+sibling_targets=""
+if [ -n "$dirs_with_exec" ]; then
+    sibling_targets="$(
+        printf '%s\n' "$dirs_with_exec" | while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            git ls-files "$d/*.sh" "$d/*.py" 2>/dev/null
+        done | sort -u
+    )"
+fi
+
 targets="$(
-    { collect tools/gates.sh; collect .walgit/ci.toml; } | sort -u
+    { collect tools/gates.sh; collect .walgit/ci.toml; \
+      [ -n "$sibling_targets" ] && printf '%s\n' "$sibling_targets"; } | sort -u
 )"
 
 if [ -z "$targets" ]; then
@@ -60,7 +96,9 @@ while IFS= read -r p; do
     if [ "$mode" != "100755" ]; then
         fail=$((fail + 1))
         ws=$(ls -l "$p" | awk '{print $1}')
-        printf '❌ %s：git 里是 %s，门禁裸路径调用 ⇒ 干净检出 Permission denied\n' "$p" "$mode"
+        # 文案不再只说「门禁裸路径调用」——本判据现在也覆盖「同目录有可执行兄弟」
+        # 这一类（见上面 siblings_exec 的注释）。说错原因会让人往错方向修。
+        printf '❌ %s：git 里是 %s，但按本仓约定它应当可执行 ⇒ 干净检出 Permission denied\n' "$p" "$mode"
         printf '     （工作区当前是 %s——所以本地自测可能是绿的，别被骗）\n' "$ws"
         printf '     修法：git update-index --chmod=+x %s\n' "$p"
     fi
