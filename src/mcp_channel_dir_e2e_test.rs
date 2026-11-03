@@ -309,4 +309,14 @@ fn abb_negotiates_real_wechat_channel() {
         err.contains("poll") || err.contains("失败") || err.contains("token"),
         "应当是取消息阶段的错误（说明协商通过了）：{err}"
     );
+
+    // **显式标记本用例真的跑了**（评审 a4040fdf 的 non-blocking）。
+    //
+    // 为什么需要：判据原来写的是「门禁输出里 `grep -c abb_negotiates_real_wechat ≥ 1`」——
+    // 但测试名本身就会出现在输出里（编译、运行、结果三行），**skip 时也成立**。
+    // 那是假绿判据：它数的是「这个测试被登记了」，不是「它真的执行到断言」。
+    //
+    // 这行的作用是：只有在**拿到二进制、真起了子进程、走完协商**之后才会打印。
+    // 门禁里 `grep -q 'ABB_WECHAT_E2E_RAN'` 才是有意义的判据。
+    eprintln!("ABB_WECHAT_E2E_RAN（已起真子进程并完成协商）");
 }

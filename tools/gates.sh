@@ -135,28 +135,11 @@ chart_target="$CARGO_TARGET_DIR-chart"
 mkdir -p "$chart_target"
 
 cd "$repo_root"
-echo "== ABB 门禁：root 包（中间产物外置于 ${CARGO_TARGET_DIR}）=="
-cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo build --locked
-tools/check_test_isolation.sh
-# 兜底：清掉 TMPDIR 里陈旧的测试夹具（见脚本头注；根因修复在 src/testtmp.rs 的 RAII 归属）。
-tools/clean_test_fixtures.sh
 
-# crates/abb-chart 是独立包，root 的四条碰不到它（见头注）⇒ 这里补一组 `--manifest-path` 门禁。
-# 测试不用 tools/check_test_isolation.sh：那个守卫查的是「测试不得写 ~/.agent-bridge」（root 包
-# 有大量运行数据落点），而 chart 只管出图、不碰运行目录；它要的是**离线可跑**（`--offline`）：
-# 随包分发的 CLI 不该为了跑单测去联网。cargo 跑测试二进制时 cwd 就是包根，manifest 仍用绝对
-# 路径（免得将来有人在这段前面 `cd` 到别处，静默跑错包）。
-echo "== ABB 门禁：crates/abb-chart（独立包，中间产物外置于 ${chart_target}）=="
-(
-  export CARGO_TARGET_DIR="$chart_target"
-  cargo fmt --manifest-path "$chart_manifest" --check
-  cargo clippy --manifest-path "$chart_manifest" --locked --all-targets -- -D warnings
-  cargo build --manifest-path "$chart_manifest" --locked
-  cargo test --manifest-path "$chart_manifest" --offline
-)
-
+# **微信 crate 必须先建**：root 组第 4 条（`check_test_isolation.sh`）会跑
+# `src/mcp_channel_dir_e2e_test.rs` 里那条 `abb_negotiates_real_wechat`，
+# 它要找微信 crate 的二进制。建在后面 ⇒ 那条 e2e 永远 skip。
+# 评审 a4040fdf 抓到的就是这个：我把 export 放在了测试跑完之后。
 # crates/abb-channel-wechat 同样是独立包，root 的四条也碰不到它。
 #
 # **为什么必须加这一组**（2026-11-03 实测）：那个包从建起来到功能做完，
@@ -194,6 +177,29 @@ if [ -x "$WECHAT_BIN" ]; then
 else
   echo "⚠️  没构建出 $WECHAT_BIN ⇒ root 的微信 e2e 将跳过（不是失败）"
 fi
+
+
+echo "== ABB 门禁：root 包（中间产物外置于 ${CARGO_TARGET_DIR}）=="
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked
+tools/check_test_isolation.sh
+# 兜底：清掉 TMPDIR 里陈旧的测试夹具（见脚本头注；根因修复在 src/testtmp.rs 的 RAII 归属）。
+tools/clean_test_fixtures.sh
+
+# crates/abb-chart 是独立包，root 的四条碰不到它（见头注）⇒ 这里补一组 `--manifest-path` 门禁。
+# 测试不用 tools/check_test_isolation.sh：那个守卫查的是「测试不得写 ~/.agent-bridge」（root 包
+# 有大量运行数据落点），而 chart 只管出图、不碰运行目录；它要的是**离线可跑**（`--offline`）：
+# 随包分发的 CLI 不该为了跑单测去联网。cargo 跑测试二进制时 cwd 就是包根，manifest 仍用绝对
+# 路径（免得将来有人在这段前面 `cd` 到别处，静默跑错包）。
+echo "== ABB 门禁：crates/abb-chart（独立包，中间产物外置于 ${chart_target}）=="
+(
+  export CARGO_TARGET_DIR="$chart_target"
+  cargo fmt --manifest-path "$chart_manifest" --check
+  cargo clippy --manifest-path "$chart_manifest" --locked --all-targets -- -D warnings
+  cargo build --manifest-path "$chart_manifest" --locked
+  cargo test --manifest-path "$chart_manifest" --offline
+)
 
 # 协作门禁（crates/* 之外，跑得快、不联网、不编译）：这两条守的是「合并闸门本身」，
 # 之前只在 .walgit/ci.toml 里跑，本地 gates.sh 漏了 —— 而协调者合并前跑的是 gates.sh
