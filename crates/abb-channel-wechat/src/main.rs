@@ -42,6 +42,12 @@ struct Channel {
     user_id: Mutex<String>,
     /// 二维码与登录态的输出目录（`--dir`）。
     dir: PathBuf,
+    /// 当前待扫的二维码句柄（`login` 拿到的那个）。`login_status` 用它轮询。
+    ///
+    /// 为什么存在进程内存而不是磁盘：它是**一次登录会话**的临时句柄，
+    /// 进程重启后本来就该重新扫码。落盘反而会让「上次那个二维码还能不能扫」
+    /// 变成一个需要判断的状态。
+    qrcode: Mutex<Option<String>>,
 }
 
 fn main() {
@@ -68,6 +74,7 @@ fn main() {
         cursor: Mutex::new(String::new()),
         user_id: Mutex::new(user_id),
         dir,
+        qrcode: Mutex::new(None),
     });
 
     if token.is_empty() {
@@ -178,8 +185,31 @@ fn tools() -> Value {
             "name": "login",
             "description": "扫码登录：渲染二维码 PNG 到 --dir，返回图片路径（给人扫）",
             "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "login_status",
+            "description": "轮询扫码状态。confirmed 时返回 token/base_url/user_id（写进 ABB 的 mcp_channel.env）",
+            "inputSchema": {"type": "object", "properties": {}}
         }
     ])
+}
+
+/// 登录成功时返回给 ABB 的**结果体**。
+///
+/// 抽成独立函数只有一个理由：**让单测验真代码路径**。
+/// 原来测试里自己写了一遍 `json!`，于是「把 token 塞进结果」的变异抓不到——
+/// 那是空断言。
+///
+/// 契约：**绝不包含 token 本身**。工具结果会被 ABB 落进会话历史/日志，
+/// 凭证只该走一次性的 stderr 提示（见调用处的 eprintln）。
+fn login_result(login: &weixin::WeixinLogin) -> Value {
+    json!({
+        "status": "confirmed",
+        "base_url": login.base_url,
+        "user_id": login.user_id,
+        "token_len": login.token.chars().count(),
+        "hint": "token 已打印到 stderr（不放进工具结果，避免被日志留存）",
+    })
 }
 
 fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
@@ -241,14 +271,57 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             let (qc, _uuid) = rt
                 .block_on(weixin::fetch_qrcode())
                 .map_err(|e| format!("取二维码失败：{e}"))?;
+            // 记下句柄供 `login_status` 轮询（见 Channel::qrcode 的注释）。
+            if let Ok(mut q) = ch.qrcode.lock() {
+                *q = Some(qc.clone());
+            }
             let p = weixin::save_qrcode_image(&ch.dir, &qc)
                 .map_err(|e| format!("写二维码失败：{e}"))?;
             // 路径打到 stderr：人看得到，ABB 不会误读成协议数据。
             eprintln!("[wechat-mcp] 请用微信扫码：{}", p.display());
             Ok(json!({"content": [{"type": "text", "text": json!({
                 "qrcode_path": p.display().to_string(),
-                "next": "扫码后调 login_status 拿 token（未实现，见卡）",
+                "next": "扫码后调 login_status；confirmed 时返回 token/base_url/user_id",
             }).to_string()}]}))
+        }
+        "login_status" => {
+            let qc = ch
+                .qrcode
+                .lock()
+                .map_err(|_| "qrcode 锁中毒".to_string())?
+                .clone()
+                .ok_or_else(|| "还没调 login 拿二维码".to_string())?;
+            let rt = rt();
+            match rt.block_on(weixin::poll_qr_status(&qc)) {
+                // wait / scaned：还没确认。返回 pending 而不是错误——
+                // 「用户还没扫」是正常状态，不是失败。
+                Ok(None) => Ok(json!({"content": [{"type": "text", "text": json!({
+                    "status": "pending",
+                    "hint": "还没确认（未扫或已扫待确认）",
+                }).to_string()}]})),
+                Ok(Some(login)) => {
+                    // 结果体抽成函数：单测要能验**真代码路径**产出的形状，
+                    // 而不是测试里自己再写一遍 json!（那样是空断言，变异抓不到）。
+                    let body = login_result(&login);
+                    // 登录成功后把凭证打到 stderr：人能看见，ABB 不会误读成协议数据。
+                    // **不写进返回值里的 token 字段**是有意的——工具结果可能被日志/历史记录，
+                    // 凭证只该走一次性的 stderr 提示。
+                    eprintln!(
+                        "[wechat-mcp] 登录成功。把下面三行写进 ABB 的 mcp_channel.env：\n\
+                         WX_TOKEN={}\nWX_BASE_URL={}\nWX_USER_ID={}",
+                        login.token, login.base_url, login.user_id
+                    );
+                    // 同时更新进程内 client 的 user_id（防自循环要用）。
+                    if let Ok(mut u) = ch.user_id.lock() {
+                        *u = login.user_id.clone();
+                    }
+                    Ok(json!({"content": [{"type": "text", "text": body.to_string()}]}))
+                }
+                Err(e) => Ok(json!({"content": [{"type": "text", "text": json!({
+                    "status": "error",
+                    "message": e.to_string(),
+                }).to_string()}]})),
+            }
         }
         other => Err(format!("未知工具 `{other}`")),
     }
@@ -305,6 +378,7 @@ mod tests {
             cursor: Mutex::new(String::new()),
             user_id: Mutex::new("me".into()),
             dir: PathBuf::from("."),
+            qrcode: Mutex::new(None),
         })
     }
 
@@ -319,7 +393,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, vec!["send_text", "poll", "login"]);
+        assert_eq!(names, vec!["send_text", "poll", "login", "login_status"]);
         assert!(
             !names.contains(&"send_thread_reply".to_string()),
             "微信无话题概念，不该声明它（否则 ABB 不回落 send_text）"
@@ -383,6 +457,39 @@ mod tests {
             ..Default::default()
         };
         assert!(to_channel_message(&ch, &m).is_none());
+    }
+
+    /// **没调 `login` 就调 `login_status` 必须报错**，不能说「pending」——
+    /// 后者会让用户一直等一个根本不存在的二维码。
+    #[test]
+    fn login_status_without_login_errors() {
+        let e = call_tool(&fake_channel(), &json!({"name":"login_status","arguments":{}}))
+            .unwrap_err();
+        assert!(e.contains("还没调 login"), "报因要指路：{e}");
+    }
+
+    /// 登录成功后 **token 不得出现在工具结果里**。
+    ///
+    /// 工具结果会被 ABB 落进会话历史/日志；凭证只该走一次性的 stderr 提示。
+    ///
+    /// **必须调真函数 `login_result`**：第一版在测试里自己写了一遍 `json!`，
+    /// 于是「把 token 塞进结果」的变异抓不到——那是空断言。
+    #[test]
+    fn token_never_appears_in_tool_result() {
+        let secret = "SECRET-TOKEN-SHOULD-NOT-LEAK";
+        let login = weixin::WeixinLogin {
+            token: secret.to_string(),
+            base_url: "https://example".to_string(),
+            user_id: "u1".to_string(),
+        };
+        let body = login_result(&login);
+        let text = body.to_string();
+        assert!(
+            !text.contains(secret),
+            "工具结果里出现了 token 本身：{text}"
+        );
+        assert!(text.contains("token_len"), "应当只暴露长度，不暴露值");
+        assert_eq!(body["user_id"], "u1", "user_id 可以明文（它不是凭证）");
     }
 
     /// 未实现的方法要报错（不是静默成功）。
