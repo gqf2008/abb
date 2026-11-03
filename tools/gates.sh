@@ -183,7 +183,43 @@ echo "== ABB 门禁：root 包（中间产物外置于 ${CARGO_TARGET_DIR}）=="
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked
-tools/check_test_isolation.sh
+# 隔离测试的输出要**留下来**：下面那条断言要 grep 里面的标记。
+# 用 tee 而不是重定向，是为了失败时人还能看到完整测试输出。
+iso_log="${CARGO_TARGET_DIR}/iso-test.log"
+mkdir -p "$(dirname "$iso_log")"
+tools/check_test_isolation.sh 2>&1 | tee "$iso_log"
+
+# **断言微信跨包 e2e 真的跑了**（评审 902033a 的 non-blocking）。
+#
+# 为什么需要这一条：`src/mcp_channel_dir_e2e_test.rs` 里那条 e2e 只有在
+# 「拿到 `abb-channel-wechat` 二进制、真起了子进程、走完协商」之后才打印
+# `ABB_WECHAT_E2E_RAN`。而它**找不到产物时会静默 return（走 skip）**——
+# 测试照样 `ok`，门禁照样绿。
+#
+# 前面虽然把微信 crate 的构建前移到了 root 组之前、也 export 了 `ABB_WECHAT_BIN`，
+# 但**没有任何东西检查这个标记有没有真的出现**。export 哪天再退化（顺序改了、
+# 路径改了、产物没建），门禁会**静默变绿**——这正是
+# `docs/false-green-checklist.md` 第 8 种形态。
+#
+# 所以这里真的消费它。产物不存在是**环境问题**（不是代码问题），报 ⚠️ 并让人看见；
+# 产物存在但标记没出现，那是**门禁接线坏了**，报红。
+# **判据看产物文件本身，不看 env 变量**：export 退化时 env 为空，
+# 若用 env 判就会误判成"环境没产物"而降级成警告——变异实测逃逸过。
+# 产物是否存在是客观事实，env 是否传是接线问题。
+if [ -x "$wechat_target/debug/abb-channel-wechat" ]; then
+    if grep -q 'ABB_WECHAT_E2E_RAN' "$iso_log"; then
+        echo "✅ 微信跨包 e2e 真的跑了（找到 ABB_WECHAT_E2E_RAN 标记）"
+    else
+        echo "❌ 产物存在但微信 e2e 没跑：日志里没有 ABB_WECHAT_E2E_RAN" >&2
+        echo "   这不是环境问题——${ABB_WECHAT_BIN} 是可执行的，测试却走了 skip。" >&2
+        echo "   查 gates.sh 里微信 crate 组与 export 的顺序（必须先构建再 export，再跑 root 测试）。" >&2
+        exit 1
+    fi
+else
+    echo "⚠️  没有微信 crate 产物（${wechat_target}/debug/abb-channel-wechat）⇒ 该 e2e 未跑"
+    echo "   这是环境问题，不是代码问题；但门禁对这条 e2e 的覆盖是**缺失**的。"
+fi
+
 # 兜底：清掉 TMPDIR 里陈旧的测试夹具（见脚本头注；根因修复在 src/testtmp.rs 的 RAII 归属）。
 tools/clean_test_fixtures.sh
 
