@@ -50,29 +50,50 @@ pub const BACKOFF_START: std::time::Duration = std::time::Duration::from_secs(2)
 /// 代价只是长故障期间每分钟 4 次请求而不是 1 次（子进程本地调用，可忽略）。
 pub const BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// 连续失败多少次后放弃。**必须有上限**：一个永远起不来的配置
-/// 无限重连会刷爆日志，而日志是排障唯一线索。
+/// 超过多少次连续失败后，从「指数退避」切到「稳定慢重试」。
 ///
-/// **问过 Jev**：`keep`(10 次) p=0.58 / conf=0.44——**它自己也不确定**
-/// （`raise_to_30` 有 0.21）。保持 10 的好处是配合 15s 封顶，
-/// 最坏约 2 分钟内暴露配置错误，而不是让用户等半天才发现连不上。
+/// **2026-11-03 owner 决定：永不放弃。**
+/// 原设计是「连续 10 次就退出渠道」，理由是「一个永远起不来的配置无限重连会刷爆日志」。
+/// 但那个理由只对**日志量**成立，代价却是「MCP 服务半夜崩了，渠道静默死到人发现为止」——
+/// 而 IM 是随时会来消息的东西，静默死比刷日志严重得多。
+///
+/// 现在的设计：10 次以内仍按指数退避（**快速暴露配置错误**：约 2 分钟内就能从日志看出不对），
+/// 超过 10 次转 [`RETRY_SLOW`] 固定间隔、**永不退出**。
+/// 日志量由 `RETRY_SLOW` 控制：每 30s 一条，一天约 2880 条——可接受。
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 10;
 
-/// 下一轮退避时长（指数增长，封顶）。
+/// 超过 [`MAX_CONSECUTIVE_FAILURES`] 之后的固定重试间隔。
 ///
-/// 抽成纯函数是为了能直接测边界（0 次、1 次、很多次），不必等真实时间。
+/// 30s 是 owner 指定的值。它同时是「日志量上限」与「恢复延迟上限」的折中：
+/// 服务恢复后最多等 30s 就重新取到消息，而长期故障时每 30s 才一条日志。
+pub const RETRY_SLOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 下一轮退避时长。
+///
+/// 两段式：
+/// - `failures <= MAX_CONSECUTIVE_FAILURES`：指数增长（2s→4s→…→15s 封顶），
+///   **快速暴露配置错误**
+/// - 超过之后：固定 [`RETRY_SLOW`]（30s），**永不放弃**
+///
+/// 抽成纯函数是为了能直接测边界（0 次 / 刚好到阈值 / 远超阈值），不必等真实时间。
 pub fn backoff(failures: u32) -> std::time::Duration {
     if failures == 0 {
         return BACKOFF_START;
+    }
+    if failures > MAX_CONSECUTIVE_FAILURES {
+        return RETRY_SLOW;
     }
     let factor = 1u32 << failures.min(5); // 2^5=32，够了
     let d = BACKOFF_START.saturating_mul(factor);
     d.min(BACKOFF_MAX)
 }
 
-/// 是否该放弃。
-pub fn should_give_up(consecutive: u32) -> bool {
-    consecutive >= MAX_CONSECUTIVE_FAILURES
+/// **永不放弃**（owner 决定，2026-11-03）。
+///
+/// 保留这个函数而不是删掉调用点，是为了让「放弃」这个决定只有**一处**——
+/// 将来若要重新引入上限（比如加个 `max_retry_minutes` 配置），改这里就够。
+pub fn should_give_up(_consecutive: u32) -> bool {
+    false
 }
 
 /// 把消息投给 `Bridge` 的 sink。
@@ -164,6 +185,9 @@ pub async fn run(
             Ok(Err(e)) => {
                 consecutive += 1;
                 crate::log!("[mcp:{bot_key}] 连接渠道 `{name}` 失败（第 {consecutive} 次）：{e}");
+                // **当前恒为 false**（owner 决定永不放弃，2026-11-03）。
+                // 保留这个分支是因为「要不要放弃」这个决定只该有一处；
+                // 真要重新引入上限（比如加 max_retry_minutes 配置）时改 should_give_up 即可。
                 if should_give_up(consecutive) {
                     crate::log!(
                         "[mcp:{bot_key}] 连续失败 {consecutive} 次，放弃重连（检查 mcp_channel 配置）"
@@ -204,6 +228,7 @@ pub async fn run(
                     consecutive += 1;
                     crate::log!("[mcp:{bot_key}] 取消息失败（第 {consecutive} 次）：{e}");
                     crate::botstatus::report(bot_key, "mcp", name, "重连中");
+                    // 同上：当前恒为 false，永不退出。
                     if should_give_up(consecutive) {
                         crate::log!("[mcp:{bot_key}] 连续失败 {consecutive} 次，退出渠道");
                         return;
@@ -405,17 +430,39 @@ mod tests {
         assert_eq!(backoff(0), BACKOFF_START);
         assert_eq!(backoff(1), BACKOFF_START * 2);
         assert_eq!(backoff(2), BACKOFF_START * 4);
-        // 封顶：5 次以上不再增长
+        // 指数段封顶：5 次以上不再增长，到 15s
         assert_eq!(backoff(5), BACKOFF_MAX);
-        assert_eq!(backoff(50), BACKOFF_MAX);
+        // **阈值处仍是指数段**（`> MAX` 才切慢档，`== MAX` 不切）
+        assert_eq!(backoff(MAX_CONSECUTIVE_FAILURES), BACKOFF_MAX);
     }
 
+    /// 超过阈值转「稳定慢重试」，**且永不放弃**（owner 决定 2026-11-03）。
+    ///
+    /// 两段的分工：前 10 次快（快速暴露配置错误），之后慢但**一直试**
+    /// （MCP 服务半夜崩了也要能自己回来）。
     #[test]
-    fn gives_up_after_limit() {
-        assert!(!should_give_up(0));
-        assert!(!should_give_up(MAX_CONSECUTIVE_FAILURES - 1));
-        assert!(should_give_up(MAX_CONSECUTIVE_FAILURES));
-        assert!(should_give_up(MAX_CONSECUTIVE_FAILURES + 5));
+    fn switches_to_slow_retry_instead_of_giving_up() {
+        // 刚好超过阈值 ⇒ 切 30s，且比指数段更慢
+        assert_eq!(backoff(MAX_CONSECUTIVE_FAILURES + 1), RETRY_SLOW);
+        assert!(RETRY_SLOW > BACKOFF_MAX, "慢档必须真的更慢");
+        // 远超阈值仍是同一个间隔（**不继续增长，也不溢出**）
+        assert_eq!(backoff(MAX_CONSECUTIVE_FAILURES + 50), RETRY_SLOW);
+        assert_eq!(backoff(u32::MAX), RETRY_SLOW);
+
+        // 关键断言：**任何次数都不放弃**
+        for n in [
+            0,
+            1,
+            MAX_CONSECUTIVE_FAILURES,
+            MAX_CONSECUTIVE_FAILURES + 1,
+            1000,
+            u32::MAX,
+        ] {
+            assert!(
+                !should_give_up(n),
+                "连续失败 {n} 次也不得放弃——owner 决定：永不退出，每 30s 重试"
+            );
+        }
     }
 
     fn msg(id: &str) -> ChannelMessage {
