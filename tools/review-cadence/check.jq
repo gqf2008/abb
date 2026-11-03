@@ -415,9 +415,20 @@ def label_counts:
                 | "\(.what // "?"): 这一项命中了触发清单（T1–T4 的信号词）却记成 self_decided"
                   + " ⇒ 应先问 Jev 再落；口径见 docs/decision-defaults.md" ),
               # A3 低置信失真
+              #
+              # **与 A2 同样的 `corrects` 豁免**（Jev `extends_corrects` p=0.98/conf=0.97）：
+              # 后一条 patch 指名修正旧条目时，A2 与 A3 都该生效。
+              # 实测缺口：A2 有豁免而 A3 没有，于是「旧条目的 q 没写不确定」这种事
+              # 即使在新 patch 里重记过、也指名了，仍然永久判红。
               ( $asked[]
                 | select((.conf // 1) < 0.6)
                 | select(((.q // "") | test("不确定")) | not)
+                | select(
+                    ( [ $all_patches[]
+                        | select(.ts > ($p.e.ts // 0))
+                        | .corrects[] ]
+                      | any(. == ($p.oid // "")) ) | not
+                  )
                 | "\(.rid): conf=\(.conf) < 0.6（Jev 自己也不确定），但 q 里没如实写成不确定"
                   + " ⇒ 不得把概率判断包装成强结论" )
             )

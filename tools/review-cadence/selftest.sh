@@ -203,7 +203,7 @@ done
 for s in ok_decisions_self_decided_technical_only \
          ok_decisions_asked_with_low_confidence_stated ok_decisions_absent \
          ok_decisions_debug_output_wording ok_decisions_negated_mention \
-         ok_decisions_corrected_by_later_patch; do
+         ok_decisions_corrected_by_later_patch ok_corrects_also_covers_a3; do
   expect_rc "(h) 合规：$s" 0 \
     "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
 done
