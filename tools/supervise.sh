@@ -49,7 +49,38 @@ if git rev-parse --verify -q origin/main >/dev/null 2>&1; then
     if [ -z "$local_head" ] || [ -z "$remote_head" ]; then
         unknown_note "main / origin/main 解析不出（git 异常？）"
     elif [ "$local_head" = "$remote_head" ]; then
-        pass_note "main == origin/main（$(git rev-parse --short main 2>/dev/null)）"
+        # `main` 干净**不等于没有待合的工作**。
+        #
+        # 2026-11-04 实测：S4 退役（10632 行删除）做完、门禁全绿、推到了
+        # `retire/builtin-channels`，而 `supervise.sh` 报「✅ 全部 7 项通过」——
+        # 因为它只看 main。**「全绿」在这里被读成「没有进展也没有问题」**，
+        # 而实际状态是「有整批交付在等评审」，这两件事相反。
+        #
+        # 所以每一条「已推但未合」的分支都要单独说。它不进 fail（有分支在等评审
+        # 是正常节奏），但必须可见——否则监督脚本会替我把「待合」瞒掉。
+        pend=$(git for-each-ref --format='%(refname:short) %(upstream:short)' refs/heads/ 2>/dev/null \
+            | while read -r br _up; do
+                # 不用 `case ... ;; esac`：macOS 的 `/bin/sh`（bash 3.2 POSIX 模式）
+                # 在 `$( 管道 | while )` 里解析 `;;` 会报 syntax error（实测）。
+                [ -n "$br" ] || continue
+                [ "$br" = main ] && continue
+                n=$(git rev-list --count "$local_head..$br" 2>/dev/null || echo 0)
+                [ "$n" -gt 0 ] 2>/dev/null || continue
+                # 判「推没推」不能靠 `%(upstream:short)`：`git push origin <branch>`
+                # **不设 tracking**，upstream 是空的，于是已推的分支会被报成「未推」
+                # （2026-11-04 实测，retire/builtin-channels 已推却被报未推）。
+                # 直接看远端有没有这个 ref。
+                pushed="未推"
+                if git rev-parse --verify -q "origin/${br}" >/dev/null 2>&1; then
+                    pushed="已推"
+                fi
+                printf '%s(%s提交,%s) ' "$br" "$n" "$pushed"
+            done)
+        if [ -n "$pend" ]; then
+            warn_note "main == origin/main（$(git rev-parse --short main 2>/dev/null)），但有未合分支：${pend}——在等评审还是忘了合？"
+        else
+            pass_note "main == origin/main（$(git rev-parse --short main 2>/dev/null)），无待合分支"
+        fi
     else
         ahead=$(git rev-list --count origin/main..main 2>/dev/null || echo "?")
         behind=$(git rev-list --count main..origin/main 2>/dev/null || echo "?")
