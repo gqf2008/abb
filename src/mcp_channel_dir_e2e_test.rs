@@ -435,3 +435,109 @@ fn abb_negotiates_dingtalk_via_subscribe() {
 
     eprintln!("ABB_DINGTALK_E2E_RAN（订阅路径协商成功）");
 }
+
+// ── 契约 §3.4 可选能力：真 server 上的调用链 ────────────────────────
+//
+// 为什么这条必须存在：`mcp_channel.rs` 里 11 个可选能力的单测用的是**手写假
+// server**（我用 `printf` 拼 JSON）。假 server 只证明「ABB 解析器能吃我喂的形状」，
+// **不证明真 crate 返回那个形状**。
+//
+// 这条用真 `abb-channel-feishu` 二进制走一遍：能力协商 → `has_tool` →
+// `call_optional` → 解析。它咬住的是两侧**名字与形状**的对接，而那正是
+// 最容易错、且错了不会报错的地方（回落 trait 默认 = 静默降级）。
+
+/// 真飞书 crate 声明了 9 个可选能力 ⇒ ABB 的 `has_tool` 要认得其中每一个。
+///
+/// 这条**不调工具**（那要真凭证、真网络），只验「能力协商」这一半：
+/// `tools/list` 的结果经 `capabilities_from` 后，`has_tool` 对每个名字为真。
+///
+/// 变异它会红的情况：crate 拼错工具名、ABB 没把 `tool_names` 填进能力、
+/// `has_tool` 的比较写错（比如做了 `to_lowercase`）。
+#[tokio::test]
+async fn real_feishu_server_exposes_optional_capabilities() {
+    let Some(bin) = feishu_bin() else {
+        return;
+    };
+    // 空凭证也能握手（`connect` 只做 tools/list + resources/list，不发网络请求）。
+    let m = crate::mcp_channel::McpChannelMessenger::connect("feishu-e2e", &bin, &[], &[])
+        .unwrap_or_else(|e| panic!("连不上真飞书 server（{bin}）：{e:#}"));
+
+    for tool in [
+        crate::mcp_bus::TOOL_GET_QUOTED_MESSAGE,
+        crate::mcp_bus::TOOL_DOWNLOAD_ATTACHMENT,
+        crate::mcp_bus::TOOL_CREATE_CHAT,
+        crate::mcp_bus::TOOL_USER_DISPLAY_NAME,
+        crate::mcp_bus::TOOL_TYPING,
+        crate::mcp_bus::TOOL_DEL_TYPING,
+        crate::mcp_bus::TOOL_DONE,
+        crate::mcp_bus::TOOL_CHAT_BRIEF,
+        crate::mcp_bus::TOOL_GET_CHAT_INFO,
+    ] {
+        assert!(
+            m.capabilities().has_tool(tool),
+            "真飞书 server 没暴露 `{tool}`（或 ABB 没把它记进能力）\n\
+             实际暴露：{:?}",
+            m.capabilities().tool_names
+        );
+    }
+
+    // 反向：飞书**不该**声明两个跨渠道概念的能力。
+    // 声明了却没有实现，比不声明更糟——ABB 会调它然后拿到 error。
+    for tool in [
+        crate::mcp_bus::TOOL_NOTE_CONTEXT,
+        crate::mcp_bus::TOOL_NOTE_SENDER,
+    ] {
+        assert!(
+            !m.capabilities().has_tool(tool),
+            "飞书不该声明 `{tool}`（那是微信/钉钉的概念）"
+        );
+    }
+    eprintln!("✅ 真飞书 server 的可选能力协商验过了（{bin}）");
+}
+
+/// 调真 server 的 `user_display_name` / `chat_brief` / `get_chat_info`：
+/// **空凭证下必然失败**，但必须**失败得干净**（返回 `None`/`Err`，不 panic、不挂住）。
+///
+/// 这条守的是「可选能力的失败路径」在真进程上成立：
+/// 单测里假 server 可以精确控制错误形状，但真 server 的错误是飞书 API 回的
+/// （`99991663` 之类），形状完全不同。**只要它不把 ABB 拖死**，回落就是对的。
+///
+/// 变异它会红的情况：`call_optional` 在真错误上 panic、或 `McpChannelMessenger`
+/// 的锁在中途中毒后所有后续调用都失败。
+#[tokio::test]
+async fn real_feishu_server_optional_calls_fail_softly() {
+    let Some(bin) = feishu_bin() else {
+        return;
+    };
+    let m = crate::mcp_channel::McpChannelMessenger::connect("feishu-e2e", &bin, &[], &[])
+        .unwrap_or_else(|e| panic!("连不上真飞书 server（{bin}）：{e:#}"));
+
+    // 三个都要**在合理时间内**返回（真发 HTTP 会超时，所以这里给宽一点）。
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        (
+            m.user_display_name("ou_nonexistent").await,
+            m.chat_brief("oc_nonexistent").await,
+            m.get_chat_info("oc_nonexistent").await,
+        )
+    })
+    .await
+    .expect("真 server 的可选能力调用不能挂住（30s 超时）");
+
+    // 空凭证下拿不到东西是**预期**的；关键是没 panic、没挂住。
+    assert!(
+        out.0.is_none() && out.1.is_none() && out.2.is_none(),
+        "空凭证下应当全部回落 None，实际：{:?}",
+        out
+    );
+
+    // **关键**：失败没有污染 client —— 后续调用仍然正常。
+    // （`call_optional` 若在错误路径上忘了归还锁，这里会永久挂住。）
+    let again = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        m.user_display_name("ou_another"),
+    )
+    .await
+    .expect("失败之后 client 必须仍然可用（锁没被吃掉）");
+    assert!(again.is_none());
+    eprintln!("✅ 真飞书 server 的可选能力失败路径验过了（干净回落，client 未污染）");
+}
