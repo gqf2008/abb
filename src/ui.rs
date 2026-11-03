@@ -2728,7 +2728,7 @@ fn refresh_toggle_checks(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
 }
 
 /// 按当前选中 bot 重建编辑框/下拉的单元素 model（名称/类型/供应商/Owner/
-/// App ID/App Secret/钉钉机器人编码/钉钉 Owner）。输入/选择交互同样移除 text/index/value
+/// App ID/App Secret/钉钉机器人编码/钉钉 Owner/mcp 渠道三字段）。输入/选择交互同样移除 text/index/value
 /// 绑定（与 checkbox 同源坑），直接绑 model 行属性会在切 bot 后残留上一 bot 的值；
 /// 整体替换 model → for 循环重建实例，绑定全新。密码框按现有语义回填原值（bot_to_row 已如此）。
 fn refresh_editors(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
@@ -2744,6 +2744,15 @@ fn refresh_editors(w: &SettingsWindow, work: &RefCell<Vec<BotConfig>>) {
     w.set_app_secret_editor_options(mk(b.map(|b| b.app_secret.as_str()).unwrap_or("")));
     w.set_ding_robot_code_editor_options(mk(b.map(|b| b.ding_robot_code.as_str()).unwrap_or("")));
     w.set_ding_owner_ids_editor_options(mk(b.map(|b| b.ding_owner_ids.as_str()).unwrap_or("")));
+    // mcp 渠道三字段（总线 S3）：格式与 bot_to_row 同源（args 空格连接 / env 每行 KEY=VALUE），
+    // 否则「切 bot 后显示」与「首次装载显示」两种路径会给出不同文本。
+    // 没配 mcp_channel（或非 mcp kind 的旧 bot）一律空串 ⇒ 三个框显示占位符，不是错误态。
+    let mcp = b.and_then(|b| b.mcp_channel.as_ref());
+    let args_text = mcp.map(mcp_args_text).unwrap_or_default();
+    let env_text = mcp.map(mcp_env_text).unwrap_or_default();
+    w.set_mcp_command_editor_options(mk(mcp.map(|m| m.command.as_str()).unwrap_or("")));
+    w.set_mcp_args_editor_options(mk(&args_text));
+    w.set_mcp_env_editor_options(mk(&env_text));
 }
 
 /// 重算对话权限互斥 CheckBox 的勾选态（飞书/钉钉同模型）。
@@ -12719,6 +12728,32 @@ mod tests {
         assert!(!apply_mcp_field_edit(&mut bot, "name", "x"));
         assert!(!apply_mcp_field_edit(&mut bot, "provider", "ds"));
         assert!(bot.mcp_channel.is_none(), "不认领的字段不得建出渠道配置");
+    }
+
+    /// slint 侧发给 `bot-field-edited` 的字段名必须与 `on_bot_field_edited` 的
+    /// match 分支**逐字对上**——写错一个字，编辑就无声丢弃：界面看着能打字，
+    /// 保存后却发现没生效，而且**不报任何错误**。这正是本仓反复踩的"不报错的错误"。
+    ///
+    /// slint 是编译期检查类型，但**字符串参数是运行期语义**，编译器管不到。
+    /// 所以用源码守卫把两侧对起来：slint 里出现的 `"mcp_*"` 必须都能在 Rust 的
+    /// match 里找到同名分支。
+    #[test]
+    fn slint_mcp_field_names_match_rust_match_arms() {
+        let slint_src = include_str!("../ui/app.slint");
+        let rust_src = include_str!("ui.rs");
+        // 只关心 mcp 三字段（其它字段的是既有行为，不在本卡范围）。
+        for field in ["mcp_command", "mcp_args", "mcp_env"] {
+            let in_slint = format!("bot-field-edited(root.selected, \"{field}\"");
+            assert!(
+                slint_src.contains(&in_slint),
+                "slint 里没找到 {field} 的编辑绑定（{in_slint}）⇒ 界面无法改这个字段"
+            );
+            let in_rust = format!("\"{field}\" =>");
+            assert!(
+                rust_src.contains(&in_rust),
+                "Rust 的 on_bot_field_edited 里没有 {field} 分支 ⇒ 界面改了也不会存"
+            );
+        }
     }
 
     /// mcp 渠道入签名：command / args / env 任一项变了都要翻签名（否则 service 不重启，

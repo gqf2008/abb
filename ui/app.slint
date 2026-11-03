@@ -1309,6 +1309,11 @@ export component SettingsWindow inherits Window {
     in-out property <[EditorRow]> app-secret-editor-options: [];
     in-out property <[EditorRow]> ding-robot-code-editor-options: [];
     in-out property <[EditorRow]> ding-owner-ids-editor-options: [];
+    // mcp 渠道三字段（总线 S3）：与上面各字段同款绕法——输入交互会断绑、切 bot
+    // 残留上一 bot 的值，所以同样由 refresh_editors 整体替换 model → for 重建实例。
+    in-out property <[EditorRow]> mcp-command-editor-options: [];
+    in-out property <[EditorRow]> mcp-args-editor-options: [];
+    in-out property <[EditorRow]> mcp-env-editor-options: [];
     in-out property <string> status-line;
     in-out property <bool> status-is-error: true;   // true=红（报错）/ false=绿（成功/信息）
     // 跨会话投递总开关（#21）：打开后 agent 可用 `$ABB_BIN deliver` 投递到其它 bot 的会话。
@@ -2070,6 +2075,54 @@ export component SettingsWindow inherits Window {
                                                         color: UiTokens.text-dim;
                                                         wrap: word-wrap;
                                                         vertical-alignment: center;
+                                                    }
+                                                }
+                                                // ── mcp 渠道字段（总线 S3）：渠道服务由外部 MCP server 提供，
+                                                // ABB 只负责拉起它。三字段与 config 的 mcp_channel 一一对应，
+                                                // 缺了界面就没人能配置这类 bot（kind=mcp 也就是新建 bot 的默认档）。
+                                                // 行形状照抄上面的 app_id 行：标签 80px + HorizontalBox
+                                                // horizontal-stretch:1 + for opt[i] 单元素 model（防断绑残留）。
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "mcp": Row {
+                                                    Text { text: "可执行文件"; width: 80px; vertical-alignment: center; }
+                                                    HorizontalBox {
+                                                        horizontal-stretch: 1;
+                                                        for opt[i] in root.mcp-command-editor-options: PixelTextInput {
+                                                            text: opt.value;
+                                                            placeholder: "MCP server 可执行文件绝对路径，如 /opt/channel-mcp";
+                                                            horizontal-stretch: 1;
+                                                            edited => { root.bot-field-edited(root.selected, "mcp_command", self.text); }
+                                                        }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "mcp": Row {
+                                                    Text { text: "参数"; width: 80px; vertical-alignment: center; }
+                                                    HorizontalBox {
+                                                        horizontal-stretch: 1;
+                                                        // 空格分隔（Rust 侧 parse_mcp_args 按空白切分）：带空格的参数
+                                                        // 表达不了，要写 wrapper 脚本——占位符里直接告诉用户。
+                                                        for opt[i] in root.mcp-args-editor-options: PixelTextInput {
+                                                            text: opt.value;
+                                                            placeholder: "空格分隔，如 --root /tmp/x（带空格的参数请写成 wrapper 脚本）";
+                                                            horizontal-stretch: 1;
+                                                            edited => { root.bot-field-edited(root.selected, "mcp_args", self.text); }
+                                                        }
+                                                    }
+                                                }
+                                                if root.selected >= 0 && root.selected < root.bots.length && root.bots[root.selected].kind == "mcp": Row {
+                                                    Text { text: "环境变量"; width: 80px; vertical-alignment: center; }
+                                                    HorizontalBox {
+                                                        horizontal-stretch: 1;
+                                                        // 多行：Rust 侧 mcp_env_text 用 "\n" 拼、parse_mcp_env 按行解析，
+                                                        // 所以这里必须用真的多行控件（PixelTextArea，同文件 736 行的系统
+                                                        // prompt 输入框同款）——普通单行 PixelTextInput 会让每行
+                                                        // KEY=VALUE 挤成一行、解析成一条畸形 env。
+                                                        for opt[i] in root.mcp-env-editor-options: PixelTextArea {
+                                                            text: opt.value;
+                                                            placeholder: "每行一个 KEY=VALUE，如\nTOKEN=abc123\nMODE=prod";
+                                                            frame-height: 78px;
+                                                            horizontal-stretch: 1;
+                                                            edited => { root.bot-field-edited(root.selected, "mcp_env", self.text); }
+                                                        }
                                                     }
                                                 }
 
