@@ -182,6 +182,19 @@ echo "== ABB 门禁：crates/abb-channel-wechat（独立包，中间产物外置
   cargo test --manifest-path "$wechat_manifest" --locked
 )
 
+# 把微信 crate 的构建产物路径告诉 root 的测试：`src/mcp_channel_dir_e2e_test.rs`
+# 里那条 `abb_negotiates_real_wechat` 要起真子进程验「ABB 的协商器能接上它」。
+#
+# **不传的话那条 e2e 永远走 `[skip]`**——而它看起来在门禁里。
+# 这正是评审 a0e0ff0 指出的问题：测试硬编码作者本机路径，别人机器与 CI 上必然跳过。
+# 现在 gates 先建好产物、再把路径传下去，那条 e2e 在门禁里**真的跑**。
+WECHAT_BIN="$wechat_target/debug/abb-channel-wechat"
+if [ -x "$WECHAT_BIN" ]; then
+  export ABB_WECHAT_BIN="$WECHAT_BIN"
+else
+  echo "⚠️  没构建出 $WECHAT_BIN ⇒ root 的微信 e2e 将跳过（不是失败）"
+fi
+
 # 协作门禁（crates/* 之外，跑得快、不联网、不编译）：这两条守的是「合并闸门本身」，
 # 之前只在 .walgit/ci.toml 里跑，本地 gates.sh 漏了 —— 而协调者合并前跑的是 gates.sh
 # （评审 NB-6）。放在最后：前面任何一条失败都不会掩盖它们。

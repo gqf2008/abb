@@ -219,25 +219,60 @@ fn dir_channel_bad_message_does_not_block_later_ones() {
 
 // ── 真渠道：微信 crate（crates/abb-channel-wechat）──────────────────
 
-/// `crates/abb-channel-wechat` 的二进制路径（同一次 `cargo build` 的产物）。
+/// `crates/abb-channel-wechat` 的二进制路径。
 ///
-/// 找不到就 `[skip]`：那个包是独立 manifest，root 的构建**不保证**它存在。
-/// 这条测试的价值是「ABB 的生产协商代码能接上真微信 server」，
-/// 没构建过就跳过，而不是失败——环境问题不该伪装成代码问题。
+/// ## 为什么不能硬编码（评审 a0e0ff0 的 non-blocking，属实）
+///
+/// 第一版写死了 `/Volumes/DataExt/tmp/abb-target-wx/debug/abb-channel-wechat`。
+/// 那在作者本机能跑，但：
+/// - 别人机器上没有这个路径 ⇒ 永远走 `[skip]`
+/// - CI 上更是必然 skip（`ci.yml` 不构建这个 crate）
+///
+/// 于是这条 e2e **看起来在门禁里、实际只在一个人机器上真跑过**——
+/// 又一种「看着绿、其实没检查」。
+///
+/// ## 现在的寻址顺序
+///
+/// 1. `ABB_WECHAT_BIN` 环境变量（`tools/gates.sh` 在跑微信 crate 那组时**会传**）
+/// 2. `target/debug/abb-channel-wechat`（同一次 `cargo build` 的常规产物路径，
+///    用 `CARGO_TARGET_DIR` 或默认 `target`）
+///
+/// 都找不到就 `[skip]` **并打印找过哪些路径**——"跳过"必须能看出是环境问题，
+/// 而不是静默当成通过。
 fn wechat_bin() -> Option<String> {
-    let p = format!(
-        "{}/../../abb-target-wx/debug/abb-channel-wechat",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let alt = "/Volumes/DataExt/tmp/abb-target-wx/debug/abb-channel-wechat";
-    for c in [p.as_str(), alt] {
-        if std::path::Path::new(c).exists() {
-            return Some(c.to_string());
+    let mut tried: Vec<String> = Vec::new();
+
+    // ① 显式指定（CI / gates.sh 用这条）
+    if let Ok(p) = std::env::var("ABB_WECHAT_BIN") {
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
         }
+        tried.push(format!("ABB_WECHAT_BIN={p}（不存在）"));
     }
+
+    // ② 常规构建产物：root 的 target 目录下的 debug/abb-channel-wechat。
+    //    注意**不是** `-wx` 那种自定义目录：那只有作者本机的 gates 会建。
+    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
+        let p = format!("{td}/debug/abb-channel-wechat");
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+        tried.push(p);
+    }
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        // 同仓库下的 `target/`（默认位置）
+        let p = format!("{manifest}/target/debug/abb-channel-wechat");
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+        tried.push(p);
+    }
+
     eprintln!(
-        "[skip] 没找到 abb-channel-wechat 构建产物 ⇒ 跳过\
-         （先跑 cargo build --manifest-path crates/abb-channel-wechat/Cargo.toml）"
+        "[skip] 没找到 abb-channel-wechat 构建产物 ⇒ 这条 e2e 没跑。找过：\n  {}\n\
+         构建方式：cargo build --manifest-path crates/abb-channel-wechat/Cargo.toml\n\
+         或显式指定：ABB_WECHAT_BIN=<path> cargo test …",
+        tried.join("\n  ")
     );
     None
 }
