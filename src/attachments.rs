@@ -66,6 +66,15 @@ pub enum AttachmentDesc {
         voice_text: String,
     },
     Wechat(crate::wechat::WechatMedia),
+    /// MCP 渠道：**不带任何平台凭据**。
+    ///
+    /// 为什么不带 `file_key` 之类：契约 §4「ABB 不负责渠道协议细节」——
+    /// 怎么下载是渠道 server 的事，它自己按消息 id 反查（飞书查消息 API、
+    /// 钉钉查 download_code、微信查 media）。ABB 侧只需知道「这是第几个附件」。
+    ///
+    /// 消息 id 也不放这里：`Messenger::download_attachment` 的 `mid` 参数
+    /// 已经给了，放两处只会出现「两处不一致时信哪个」的问题。
+    Mcp,
 }
 
 /// 下载/保存失败的占位元数据：路径/sha 为空，note 带原因。

@@ -140,9 +140,57 @@ impl InboundSink for BridgeSink {
                 return Err(e);
             }
         };
+        // 附件下载：**在这里做，不在 `to_ev` 里**。
+        //
+        // `to_ev` 是纯函数（无 IO、可单测），而下载要等渠道 server 回包。
+        // 让纯函数去下载会把「翻译」和「IO」绑死，单测就得起子进程。
+        //
+        // 顺序与内置渠道一致（`bridge/mod.rs` 的飞书路径也是先下载再建 Ev）：
+        // 下载失败**不丢消息**——`download_attachment` 返回的 meta 自带 `note`，
+        // agent 会如实告诉用户「附件拿不到」。
+        let ev = download_attachments(self.bridge.msgr.as_ref(), &self.bridge.bot.key(), ev).await;
         self.bridge.handle(ev).await;
         Ok(())
     }
+}
+
+/// 把 `Ev` 里「只有占位、没有本地路径」的附件真的下载下来。
+///
+/// 不下载的直接后果（本轮修的）：用户发图，agent 只看到「有一个附件」，
+/// **读不到内容**，于是答非所问——而 ABB 不报任何错。
+///
+/// 抽成自由函数（不挂在 `BridgeSink` 上）纯粹为了**可测**：`BridgeSink` 要构造
+/// 整个 `Bridge`（会话、agent、运行时目录），而这段逻辑只依赖 `Messenger`。
+pub async fn download_attachments(
+    msgr: &dyn crate::messenger::Messenger,
+    bot_key: &str,
+    mut ev: crate::bridge::Ev,
+) -> crate::bridge::Ev {
+    if ev.attachments.is_empty() {
+        return ev;
+    }
+    for (i, meta) in ev.attachments.iter_mut().enumerate() {
+        // 已经有本地路径的（渠道直接给了落盘位置）不再下载。
+        if !meta.path.trim().is_empty() {
+            continue;
+        }
+        // `seq` 必须与渠道侧 `attachments` 数组同序——入站解析时两侧按同一
+        // 顺序生成，这里用下标即对得上（跨包 e2e 覆盖了这条）。
+        let desc = crate::attachments::AttachmentDesc::Mcp;
+        match msgr.download_attachment(bot_key, &ev.mid, i, &desc).await {
+            Some(got) => *meta = got,
+            None => {
+                // 渠道没声明 `download_attachment`（契约 §3.4 可选能力）：
+                // 保留占位并在 note 里说清，**不静默**。
+                if meta.note.trim().is_empty() {
+                    meta.note = format!(
+                        "渠道 `{bot_key}` 未声明 download_attachment 能力 ⇒ 附件内容取不到"
+                    );
+                }
+            }
+        }
+    }
+    ev
 }
 
 /// 一次拉取的抽象：让循环本身能单测（真实现走 `mcp_inbound`）。
@@ -438,6 +486,168 @@ mod tests {
     use super::*;
     use crate::mcp_inbound_loop::TickReport;
     use std::sync::Mutex;
+
+    // ── 附件下载接线：不下载 = 用户发图 agent 读不到内容 ─────────────
+    //
+    // 这一批测的是**行为**，不是解析：`download_attachments` 有没有真的去调
+    // messenger、有没有把结果写回 `Ev`、没能力时有没有留下说明。
+
+    /// 假 messenger：只实现 `download_attachment`，记录被问过的 `(mid, seq)`。
+    ///
+    /// `capable=false` 时返回 `None`——那正是「渠道没声明这个可选能力」的形状
+    /// （trait 默认实现就返回 `None`）。
+    struct AttachMsgr {
+        capable: bool,
+        asked: std::sync::Mutex<Vec<(String, usize)>>,
+    }
+
+    impl AttachMsgr {
+        fn new(capable: bool) -> Self {
+            Self {
+                capable,
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::messenger::Messenger for AttachMsgr {
+        async fn send_text(&self, _c: &str, _t: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_attachment(
+            &self,
+            _c: &str,
+            _m: &crate::attachments::AttachmentMeta,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn download_attachment(
+            &self,
+            _bot_key: &str,
+            mid: &str,
+            seq: usize,
+            _desc: &crate::attachments::AttachmentDesc,
+        ) -> Option<crate::attachments::AttachmentMeta> {
+            self.asked.lock().unwrap().push((mid.to_string(), seq));
+            if !self.capable {
+                return None;
+            }
+            Some(crate::attachments::AttachmentMeta {
+                kind: "image".into(),
+                source: "mcp".into(),
+                file_name: format!("{mid}-{seq}.png"),
+                mime: "image/png".into(),
+                size: 7,
+                path: format!("/tmp/{mid}-{seq}.png"),
+                sha256: String::new(),
+                note: String::new(),
+            })
+        }
+    }
+
+    fn ev_with(n: usize) -> crate::bridge::Ev {
+        crate::bridge::Ev {
+            mid: "m1".into(),
+            chat_id: "c1".into(),
+            chat_type: "mcp".into(),
+            chat_name: String::new(),
+            thread_id: String::new(),
+            sender_id: "u1".into(),
+            text: "看图".into(),
+            ts: 1,
+            quoted: Default::default(),
+            role: crate::config::SenderRole::Granted,
+            attachments: (0..n)
+                .map(|i| crate::attachments::AttachmentMeta {
+                    kind: "image".into(),
+                    source: "mcp".into(),
+                    file_name: format!("a{i}.png"),
+                    mime: String::new(),
+                    size: 0,
+                    // **空路径**：正是「渠道只给了占位」的形状。
+                    path: String::new(),
+                    sha256: String::new(),
+                    note: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// 渠道支持 ⇒ 每个附件都下载、路径写回、`seq` 是下标。
+    ///
+    /// **这是本轮修的主缺陷**：修之前 `mcp_adapter` 直接造占位 `AttachmentMeta`，
+    /// 从不调用 `download_attachment` ⇒ agent 只看到「有一个附件」，读不到内容，
+    /// 而 ABB 不报任何错。
+    #[tokio::test]
+    async fn supported_channel_downloads_every_attachment() {
+        let m = AttachMsgr::new(true);
+        let ev = download_attachments(&m, "bot", ev_with(3)).await;
+
+        let asked = m.asked.lock().unwrap().clone();
+        assert_eq!(
+            asked,
+            vec![
+                ("m1".to_string(), 0),
+                ("m1".to_string(), 1),
+                ("m1".to_string(), 2)
+            ],
+            "必须按 seq=0,1,2 逐个问，且用消息 id"
+        );
+        assert_eq!(ev.attachments.len(), 3);
+        for (i, a) in ev.attachments.iter().enumerate() {
+            assert_eq!(
+                a.path,
+                format!("/tmp/m1-{i}.png"),
+                "第 {i} 个要拿到自己的路径"
+            );
+            assert_eq!(a.size, 7, "下载后的元数据要覆盖占位");
+        }
+    }
+
+    /// 渠道不支持 ⇒ **保留占位并写清原因**，不静默、不丢消息。
+    #[tokio::test]
+    async fn unsupported_channel_leaves_an_explanatory_note() {
+        let m = AttachMsgr::new(false);
+        let ev = download_attachments(&m, "bot", ev_with(1)).await;
+
+        assert_eq!(ev.attachments.len(), 1, "消息里的附件条目不能消失");
+        assert!(ev.attachments[0].path.is_empty());
+        let note = &ev.attachments[0].note;
+        assert!(
+            note.contains("download_attachment") && note.contains("bot"),
+            "note 要点名缺的能力和渠道：{note:?}"
+        );
+    }
+
+    /// 已经有本地路径的**不再下载**（渠道直接给了落盘位置）。
+    ///
+    /// 这条防的是「无谓的第二次下载」：重复下载既慢又可能把文件覆盖成另一份。
+    #[tokio::test]
+    async fn attachment_with_existing_path_is_not_re_downloaded() {
+        let m = AttachMsgr::new(true);
+        let mut ev = ev_with(2);
+        ev.attachments[0].path = "/already/there.png".into();
+
+        let ev = download_attachments(&m, "bot", ev).await;
+
+        let asked = m.asked.lock().unwrap().clone();
+        assert_eq!(asked, vec![("m1".to_string(), 1)], "只该问没路径的那个");
+        assert_eq!(
+            ev.attachments[0].path, "/already/there.png",
+            "不覆盖已有路径"
+        );
+        assert_eq!(ev.attachments[1].path, "/tmp/m1-1.png");
+    }
+
+    /// 没有附件 ⇒ 一次都不问（别为无附件的消息白起 IO）。
+    #[tokio::test]
+    async fn no_attachments_means_no_calls() {
+        let m = AttachMsgr::new(true);
+        let ev = download_attachments(&m, "bot", ev_with(0)).await;
+        assert!(m.asked.lock().unwrap().is_empty());
+        assert!(ev.attachments.is_empty());
+    }
 
     #[test]
     fn backoff_grows_then_caps() {

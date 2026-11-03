@@ -1216,6 +1216,7 @@ mod tests {
                 crate::attachments::AttachmentDesc::Wechat(m) => {
                     (m.kind.clone(), m.file_name.clone())
                 }
+                crate::attachments::AttachmentDesc::Mcp => ("file".to_string(), String::new()),
             };
             Some(crate::attachments::AttachmentMeta {
                 kind,
