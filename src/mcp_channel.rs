@@ -144,6 +144,45 @@ impl McpChannelMessenger {
             .map_err(|e| map_err(tool, e))?;
         Ok(text_of_tool_result(&resp))
     }
+
+    /// 调一个**可选**工具（契约 §3.4）。
+    ///
+    /// 三条回落规则，与 trait 的默认实现对齐：
+    /// - 服务没声明该工具 ⇒ `None`，调用方回落 trait 默认；
+    /// - 调用失败 ⇒ 记日志后 `None`（**不向上报错**：可选能力失败不该让消息处理失败）；
+    /// - 返回内容不是合法 JSON ⇒ 也 `None`（同上）。
+    ///
+    /// 为什么失败只记日志不报错：这些能力都是「锦上添花」——
+    /// 拿不到引用消息，消息仍要处理；查不到人名，用 id 兜底也行。
+    /// 让它们阻断主流程，等于一个次要功能坏掉就吞掉整条消息。
+    fn call_optional(&self, tool: &str, args: Value) -> Option<Value> {
+        if !self.caps.has_tool(tool) {
+            return None;
+        }
+        let mut c = match self.client.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                crate::log!("[mcp:{}] 可选工具 {tool} 跳过：client 锁中毒", self.name);
+                return None;
+            }
+        };
+        match Self::call_tool(&mut c, tool, args) {
+            Ok(text) => match serde_json::from_str::<Value>(&text) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    crate::log!(
+                        "[mcp:{}] 可选工具 {tool} 返回的不是 JSON（{e}），按不支持处理",
+                        self.name
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                crate::log!("[mcp:{}] 可选工具 {tool} 失败：{e:#}", self.name);
+                None
+            }
+        }
+    }
 }
 
 /// 从 `tools/call` 的结果里取出文本。
@@ -301,6 +340,225 @@ impl Messenger for McpChannelMessenger {
             }),
         )?;
         Ok(())
+    }
+
+    // ── 契约 §3.4 的可选能力（缺失即回落 trait 默认实现）──────────────
+    //
+    // 全部走 `call_optional`：服务没声明 / 调用失败 / 返回非 JSON ⇒ 一律 `None`，
+    // 由 trait 默认值兜底。**不向上报错**——次要能力失败不该吞掉整条消息。
+
+    /// A：取被引用消息的内容。缺它 ⇒ agent 看不到引用上文。
+    async fn get_quoted_message(
+        &self,
+        message_id: &str,
+    ) -> Option<crate::messenger::QuotedMessage> {
+        let v = self.call_optional(
+            crate::mcp_bus::TOOL_GET_QUOTED_MESSAGE,
+            json!({ "message_id": message_id }),
+        )?;
+        Some(crate::messenger::QuotedMessage {
+            text: v.get("text").and_then(|x| x.as_str())?.to_string(),
+            // 附件描述由**调用方**在入站时已经拿到（`Ev` 里），这里不重复传——
+            // 契约只要求回文本；server 想给附件信息时放 `text` 里即可。
+            attachments: vec![],
+            msg_type: v
+                .get("msg_type")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            unparsed_tags: vec![],
+        })
+    }
+
+    /// A：下载入站附件。
+    ///
+    /// **参数只有 `{message_id, seq}`**：怎么下载是渠道的事（契约 §4「ABB 不负责
+    /// 协议细节」）。server 自己反查那条消息的第 `seq` 个附件、下载到它自己的目录，
+    /// 把最终路径告诉 ABB。
+    async fn download_attachment(
+        &self,
+        _bot_key: &str,
+        mid: &str,
+        seq: usize,
+        _desc: &crate::attachments::AttachmentDesc,
+    ) -> Option<crate::attachments::AttachmentMeta> {
+        let v = self.call_optional(
+            crate::mcp_bus::TOOL_DOWNLOAD_ATTACHMENT,
+            json!({ "message_id": mid, "seq": seq }),
+        )?;
+        // 形状不对 ⇒ 返回带 note 的占位（**不静默丢消息**，与内置渠道同口径）。
+        let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("");
+        if path.is_empty() {
+            return Some(crate::attachments::AttachmentMeta {
+                kind: v
+                    .get("kind")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("file")
+                    .to_string(),
+                source: "mcp".to_string(),
+                file_name: v
+                    .get("file_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                mime: String::new(),
+                size: 0,
+                path: String::new(),
+                sha256: String::new(),
+                note: format!(
+                    "渠道 `{}` 说下载了但没给路径：{}",
+                    self.name,
+                    v.get("note")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("（无说明）")
+                ),
+            });
+        }
+        Some(crate::attachments::AttachmentMeta {
+            kind: v
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .unwrap_or("file")
+                .to_string(),
+            source: "mcp".to_string(),
+            file_name: v
+                .get("file_name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            mime: v
+                .get("mime")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            size: v.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
+            path: path.to_string(),
+            sha256: v
+                .get("sha256")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            note: v
+                .get("note")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
+
+    /// A：建群。缺它 ⇒ 只能手动建（聊天侧回落登记制指引）。
+    async fn create_chat(
+        &self,
+        name: &str,
+        description: &str,
+        owner_user_id: &str,
+    ) -> Result<String, String> {
+        let v = self
+            .call_optional(
+                crate::mcp_bus::TOOL_CREATE_CHAT,
+                json!({
+                    "name": name,
+                    "description": description,
+                    "owner_user_id": owner_user_id,
+                }),
+            )
+            .ok_or_else(|| {
+                format!(
+                    "渠道 `{}` 的 MCP 服务未声明 `{}` ⇒ 只能手动建群后登记",
+                    self.name,
+                    crate::mcp_bus::TOOL_CREATE_CHAT
+                )
+            })?;
+        v.get("chat_id")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!("渠道 `{}` 建了群但没给 chat_id", self.name))
+    }
+
+    /// A：反查展示名。缺它 ⇒ 授权记录里只有 id。
+    async fn user_display_name(&self, user_id: &str) -> Option<String> {
+        self.call_optional(
+            crate::mcp_bus::TOOL_USER_DISPLAY_NAME,
+            json!({ "user_id": user_id }),
+        )?
+        .get("name")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+    }
+
+    /// B：处理中表情。
+    async fn typing(&self, message_id: &str) -> Option<String> {
+        self.call_optional(
+            crate::mcp_bus::TOOL_TYPING,
+            json!({ "message_id": message_id }),
+        )?
+        .get("reaction_id")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+    }
+
+    /// B：撤销处理中表情。
+    async fn del_typing(&self, message_id: &str, reaction_id: Option<String>) {
+        let _ = self.call_optional(
+            crate::mcp_bus::TOOL_DEL_TYPING,
+            json!({ "message_id": message_id, "reaction_id": reaction_id }),
+        );
+    }
+
+    /// B：完成表情。
+    async fn done(&self, message_id: &str) {
+        let _ = self.call_optional(
+            crate::mcp_bus::TOOL_DONE,
+            json!({ "message_id": message_id }),
+        );
+    }
+
+    /// B：记回复上下文。**同步方法**（trait 如此），且无返回。
+    ///
+    /// 失败静默：这是状态同步，调用方（`bridge`）本来也不看返回值。
+    fn note_context(&self, chat_id: &str, context_token: &str) {
+        let _ = self.call_optional(
+            crate::mcp_bus::TOOL_NOTE_CONTEXT,
+            json!({ "chat_id": chat_id, "context_token": context_token }),
+        );
+    }
+
+    /// B：记最近发送者（钉钉群聊 @ 用）。**同步方法**，无返回。
+    fn note_sender(&self, chat_id: &str, sender_id: &str) {
+        let _ = self.call_optional(
+            crate::mcp_bus::TOOL_NOTE_SENDER,
+            json!({ "chat_id": chat_id, "sender_id": sender_id }),
+        );
+    }
+
+    /// B：会话类型 + 会话名。缺它 ⇒ 历史回填跳过该会话。
+    async fn chat_brief(&self, chat_id: &str) -> Option<(String, String)> {
+        let v = self.call_optional(
+            crate::mcp_bus::TOOL_CHAT_BRIEF,
+            json!({ "chat_id": chat_id }),
+        )?;
+        Some((
+            v.get("chat_type").and_then(|x| x.as_str())?.to_string(),
+            v.get("chat_name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ))
+    }
+
+    /// B：群资料（群名 + 群介绍）。
+    async fn get_chat_info(&self, chat_id: &str) -> Option<(String, String)> {
+        let v = self.call_optional(
+            crate::mcp_bus::TOOL_GET_CHAT_INFO,
+            json!({ "chat_id": chat_id }),
+        )?;
+        Some((
+            v.get("name").and_then(|x| x.as_str())?.to_string(),
+            v.get("description")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ))
     }
 }
 
@@ -503,6 +761,213 @@ mod tests {
             .find("reject_if_too_big(bytes.len()")
             .expect("找不到读后的体积闸（metadata 可能不可信，读后必须再判）");
         assert!(after < src[read..].len(), "读后那道闸在错误的位置");
+    }
+
+    // ── 契约 §3.4 可选能力：三条回落规则 ─────────────────────────────
+    //
+    // 11 个可选能力共用同一套回落逻辑（`call_optional`），所以这里按
+    // **三种情形**覆盖，而不是逐个能力写一遍——那只会重复同一段断言。
+
+    /// 假 server 的脚本：`tools` 是要暴露的工具名列表（空格分隔）。
+    ///
+    /// 每个可选工具返回**写死的完整 JSON 行**，不用 `sed` 拼转义——
+    /// 第一版用了 `printf ... | sed 's/"/\\"/g'` 双层转义，结果 JSON 被拼坏、
+    /// 服务连不上（`tools/list` 都失败）。写死虽然重复，但**一眼能看出返回什么**。
+    fn fake_server(tools: &str, break_all: bool) -> String {
+        let list = tools
+            .split_whitespace()
+            .map(|t| format!(r#"{{"name":"{t}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let call_arm = if break_all {
+            // **只让可选工具失败，`send_text` 保持正常**。
+            //
+            // 第一版让所有 `tools/call` 都返回 error，于是测试里那句
+            // 「失败没有污染 client，仍然能发文本」也失败了——那不是代码的问题，
+            // 是我把「可选能力失败」和「主能力失败」混在一起测了。
+            r#"*send_text*)
+                     B='ok'
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$B" ;;
+                   *tools/call*)
+                     printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"boom"}}\n' "$id" ;;
+            "#
+            .to_string()
+        } else {
+            // **关键：JSON 放在 shell 单引号变量里、用 `%s` 插入。**
+            //
+            // 第一版把 JSON 直接写进 printf 的格式串，结果 `printf` 把 `\"` 解释成 `"`
+            // （吃掉反斜杠），拼出非法 JSON、server 连都不上。`%s` 不做转义处理，
+            // 所以把转义好的内容放进变量再插入是可靠的。
+            r#"*get_quoted_message*)
+                     B='{\"text\":\"引用原文\",\"msg_type\":\"text\"}'
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$B" ;;
+                   *download_attachment*)
+                     B='{\"kind\":\"image\",\"file_name\":\"a.png\",\"mime\":\"image/png\",\"size\":42,\"path\":\"/tmp/a.png\",\"sha256\":\"ab\"}'
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$B" ;;
+                   *create_chat*)
+                     B='{\"chat_id\":\"oc_new\"}'
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$B" ;;
+                   *user_display_name*)
+                     B='{\"name\":\"张三\"}'
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$B" ;;
+                   *typing*)
+                     B='{\"reaction_id\":\"re_1\"}'
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$B" ;;
+                   *chat_brief*)
+                     B='{\"chat_type\":\"group\",\"chat_name\":\"研发群\"}'
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$B" ;;
+                   *get_chat_info*)
+                     B='{\"name\":\"研发群\",\"description\":\"干啥的\"}'
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$B" ;;
+                   *tools/call*)
+                     B='{}'
+                     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$B" ;;
+            "#
+            .to_string()
+        };
+        format!(
+            r#"while IFS= read -r line; do
+                 id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+                 case "$line" in
+                   *tools/list*)
+                     printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{list}]}}}}\n' "$id" ;;
+                   *resources/list*)
+                     printf '{{"jsonrpc":"2.0","id":%s,"result":{{"resources":[{{"uri":"channel://inbox"}}]}}}}\n' "$id" ;;
+                   {call_arm}
+                   *) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+                 esac
+               done"#
+        )
+    }
+
+    fn messenger_with(tools: &str, break_all: bool) -> McpChannelMessenger {
+        let body = fake_server(tools, break_all);
+        McpChannelMessenger::connect("fake", "/bin/sh", &["-c".to_string(), body], &[])
+            .unwrap_or_else(|e| panic!("应当连上（tools={tools}）：{e}"))
+    }
+
+    /// **情形 1**：服务只声明 `send_text` ⇒ 11 个可选能力全部回落 trait 默认。
+    ///
+    /// 这条守的是「缺能力不等于坏渠道」：一个只发文本的服务仍然可用，
+    /// 不该因为没声明 `create_chat` 就被判不可用。
+    #[tokio::test]
+    async fn absent_optional_tools_fall_back_to_trait_defaults() {
+        let m = messenger_with("send_text", false);
+
+        assert!(
+            m.get_quoted_message("mid").await.is_none(),
+            "缺工具应返回 None"
+        );
+        assert!(
+            m.download_attachment(
+                "k",
+                "mid",
+                0,
+                &crate::attachments::AttachmentDesc::Feishu {
+                    message_id: "mid".into(),
+                    file_key: "fk".into(),
+                    kind: "image".into(),
+                    file_name: "a.png".into(),
+                }
+            )
+            .await
+            .is_none(),
+            "缺工具应返回 None"
+        );
+        // create_chat 的默认是 **Err**（不是 None）——它要告诉调用方「只能手动建群」。
+        let err = m
+            .create_chat("群", "描述", "ou_1")
+            .await
+            .expect_err("缺 create_chat 应报错而不是静默");
+        assert!(
+            err.contains("未声明") && err.contains("create_chat"),
+            "报因要点名缺哪个工具：{err}"
+        );
+        assert!(m.user_display_name("u1").await.is_none());
+        assert!(m.typing("mid").await.is_none());
+        assert!(m.chat_brief("c1").await.is_none());
+        assert!(m.get_chat_info("c1").await.is_none());
+
+        // 无返回的三个：只要不 panic 就算过（它们本来就不上报）。
+        m.del_typing("mid", Some("re".into())).await;
+        m.done("mid").await;
+        m.note_context("c1", "ctx");
+        m.note_sender("c1", "u1");
+    }
+
+    /// **情形 2**：服务声明的工具都要被真的调用并正确解析。
+    ///
+    /// 这条守的是「解析对不对」——11 个能力各有一个字段映射，
+    /// 任何一个写错（取错 key、漏 unwrap）都会在这里暴露。
+    #[tokio::test]
+    async fn present_optional_tools_are_called_and_parsed() {
+        let m = messenger_with(
+            "send_text get_quoted_message download_attachment create_chat              user_display_name typing del_typing done note_context note_sender              chat_brief get_chat_info",
+            false,
+        );
+
+        let q = m.get_quoted_message("mid").await.expect("应当拿到引用");
+        assert_eq!(q.text, "引用原文");
+        assert_eq!(q.msg_type, "text");
+
+        let a = m
+            .download_attachment(
+                "k",
+                "mid",
+                0,
+                &crate::attachments::AttachmentDesc::Feishu {
+                    message_id: "mid".into(),
+                    file_key: "fk".into(),
+                    kind: "image".into(),
+                    file_name: "a.png".into(),
+                },
+            )
+            .await
+            .expect("应当拿到附件元数据");
+        assert_eq!(a.path, "/tmp/a.png");
+        assert_eq!(a.size, 42);
+        assert_eq!(a.mime, "image/png");
+        assert!(a.note.is_empty(), "正常下载不该有 note：{:?}", a.note);
+
+        assert_eq!(m.create_chat("群", "描述", "ou_1").await.unwrap(), "oc_new");
+        assert_eq!(m.user_display_name("u1").await.as_deref(), Some("张三"));
+        assert_eq!(m.typing("mid").await.as_deref(), Some("re_1"));
+        assert_eq!(
+            m.chat_brief("c1").await,
+            Some(("group".to_string(), "研发群".to_string()))
+        );
+        assert_eq!(
+            m.get_chat_info("c1").await,
+            Some(("研发群".to_string(), "干啥的".to_string()))
+        );
+    }
+
+    /// **情形 3**：可选能力调用失败 ⇒ `None`，**不阻断主流程**。
+    ///
+    /// 这条守的是「次要功能坏了不该吞掉消息」：如果 `get_quoted_message` 失败
+    /// 就向上报错，一条带引用的消息会被整个丢弃——而它本来完全可以不带引用进 agent。
+    #[tokio::test]
+    async fn failing_optional_tool_is_swallowed_not_propagated() {
+        let m = messenger_with(
+            "send_text get_quoted_message create_chat chat_brief",
+            true, // 所有 tools/call 都返回 error
+        );
+
+        // 全部返回 None / Err，且**不 panic**
+        assert!(
+            m.get_quoted_message("mid").await.is_none(),
+            "调用失败应回落 None"
+        );
+        assert!(m.chat_brief("c1").await.is_none(), "调用失败应回落 None");
+        assert!(
+            m.create_chat("群", "", "").await.is_err(),
+            "create_chat 失败要报错（它没有 None 可回落）"
+        );
+
+        // **关键**：同一个 messenger 仍然能发文本——失败没有污染 client。
+        m.send_text("c1", "仍然能发")
+            .await
+            .expect("发文本不该受影响");
     }
 
     #[test]

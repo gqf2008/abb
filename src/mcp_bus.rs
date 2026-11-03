@@ -41,6 +41,49 @@ pub const TOOL_SEND_THREAD_REPLY: &str = "send_thread_reply";
 /// 不会假装送达（历史教训：旧默认实现把路径当文本发出去还返回 `Ok`）。
 pub const TOOL_SEND_ATTACHMENT: &str = "send_attachment";
 
+// ── 可选能力工具名（契约 §3.4）──────────────────────────────────
+//
+// **全部可选**：缺失时 [`crate::mcp_channel::McpChannelMessenger`] 回落
+// `Messenger` trait 的默认实现（返回 `None` / 无操作 / `Err`）。
+//
+// 为什么集中在这里而不是散在 `mcp_channel.rs`：名字是**契约的一部分**——
+// 渠道 server 按这些名字暴露工具，ABB 按这些名字找。改名字等于改契约。
+//
+// **顺序即优先级**：A 档（用户可感知）在前，B 档（平台细节）在后。
+// 分档的判据是「丢了用户会不会发现」，不是实现难度。
+
+/// A：取一条被引用消息的内容（引用/回复进 prompt 用）。
+///
+/// 缺它 ⇒ 引用消息只剩 `message_id`，agent 看不到上文。
+pub const TOOL_GET_QUOTED_MESSAGE: &str = "get_quoted_message";
+/// A：下载入站附件到工作区。
+///
+/// 缺它 ⇒ 用户发来的图片/文件**存不下来**，agent 只能看到「有一个附件」。
+pub const TOOL_DOWNLOAD_ATTACHMENT: &str = "download_attachment";
+/// A：创建群会话（虚拟 Bot 一键建群用）。
+///
+/// 缺它 ⇒ 建群只能手动，聊天侧回落登记制指引。
+pub const TOOL_CREATE_CHAT: &str = "create_chat";
+/// A：反查用户展示名（授权记录里显示人名而不是一串 id）。
+pub const TOOL_USER_DISPLAY_NAME: &str = "user_display_name";
+
+/// B：处理中表情（打字机效果）。返回 reaction id 供 `del_typing`/`done` 用。
+pub const TOOL_TYPING: &str = "typing";
+/// B：撤销处理中表情。
+pub const TOOL_DEL_TYPING: &str = "del_typing";
+/// B：完成表情。
+pub const TOOL_DONE: &str = "done";
+/// B：记下会话的回复上下文（微信 `context_token` 用）。
+///
+/// **无返回**——它是状态同步，不是查询。
+pub const TOOL_NOTE_CONTEXT: &str = "note_context";
+/// B：记下会话最近的发送者（钉钉群聊回复时 @ 对方）。
+pub const TOOL_NOTE_SENDER: &str = "note_sender";
+/// B：会话类型 + 会话名（历史回填用）。
+pub const TOOL_CHAT_BRIEF: &str = "chat_brief";
+/// B：群资料（群名 + 群介绍）。
+pub const TOOL_GET_CHAT_INFO: &str = "get_chat_info";
+
 /// 入站兜底工具名（契约 §3.2 方案 B）。
 pub const TOOL_POLL: &str = "poll";
 /// 入站首选资源 URI 前缀（契约 §3.2 方案 A）。
@@ -125,6 +168,15 @@ pub struct ChannelCapabilities {
     pub has_poll: bool,
     /// 可订阅的收件箱 URI（`resources/list` 里以 `channel://` 开头的那些）。
     pub inbox_uris: Vec<String>,
+    /// **服务实际暴露的全部工具名**（原样，排序后）。
+    ///
+    /// 为什么留这个而不给 11 个可选能力各加一个 bool：契约 §3.4 的能力是
+    /// **开放集合**（新增一个不需要改结构体），逐个加字段会让「加能力 = 改三处」。
+    /// 而查询只需要「这个名字在不在」——[`Self::has_tool`] 就够。
+    ///
+    /// 那为什么前三个（`has_send_text` 等）仍是独立 bool：它们参与 [`Self::validate`]
+    /// 的**可用性判定**（缺 `send_text` 直接判渠道不可用），是必需字段而非可选能力。
+    pub tool_names: Vec<String>,
 }
 
 impl ChannelCapabilities {
@@ -137,6 +189,13 @@ impl ChannelCapabilities {
             return Some(Inbound::Poll);
         }
         None
+    }
+
+    /// 服务是否暴露了某个工具（契约 §3.4 的可选能力都走这个查询）。
+    ///
+    /// 逐字节精确匹配：工具名是标识符，不做大小写折叠。
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.tool_names.iter().any(|t| t == name)
     }
 
     /// 整体可用性校验。
@@ -203,6 +262,7 @@ mod tests {
             has_send_attachment: false,
             has_poll: poll,
             inbox_uris: uris.iter().map(|s| s.to_string()).collect(),
+            tool_names: vec![],
         }
     }
 
@@ -401,12 +461,22 @@ pub fn capabilities_from(
         .map(|u| u.to_string())
         .collect();
 
+    // `tools/list` 里每个条目的 `name`；缺 name 的条目跳过（不是错误——
+    // server 可能带描述性条目，但按契约它们带不了可调用的工具名）。
+    let mut tool_names: Vec<String> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .collect();
+    tool_names.sort();
+
     Ok(ChannelCapabilities {
         has_send_text: has(TOOL_SEND_TEXT),
         has_send_thread_reply: has(TOOL_SEND_THREAD_REPLY),
         has_send_attachment: has(TOOL_SEND_ATTACHMENT),
         has_poll: has(TOOL_POLL),
         inbox_uris,
+        tool_names,
     })
 }
 

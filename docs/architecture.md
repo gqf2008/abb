@@ -111,11 +111,11 @@ $AGENT_BRIDGE_HOME 或 ~/.agent-bridge/        （main.rs:97 bridge_dir）
 |---|---|
 | `src/` 顶层 | 见下表 |
 | `src/runtime/`（从上游移植的会话层）**全目录 13727** | 主要 5 个：acp 4888 / harness 4332 / pool 2173 / queue 1536 / oneshot 571；其余 4 个小文件合计 227 |
-| `src/` 合计 | **119033** |
+| `src/` 合计 | **119569** |
 | `ui/app.slint` | 5964 |
 | GUI 三件合计（ui.rs + syschat.rs + 渲染台） | **26192** |
 
-MCP 总线拆成七个文件（`mcp_bus` 557 契约与帧 / `mcp_client` 传输 / `mcp_channel` Messenger /
+MCP 总线拆成七个文件（`mcp_bus` 627 契约与帧 / `mcp_client` 传输 / `mcp_channel` Messenger /
 `mcp_inbound` 入站协议 / `mcp_inbound_loop` 驱动 / `mcp_adapter` 翻译 / `mcp_channel_loop` 事件循环）。
 加上 `crates/abb-channel-wechat/`（微信渠道的独立 server）后，渠道实现可以整块搬出主仓。
 

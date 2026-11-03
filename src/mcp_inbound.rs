@@ -260,6 +260,7 @@ mod tests {
             has_send_attachment: false,
             has_poll: poll,
             inbox_uris: inbox.iter().map(|s| s.to_string()).collect(),
+            tool_names: vec![],
         }
     }
 
