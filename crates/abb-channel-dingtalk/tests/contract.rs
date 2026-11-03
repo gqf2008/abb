@@ -64,7 +64,10 @@ fn stdout_is_pure_json_rpc() {
         assert!(v.get("id").is_some(), "每条响应都要带 id");
     }
     // 空凭证（或凭证错）都**不许**影响握手：入站失败只能打 stderr。
-    assert_eq!(got[0]["result"]["serverInfo"]["name"], "abb-channel-dingtalk");
+    assert_eq!(
+        got[0]["result"]["serverInfo"]["name"],
+        "abb-channel-dingtalk"
+    );
     // 声明 resources 是必须的：ABB 据 `resources/subscribe` 能力选入站路线（A 方案）。
     assert_eq!(
         got[0]["result"]["capabilities"]["resources"]["subscribe"],

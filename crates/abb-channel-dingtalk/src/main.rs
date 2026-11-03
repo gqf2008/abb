@@ -426,6 +426,7 @@ fn upload_name(name: &str, mime: &str, kind: &str) -> String {
 /// 钉钉外发能力闸（与 ABB `messenger::dingtalk_send_plan` 同判据）：
 /// **先判能不能发，再去读/解码内容**——反过来的历史教训是「不支持的组合把 100 MB
 /// 整读进内存再丢」（审查 #254）。
+#[derive(Debug)]
 enum SendPlan {
     Image,
     File(&'static str),
@@ -604,15 +605,19 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 按字符数贪心分段，且**不在 ``` 代码块中间切断**。
+/// 按字符数贪心分段，且**尽量不在 ``` 代码块中间切断**。
 ///
-/// 逐字抄自 ABB `src/feishu.rs::split_text`（那边是 `pub fn`，但不在本 crate 里）：
+/// 抄自 ABB `src/feishu.rs::split_text`（那边是 `pub fn`，但不在本 crate 里）：
 /// 钉钉的文本上限约 2 万字节，超长整条会被平台拒；原实现由 ABB
 /// `DingTalkMessenger::send_thread_reply` 调用它分段，搬到本进程后只能自己在
 /// `send_text` 里补上（否则超长回复从「分几条发」退化成「一条都发不出」）。
+///
+/// **与 ABB 版的唯一差别**：单行本身就超过 `limit` 时（长段落 / minified JSON /
+/// 一整个大代码块）硬切。原实现只按行切，这种输入会产出一个**超额 chunk** —— 钉钉
+/// 那一条仍然被整条拒，等于分段白做。硬切只是把「必然失败」换成「多分几条发」。
 fn split_text(text: &str, limit: usize) -> Vec<String> {
-    let char_count = text.chars().count();
-    if char_count <= limit {
+    let limit = limit.max(1);
+    if text.chars().count() <= limit {
         return vec![text.to_string()];
     }
     let mut chunks = Vec::new();
@@ -621,6 +626,19 @@ fn split_text(text: &str, limit: usize) -> Vec<String> {
     let mut in_fence = false; // 是否在 ``` 代码块内（跨行跟踪）
     for line in text.split_inclusive('\n') {
         let l = line.chars().count();
+        if l > limit {
+            // 单行超限：先收尾当前块，再把这一行按 limit 字符硬切。
+            // 不切的话超额 chunk 会被平台整条拒（见函数注释）。
+            if !cur.is_empty() {
+                chunks.push(std::mem::take(&mut cur));
+                cur_len = 0;
+            }
+            let chars: Vec<char> = line.chars().collect();
+            for piece in chars.chunks(limit) {
+                chunks.push(piece.iter().collect());
+            }
+            continue;
+        }
         if cur_len + l > limit && !cur.is_empty() && !in_fence {
             chunks.push(std::mem::take(&mut cur));
             cur_len = 0;
@@ -916,20 +934,35 @@ mod tests {
         assert_eq!(upload_name("", "", "file"), "attachment.bin");
     }
 
-    /// 分段：短文本原样一条；长文本按行切且不切断代码块。
+    /// 分段：短文本原样一条；多行按行切**尽量不切断代码块**；单行超限硬切。
     #[test]
     fn split_text_keeps_short_text_whole_and_respects_fences() {
         assert_eq!(split_text("hello", 8000), vec!["hello".to_string()]);
+        // 单行超限 ⇒ 硬切（否则超额 chunk 会被平台整条拒）
         let long = "a".repeat(20);
         let chunks = split_text(&long, 5);
         assert!(chunks.len() > 1, "超长必须分段：{chunks:?}");
         assert_eq!(chunks.concat(), long, "分段不许丢字符");
-        // 代码块里的长行不被切断（切了会破坏 markdown 语义）
-        let fenced = format!("```\n{}\n```\n", "b".repeat(30));
-        let chunks = split_text(&fenced, 10);
-        assert!(
-            chunks.iter().any(|c| c.contains(&"b".repeat(30))),
-            "fence 内的长行不该被切断：{chunks:?}"
+        // 小代码块整体超 limit 但**行都不超** ⇒ 整块保留（in_fence 拦住切点）
+        let fenced = "```\nbb\ncc\n```\n";
+        assert_eq!(fenced.chars().count(), 14);
+        let chunks = split_text(fenced, 10);
+        assert_eq!(chunks, vec![fenced.to_string()], "小代码块应整块保留");
+        // 单行本身超过 limit 时**连 fence 也硬切**：超额 chunk 会被平台整条拒，
+        // 两害相权宁可拆块（见 split_text 函数注释）。
+        let big = format!("```\n{}\n```\n", "b".repeat(30));
+        let chunks = split_text(&big, 10);
+        assert!(chunks.len() > 1, "单行超限必须硬切：{chunks:?}");
+        assert_eq!(chunks.concat(), big, "硬切同样不许丢字符");
+        // 多行文本按行切，不切碎单行
+        let lines = format!("{}\n{}\n", "x".repeat(8), "y".repeat(8));
+        let chunks = split_text(&lines, 10);
+        assert_eq!(
+            chunks,
+            vec![
+                format!("{}\n", "x".repeat(8)),
+                format!("{}\n", "y".repeat(8))
+            ]
         );
     }
 
