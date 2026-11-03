@@ -40,6 +40,8 @@ mod mcp_bus;
 #[cfg(test)]
 mod mcp_bus_e2e_test;
 mod mcp_channel;
+#[cfg(test)]
+mod mcp_channel_dir_e2e_test;
 mod mcp_channel_loop;
 mod mcp_client;
 mod mcp_inbound;

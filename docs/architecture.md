@@ -111,12 +111,12 @@ $AGENT_BRIDGE_HOME 或 ~/.agent-bridge/        （main.rs:97 bridge_dir）
 |---|---|
 | `src/` 顶层 | 见下表 |
 | `src/runtime/`（从上游移植的会话层）**全目录 13727** | 主要 5 个：acp 4888 / harness 4332 / pool 2173 / queue 1536 / oneshot 571；其余 4 个小文件合计 227 |
-| `src/` 合计 | **117737** |
+| `src/` 合计 | **117957** |
 | `ui/app.slint` | 5964 |
 | GUI 三件合计（ui.rs + syschat.rs + 渲染台） | **26182** |
 
 最大的六个文件：`ui.rs` 12792、`syschat.rs` 7671、`ui_headless_render_test.rs` 5719、
-`task_run.rs` 4563、`platform.rs` 4096、`main.rs` 3452。
+`task_run.rs` 4563、`platform.rs` 4096、`main.rs` 3454。
 
 > **重心在 GUI**：`ui.rs` + `syschat.rs` + 渲染台三件（见上表）比整个 `src/runtime/` 全目录还大。
 > 所以「ABB 是个桥」这个说法在代码量上不成立：它一半是桌面应用。
