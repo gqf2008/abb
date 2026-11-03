@@ -62,6 +62,34 @@ check_removed_but_present() {
     fi
 }
 
+# 反向：注释声称「还没接上 / 暂未用」，但代码里**已经有调用**。
+#
+# 为什么需要（2026-11-03 实测）：先做的单向版只查「声称已移除但其实在」，
+# 于是 `mcp_channel.rs` / `mcp_inbound.rs` / `mcp_inbound_loop.rs` 三处
+# 「还没接进 service」、「暂未用」全被漏掉——而它们早已被真实调用。
+# 工具报 ✅，实际三处过期。
+#
+# 用法：$2 = 文件，$3 = 「还没接上」的措辞，$4 = 证明「已接上」的调用点模式
+# （在同一文件里 grep 到它 ⇒ 说明接线真的发生了）。
+check_claimed_unwired() {
+    desc=$1
+    file=$2
+    claim_pat=$3
+    wired_pat=$4
+
+    [ -f "$file" ] || return 0
+    if ! grep -qE "$claim_pat" "$file" 2>/dev/null; then
+        return 0
+    fi
+    # 代码里（排除注释）有没有那处调用
+    if grep -nE "$wired_pat" "$file" 2>/dev/null | grep -vE ':\s*(//|///|//!)' | grep -q .; then
+        fail=$((fail + 1))
+        printf '❌ %s\n' "$desc"
+        printf '   %s 的注释仍称「还没接上」，但代码里已有调用：\n' "$file"
+        grep -nE "$wired_pat" "$file" | grep -vE ':\s*(//|///|//!)' | sed 's/^/     /' | head -3
+    fi
+}
+
 # ── 逐条登记（每条对应一次真实事故）────────────────────────────────
 
 # 事故 1（2026-11-03）：删了模块级 allow，模块文档还写着「整模块暂时 allow(dead_code)」。
@@ -71,6 +99,48 @@ check_removed_but_present \
     "src/mcp_bus.rs" \
     "那个 allow 已经移除|已经移除" \
     '^#!\[allow\(dead_code\)\]'
+
+# 事故 3（2026-11-03）：三处注释仍称「还没接进 service / 暂未用」，
+# 而实际调用点在别的文件里（mcp_channel_loop.rs / messenger.rs）。
+# 这用「全局调用点」判：注释说没接，但整个 src/ 里找得到调用 ⇒ 过期。
+check_claimed_unwired_global() {
+    desc=$1
+    file=$2
+    claim_pat=$3
+    # 证明已接上的全局证据（在 src/ 其它文件里 grep）
+    wired_evidence=$4
+
+    [ -f "$file" ] || return 0
+    # **排除引用历史的行**：`这里曾有…注释写「…」` 是在交代背景，不是仍在声称。
+    # 第一版没排除，于是修好之后仍被自己的新注释判红——误红。
+    if ! grep -nE "$claim_pat" "$file" 2>/dev/null \
+         | grep -vE '这里曾有|曾有.*注释写|原来的注释' | grep -q .; then
+        return 0
+    fi
+    if grep -rqE "$wired_evidence" src/ --include='*.rs' 2>/dev/null; then
+        fail=$((fail + 1))
+        printf '❌ %s\n' "$desc"
+        printf '   %s 的注释仍称「还没接上」，但 src/ 里已有调用点\n' "$file"
+    fi
+}
+
+check_claimed_unwired_global \
+    "mcp_channel：注释说「还没接进 service 的 bot 装配」，但 messenger::build 已在用" \
+    "src/mcp_channel.rs" \
+    "还没接进|暂不涉及" \
+    "mcp_channel::McpChannelMessenger::connect"
+
+check_claimed_unwired_global \
+    "mcp_inbound：注释说「还没接进 service 的轮询循环」，但 mcp_channel_loop 已在用" \
+    "src/mcp_inbound.rs" \
+    "还没接进|暂未用" \
+    "mcp_inbound::negotiate"
+
+check_claimed_unwired_global \
+    "mcp_inbound_loop：注释说「还没接进 service::run_bot」，但已在用" \
+    "src/mcp_inbound_loop.rs" \
+    "还没接进|暂未用" \
+    "mcp_channel_loop::run"
 
 # 事故 2（2026-11-03）：假绿清单里「上面五条」没跟着变成七条/八条。
 # 这个用总数一致性检查：标题里的「N 种」必须等于 `### ` 小节数。
@@ -96,7 +166,7 @@ if [ -f "$plan_doc" ]; then
 fi
 
 if [ "$fail" -eq 0 ]; then
-    echo "✅ 注释声称的事实与代码一致（已登记的 2 类检查）"
+    echo "✅ 注释声称的事实与代码一致（已登记的 5 条检查，双向）"
     exit 0
 fi
 echo

@@ -22,10 +22,11 @@
 //!    本模块原来也有个 `cursor` 字段，但那是游标职责下沉前的残留——2026-11-03 实测
 //!    生产代码零调用后删掉，连同两个只被它自己用的方法。）
 
-// 本步骤（S2b）把驱动逻辑做成**可单测的纯逻辑**，但还没接进 `service::run_bot`
-// 的 bot 循环（S2c：真渠道 + 真 Bridge 的接线）。
+// 这里曾有 `#![allow(dead_code)]`，注释写「还没接进 service::run_bot 的 bot 循环（S2c）」。
 //
-// 与 `mcp_bus`/`mcp_client` 同口径：**移除它必须是「真接上了」**，不是「先关警告」。
+// **那个 allow 已经移除**（2026-11-03）：`mcp_channel_loop.rs` 现在真的在调
+// `tick` / `deliver_batch` / `InboundState`，`service::run_bot` 也已调用
+// `mcp_channel_loop::run`。摘掉后 clippy 只剩 `cursor` 相关的 3 处真死代码，已一并删除。
 use std::collections::VecDeque;
 
 use crate::mcp_bus::ChannelMessage;

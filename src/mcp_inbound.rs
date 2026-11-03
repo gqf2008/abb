@@ -25,8 +25,10 @@
 //! `next_cursor` 由**渠道服务**决定（它才知道自己的消息 id 怎么排）。ABB 只负责
 //! 原样回传上次拿到的值——不猜、不重排、不从消息 id 反推序号。
 
-// 入站还没接进 service 的轮询循环（S2b），故部分成员暂未用。
-// **移除必须是「真接上了」**，与 S1c/S1d 同口径。
+// 这里曾有 `#![allow(dead_code)]`，注释写「入站还没接进 service 的轮询循环（S2b）」。
+//
+// **那个 allow 已经移除**（2026-11-03）：`mcp_channel_loop.rs` 现在真的在调用本模块
+// （`negotiate` / `messages_from_notifications` / `poll_once`），摘掉后 clippy 零报错。
 use serde_json::{json, Value};
 
 use crate::mcp_bus::{updated_uri, ChannelMessage, Inbound, TOOL_POLL};

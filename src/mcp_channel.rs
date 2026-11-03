@@ -17,10 +17,13 @@
 //! 附件、引用、群资料、建群、表情等**一律显式失败/返回 None**——不静默假装成功
 //! （本仓在 `send_attachment` 的默认实现上踩过：默认把路径当文本发出去还返回 Ok）。
 //!
-//! 入站（`resources/subscribe` 或 `poll`）是 S2，本模块暂不涉及。
+//! 入站（`resources/subscribe` 或 `poll`）不在本模块：它在 `mcp_inbound.rs`
+//! （协议）与 `mcp_channel_loop.rs`（驱动）。
 
-// 与 `mcp_bus`/`mcp_client` 同口径：还没接进 `service.rs` 的 bot 装配（S1d），
-// 故部分成员暂时未用。**移除这个 allow 必须是「真接上了」**，不是「先关警告」。
+// 这里曾有模块级 `#![allow(dead_code)]`，注释写「还没接进 service.rs 的 bot 装配（S1d）」。
+//
+// **那个 allow 已经移除**（S1d 完成）：`messenger::build` 的 `is_mcp()` 分支真的在用本类型。
+// 只剩两个访问器单点 allow（见下），留给 S2 入站与 GUI 状态展示。
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
