@@ -95,6 +95,28 @@ ABB 启动时先试 A（`resources/list` 里有 `channel://` + `resources/subscr
 `get_quoted_message` / `get_chat_info` / `chat_brief` / `create_chat` / `typing` / `done` /
 `user_display_name` —— 一一对应 `Messenger` trait 的默认方法，缺失时用 trait 默认实现。
 
+### 3.5 附件（可选，缺失即只能发文本）
+
+工具 `send_attachment`，参数：
+
+```json
+{ "chat_id": "…", "name": "报表.csv", "mime": "text/csv",
+  "kind": "image|file|video", "data_b64": "<标准 base64>" }
+```
+
+**为什么是 base64 内联而不是路径引用**：ABB 与渠道 server 通常是同机子进程，
+两段式上传（预签名 URL）对这个场景过重；而路径引用要把 ABB 的文件系统暴露给 server。
+这是 Jev 裁定 `base64_inline`（p=0.78 / conf=0.67——它自己也不确定）。
+
+**体积上限（重要）**：单帧 JSON 上限 `mcp_client::MAX_LINE_BYTES` = **32 MB**，
+base64 膨胀 33% ⇒ 原文件上限 `MAX_ATTACHMENT_BYTES` = **20 MB**。
+
+ABB 侧会在**发送之前**做预检并给出「附件太大：X MB，上限 Y MB」，
+而不是让底层抛笼统的 `LineTooLong`（那个错误与「渠道不支持附件」难以区分）。
+
+缺这个工具时，`Messenger::send_attachment` **显式失败**并说清「该渠道只能发文本」
+—— 不假装送达（历史教训：旧默认实现把路径当文本发出去还返回 `Ok`）。
+
 ## 4. ABB 侧的职责边界
 
 | ABB **负责** | ABB **不负责** |
@@ -106,6 +128,58 @@ ABB 启动时先试 A（`resources/list` 里有 `channel://` + `resources/subscr
 
 **「告知用户怎么配」是硬要求**，不是文档附属品：用户说「我要接飞书」时，abb 里的 assistant
 必须能用自然语言讲清：装哪个 MCP server、`mcp.json` 写什么、缺哪些权限。这条能力要有测试。
+
+### 4.1 怎么配一个渠道（ABB 侧）
+
+配一个 MCP 渠道**只改配置**，不碰代码：
+
+```jsonc
+// config.json 里 bots[] 的一项
+{
+  "name": "我的微信",
+  "kind": "mcp",                    // ← 新建 bot 的默认值
+  "enabled": true,
+  "mcp_channel": {
+    "name": "wechat",               // 日志/报错里显示的名字
+    "command": "/path/to/abb-channel-wechat",
+    "args": ["--dir", "/tmp/wx-channel"],
+    "env": [
+      { "name": "WX_TOKEN",    "value": "…" },
+      { "name": "WX_BASE_URL", "value": "https://ilinkai.weixin.qq.com" },
+      { "name": "WX_USER_ID",  "value": "…" }
+    ]
+  }
+}
+```
+
+界面里对应「机器人配置」页选一个 bot、类型选 `mcp`，然后填三行：
+**可执行文件** / **参数** / **环境变量**（每行 `KEY=VALUE`）。
+
+**渠道配置由提供 MCP 的一方决定**：ABB 不认识 `WX_TOKEN` 是什么，它只是把 `env`
+原样传给子进程。所以接一个新渠道不需要改 ABB——写一个新的 MCP server 就行。
+
+### 4.2 已有的渠道实现
+
+| 实现 | 位置 | 状态 |
+|---|---|---|
+| 目录渠道（参考实现） | `tools/channel-mcp-dir/` | ✅ 可用；`sh tools/channel-mcp-dir/verify.sh` 一条命令自检 |
+| 微信 | `crates/abb-channel-wechat/` | ✅ 可用（`send_text` / `poll` / `send_attachment` / `login` / `login_status`） |
+| 飞书 / 钉钉 | 仍在 `src/feishu.rs` / `src/dingtalk.rs` | 未搬；照微信的路径搬（见 §5） |
+
+微信渠道的用法：
+
+```sh
+# 1. 起一个 bot，第一次先扫码
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"login","arguments":{}}}' \
+  | abb-channel-wechat --dir /tmp/wx
+# 二维码在 /tmp/wx/wechat-qr.png，用微信扫
+
+# 2. 轮询状态，confirmed 后 token 会打到 stderr
+echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"login_status","arguments":{}}}' \
+  | abb-channel-wechat --dir /tmp/wx
+
+# 3. 把拿到的三项写进上面 config.json 的 mcp_channel.env
+```
 
 ## 5. 迁移分期（**减法在最后，且需 owner 授权**）
 
