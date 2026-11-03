@@ -53,7 +53,7 @@ if git rev-parse --verify -q origin/main >/dev/null 2>&1; then
     else
         ahead=$(git rev-list --count origin/main..main 2>/dev/null || echo "?")
         behind=$(git rev-list --count main..origin/main 2>/dev/null || echo "?")
-        warn_note "main 与 origin/main 不一致（领先 $ahead / 落后 $behind）——有提交没推？"
+        warn_note "main 与 origin/main 不一致（领先 ${ahead} / 落后 ${behind}）——有提交没推？"
     fi
 else
     unknown_note "没有 origin/main（远程未配置或未 fetch）"
