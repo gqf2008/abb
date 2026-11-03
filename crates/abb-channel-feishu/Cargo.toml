@@ -1,0 +1,56 @@
+# abb-channel-feishu —— 飞书渠道的**独立 MCP server**。
+#
+# 为什么要独立成 crate（与「删掉内置渠道」的关键差异）：
+#   搬迁不是退役。`src/feishu.rs` 的 1165 行是**能用的实现**，删掉换「理论上能接」
+#   是净损失；搬到独立进程则功能不丢、只换进程边界，且随时能搬回来。
+#
+# 为什么飞书先于钉钉搬：
+#   依赖面最小。出站只要 `tenant_access_token` + 三条普通 HTTPS（JSON/multipart），
+#   没有钉钉那套加签（HMAC）+ 回调加解密（AES）+ Stream SDK 的额外机制
+#   ⇒ 协议层可以整份搬，只换三处依赖（见 `src/feishu.rs` 文件头）。
+#
+# 与微信版最大的**区别**在入站：
+#   微信 `get_updates(cursor)` 天然是游标长轮询 ⇒ 用契约的 `poll`（B 方案）。
+#   飞书入站是服务端推的 WS 长连接，本地没有「按游标取一批」的原语 ⇒ 用
+#   `channel://inbox` 资源订阅（A 方案）：WS 收到事件 → 进程内缓冲 →
+#   `notifications/resources/updated` → ABB `resources/read` 取走。
+#   裁决记录：Jev `subscribe_push` p=0.81 / conf=0.62（rid gen-dec-1793692596-P6YzJvS4Qo1baj0dfbY8）。
+#
+# 依赖只列**实际用到**的（`qrcode`/`image`/`aes`/`uuid`/`md5` 飞书协议不用，
+# 微信那份里它们服务的是扫码登录与媒体加解密）：多一个依赖就多一份编译时间与
+# 攻击面，飞书侧没有对应需求就不带。
+#
+# 自带 manifest + lock（与 abb-agent / abb-chart / abb-channel-wechat 同构），
+# root 的 fmt/clippy/test 不碰它。
+#
+# 构建：cargo build --release --manifest-path crates/abb-channel-feishu/Cargo.toml
+[package]
+name = "abb-channel-feishu"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+repository = "https://github.com/gqf2008/abb"
+description = "飞书渠道的独立 MCP server（ABB 总线的渠道侧实现）"
+
+[[bin]]
+name = "abb-channel-feishu"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls-webpki-roots"] }
+# 卡片 markdown 清洗（`sanitize_card_markdown`）要用 CommonMark parser：与 ABB root
+# 同版本、同特性。为什么不用手写词法扫描：连续两轮独立审查被证伪（围栏/行内代码/
+# 引用式图片都能绕过），「markdown 惰性上下文」本身就属于 CommonMark 语法。
+pulldown-cmark = { version = "0.13.4", default-features = false }
+# `create_chat` 的幂等 uuid。群管理本批**未接进契约**（见 src/feishu.rs 的
+# allow(dead_code) 说明），但协议层是整份搬来的，编译需要它。
+uuid = { version = "1", features = ["v4"] }
+# 入站长连接：帧编解码在 `src/proto.rs`，连接在 `src/wsin.rs`（与 ABB root 同版本）
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+# 重连抖动（服务端下发 ReconnectNonce）——与 ABB root 同一个 crate
+fastrand = "2"
