@@ -38,7 +38,37 @@ want() {
     return 0
 }
 
+# 数一个文件的行数。
+#
+# **文件不存在必须报错退出**，不能返回空串：
+# 2026-11-04 评审抓到——内置渠道退役后 `src/{feishu,wechat,dingtalk}.rs` 已删，
+# 而这里仍在对它们求行数。`wc -l < 不存在的文件` 把错误写进 stderr、stdout 是空，
+# 于是 `want` 拿到空值、`grep -o "\b\b"` 匹配不到 ⇒ **判据恒过**，
+# 脚本还打 ✅、rc=0、stderr 三行 "No such file" 无人看。
+# 「量不到东西」和「量到合格的值」绝不能是同一个结果。
 lines_of() { wc -l < "$1" | tr -d ' '; }
+
+# **预检**：判据表要统计的每个文件都必须存在，否则直接红。
+#
+# 为什么必须在主 shell 里预检、而不是在 `lines_of` 内部判：
+# `lines_of` 全在 `$( ... )` 里调用，**命令替换是子 shell**，里面的 `exit 1`
+# 只退出那个子 shell（父脚本继续跑并 rc=0），里面的 `MISSING_FILE=1` 也传不回来
+# （两种都实测过）。只有主 shell 里的判断才能真正让脚本红。
+#
+# 这条预检的背景：2026-11-04 评审抓到——内置渠道退役后 `src/{feishu,wechat,dingtalk}.rs`
+# 已删，判据表仍在统计它们。`wc -l < 不存在的文件` 往 stderr 写错、stdout 是空，
+# 于是 `want` 拿到空值、`grep -o "\b\b"` 匹配不到 ⇒ **判据恒过、还打 ✅**。
+# 「量不到东西」和「量到合格的值」绝不能是同一个结果。
+for f in src/ui.rs src/syschat.rs src/ui_headless_render_test.rs src/task_run.rs \
+         src/platform.rs src/main.rs src/service.rs src/guard.rs src/deliver.rs \
+         src/mcp_bus.rs src/messenger.rs src/runtime/acp.rs src/runtime/harness.rs \
+         src/runtime/pool.rs src/runtime/queue.rs src/runtime/oneshot.rs ui/app.slint; do
+    if [ ! -f "$f" ]; then
+        echo "❌ arch-check 要统计 $f 的行数，但该文件不存在" >&2
+        echo "   （文件被删/改名了？判据表需要同步，不能让判据静默失效）" >&2
+        exit 1
+    fi
+done
 total_rs() { find src -name '*.rs' -print0 | xargs -0 cat 2>/dev/null | wc -l | tr -d ' '; }
 
 # ── 实测 ────────────────────────────────────────────────────────────────────
@@ -64,9 +94,6 @@ ONESHOT=$(lines_of src/runtime/oneshot.rs)
 RUNTIME_ALL=$(find src/runtime -name '*.rs' -print0 | xargs -0 cat 2>/dev/null | wc -l | tr -d ' ')
 MCP_BUS=$(lines_of src/mcp_bus.rs)
 MESSENGER=$(lines_of src/messenger.rs)
-FEISHU=$(lines_of src/feishu.rs)
-WECHAT=$(lines_of src/wechat.rs)
-DINGTALK=$(lines_of src/dingtalk.rs)
 RUNTIME_TOTAL=$((ACP + HARNESS + POOL + QUEUE + ONESHOT))
 GUI_TOTAL=$((UI_RS + SYSCHAT + RENDER))
 if [ "$print_only" -eq 1 ]; then
@@ -92,7 +119,6 @@ runtime 合计         $RUNTIME_ALL  （全目录：find src/runtime -name *.rs�
   （上面 5 个之外的其余文件合计 $((RUNTIME_ALL - RUNTIME_TOTAL)) 行）
 mcp_bus.rs           $MCP_BUS
 messenger.rs         $MESSENGER
-feishu/wechat/ding   $FEISHU / $WECHAT / $DINGTALK
 EOF
     exit 0
 fi
@@ -111,9 +137,6 @@ want "guard.rs 行数"          "$GUARD"
 want "deliver.rs 行数"        "$DELIVER"
 want "runtime/acp.rs 行数"    "$ACP"
 want "mcp_bus.rs 行数"        "$MCP_BUS"
-want "feishu.rs 行数"         "$FEISHU"
-want "wechat.rs 行数"         "$WECHAT"
-want "dingtalk.rs 行数"       "$DINGTALK"
 # 两个**汇总**也得守（评审 blocking-2）：初版它们从未被断言，于是文档写「整个 runtime
 # 13600 行」而实测是 13727 也能全绿——一个错数字横在「重心在 GUI」这个承重结论旁边
 # 而无人发觉。汇总值比单项值更容易错（手列文件必漏），所以更需要断言。

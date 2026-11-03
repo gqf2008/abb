@@ -275,6 +275,13 @@ pub struct Inbound {
     pub text: String,
     pub ts: i64,
     pub attachments: Vec<Value>,
+    /// 被引用（回复）的消息 id；空 = 不是回复消息。
+    ///
+    /// **必须从事件体透出到契约的 `ChannelMessage.parent_id`**：ABB 侧
+    /// `Bridge::fill_quoted` 靠它回查被引用内容。不透出 ⇒ 引用/回复进 prompt
+    /// 的能力**静默消失**（2026-11-04 评审抓到：字段加了但渠道没产出，
+    /// `fill_quoted` 第一行就 return）。
+    pub parent_id: String,
 }
 
 /// 事件推来的原始字节 → [`Inbound`]。**不认识的事件一律 `None`**（不猜）。
@@ -317,6 +324,13 @@ pub fn parse_event(payload: &[u8]) -> Option<Inbound> {
         return None;
     }
     let content = msg["content"].as_str().unwrap_or("");
+    // 回复消息带 `parent_id`（被引用那条的 message_id）。缺失/等于自身 ⇒ 空。
+    let parent_id = msg["parent_id"].as_str().unwrap_or("").trim().to_string();
+    let parent_id = if parent_id == message_id {
+        String::new()
+    } else {
+        parent_id
+    };
     let parsed = crate::feishu::parse_content(content);
     let mut text = parsed.text;
     // 富文本/文本消息里的 @ 是占位符（`@_user_1`），用 mentions 里的真名替换。
@@ -361,6 +375,7 @@ pub fn parse_event(payload: &[u8]) -> Option<Inbound> {
         text,
         ts,
         attachments,
+        parent_id,
     })
 }
 
@@ -402,6 +417,8 @@ pub fn to_channel_message(in_: &Inbound, sender_name: &str) -> Value {
         "text": in_.text,
         "ts": in_.ts,
         "attachments": in_.attachments,
+        // 契约 §3.3：被引用消息 id。ABB 靠它触发 `fill_quoted` 回查上文。
+        "parent_id": in_.parent_id,
     })
 }
 
@@ -442,7 +459,12 @@ mod tests {
         assert_eq!(in_.text, "@张三 你好", "@ 占位符要换成真名");
         assert_eq!(in_.ts, 1793612338, "毫秒要换成秒");
         let m = to_channel_message(&in_, "张三");
-        // 契约 §3.3 的七个字段一个都不能少
+        // 契约 §3.3 的字段一个都不能少。**`parent_id` 必须在这张表里**——
+        // 它曾经漏了（2026-11-04 评审抓到的 blocking）：契约加了字段、ABB 侧
+        // `fill_quoted` 靠它回查上文，但渠道根本不产出 ⇒ 引用/回复内容
+        // **静默不进 prompt**，`fill_quoted` 第一行就 return，连日志都没有。
+        // 把字段名列成数组、逐个断言存在，正是为了让「加了契约没加产出」这
+        // 类漏项在**渠道侧**就红掉，而不是等 ABB 侧看起来一切正常。
         for k in [
             "chat_id",
             "message_id",
@@ -451,10 +473,39 @@ mod tests {
             "text",
             "ts",
             "attachments",
+            "parent_id",
         ] {
             assert!(m.get(k).is_some(), "契约 §3.3 缺字段 `{k}`：{m}");
         }
         assert_eq!(m["sender_name"], "张三");
+        assert_eq!(m["parent_id"], "", "非回复消息的 parent_id 必须是空串");
+    }
+
+    /// 回复消息：`parent_id` 要一路从事件体透到 `ChannelMessage`。
+    ///
+    /// 这是「引用/回复进 prompt」的**唯一入口**——ABB 侧 `Bridge::fill_quoted`
+    /// 拿不到它就直接 return（无日志），所以渠道不产出 = 功能静默消失。
+    #[test]
+    fn reply_event_carries_parent_id_into_channel_message() {
+        let mut v: Value =
+            serde_json::from_slice(&event(r#"{"text":"这张图啥意思"}"#, "text")).unwrap();
+        v["event"]["message"]["parent_id"] = json!("om_parent");
+        let in_ = parse_event(&serde_json::to_vec(&v).unwrap()).expect("应当解出一条");
+        assert_eq!(in_.parent_id, "om_parent", "事件里的 parent_id 要留下来");
+        let m = to_channel_message(&in_, "张三");
+        assert_eq!(
+            m["parent_id"], "om_parent",
+            "必须透出到契约字段，否则 ABB 侧 fill_quoted 拿不到"
+        );
+    }
+
+    /// `parent_id == message_id`（自己引用自己）要当成「没有引用」。
+    #[test]
+    fn self_referencing_parent_id_is_cleared() {
+        let mut v: Value = serde_json::from_slice(&event(r#"{"text":"hi"}"#, "text")).unwrap();
+        v["event"]["message"]["parent_id"] = json!("om_1"); // 与 message_id 相同
+        let in_ = parse_event(&serde_json::to_vec(&v).unwrap()).expect("应当解出一条");
+        assert_eq!(in_.parent_id, "", "自己引用自己要清空，否则会白拉一次");
     }
 
     /// 自己的/别的应用发的消息不收（飞书会把 bot 自己的消息也推回来）。

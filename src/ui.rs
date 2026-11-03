@@ -6786,6 +6786,25 @@ pub fn run_gui() -> Result<()> {
             }
         });
     }
+    // ── 微信扫码登录：**已随内置渠道退役**（2026-11-04）──
+    //
+    // slint 侧的 `wx-login` 回调与「点下方按钮，用微信扫码登录」的文案都还在，
+    // 如果不接处理器，用户点了**什么都不发生**——那比按钮消失更糟（像是坏了）。
+    // 这里接一个说明性处理器：明确告知已迁走，并指出该去哪里登录。
+    {
+        let sw = settings.as_weak();
+        settings.on_wx_login(move |_idx| {
+            if let Some(w) = sw.upgrade() {
+                w.set_status_is_error(false);
+                w.set_status_line(
+                    "微信扫码登录已迁到 MCP 渠道：用 abb-channel-wechat 的 login / login_status \
+                     工具拿 token，填进该 bot 的 mcp_channel.env（WX_TOKEN 等）后重启。"
+                        .into(),
+                );
+            }
+        });
+    }
+
     // ── 虚拟 Bot 弹窗（#75）：交互接线 ──
     {
         let dlg = vb_dialog.as_weak();
