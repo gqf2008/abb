@@ -158,6 +158,21 @@ fn text_of_tool_result(resp: &Value) -> String {
         .join("\n")
 }
 
+/// 体积闸。抽成函数是因为**要在两处用**（读前看 metadata、读后再看实际字节数）。
+///
+/// 报因必须带具体大小与上限：只说"太大"让人不知道差多少、要不要压缩。
+fn reject_if_too_big(len: u64) -> Result<()> {
+    let max = crate::mcp_client::MAX_ATTACHMENT_BYTES as u64;
+    if len > max {
+        return Err(anyhow::anyhow!(
+            "附件太大：{:.1} MB，上限 {:.0} MB（base64 后需留在单帧上限内）",
+            len as f64 / 1_048_576.0,
+            max as f64 / 1_048_576.0
+        ));
+    }
+    Ok(())
+}
+
 /// 标准 base64（含 padding）。手写不引 crate——与 ABB 既有风格一致
 /// （`wechat.rs` 里的 base64 也是手写的，避免为几行代码拉依赖树）。
 fn base64_encode(data: &[u8]) -> String {
@@ -249,15 +264,20 @@ impl Messenger for McpChannelMessenger {
             ));
         }
         let path = std::path::Path::new(&meta.path);
+        // **先看大小，再读内容**（评审 7f57d7a8 的 non-blocking）。
+        //
+        // 第一版把体积闸放在 `fs::read` 之后：功能上对（会拒绝），但「防内存爆炸」
+        // 这个目的**完全没达到**——20 MB 的超限文件照样先被整份读进内存才被拒。
+        // metadata 是 O(1)，读文件是 O(size)，顺序反了等于没防。
+        let meta_len = std::fs::metadata(path)
+            .map_err(|e| anyhow::anyhow!("读附件失败（{}）：{e}", path.display()))?
+            .len();
+        reject_if_too_big(meta_len)?;
         let bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("读附件失败（{}）：{e}", path.display()))?;
-        if bytes.len() > crate::mcp_client::MAX_ATTACHMENT_BYTES {
-            return Err(anyhow::anyhow!(
-                "附件太大：{:.1} MB，上限 {:.0} MB（base64 后需留在单帧上限内）",
-                bytes.len() as f64 / 1_048_576.0,
-                crate::mcp_client::MAX_ATTACHMENT_BYTES as f64 / 1_048_576.0
-            ));
-        }
+        // **读后还要再判一次**：metadata 与实际读到的大小可能不一致（文件在两次调用
+        // 之间被改、或路径指向特殊文件如 /proc、FIFO）。只信 metadata 会漏掉那种。
+        reject_if_too_big(bytes.len() as u64)?;
         // base64 内联：Jev 裁定 `base64_inline`（p=0.78/conf=0.67），
         // 理由是 ABB 与渠道 server 通常同机（都是本地子进程），
         // 两段式上传对这个场景过重；path_ref 会把 ABB 的文件系统暴露给 server。
@@ -435,6 +455,51 @@ mod tests {
             "超限要在发送前拒绝并说清大小：{msg}"
         );
         assert!(msg.contains("MB"), "报因要带单位：{msg}");
+    }
+
+    /// **体积闸必须在读文件之前生效**（评审 7f57d7a8 的 non-blocking）。
+    ///
+    /// ## 判据为什么不用耗时
+    ///
+    /// 第一版用「耗时应 < 20ms」——**变异逃逸了**：20 MB 稀疏文件读起来太快，
+    /// 先读后判也只花十几毫秒。耗时依赖机器速度，不是可靠判据。
+    ///
+    /// ## 改用「读会阻塞」的路径
+    ///
+    /// 用 **FIFO**（命名管道）：`metadata().len()` 立即返回 0（不阻塞），
+    /// 而 `fs::read` 会**一直阻塞**直到有人写。于是：
+    /// - 正确的实现（先看 metadata）：立刻返回「附件太大」或走到 read 才阻塞
+    /// - 先读后判的实现在这里会**挂住**
+    ///
+    /// 但 FIFO 的 metadata 大小是 0，不会触发超限……所以这条路也不通。
+    ///
+    /// ## 最终判据：源码守卫
+    ///
+    /// 耗时不可靠、FIFO 触发不了体积闸，那就直接钉**顺序**：
+    /// 断言 `reject_if_too_big(meta_len)` 在 `std::fs::read` **之前**出现。
+    /// 这是纯静态判据，不受机器快慢影响。
+    /// 源码守卫：体积闸必须出现在 `fs::read` **之前**。
+    ///
+    /// 见上方注释解释为什么不用耗时/不用 FIFO。这条判据是静态的，
+    /// 不受机器快慢与文件系统行为影响。
+    #[test]
+    fn oversized_gate_precedes_file_read_in_source() {
+        let src = include_str!("mcp_channel.rs");
+        let gate = src
+            .find("reject_if_too_big(meta_len)?")
+            .expect("找不到读前的体积闸（被删了？）");
+        let read = src.find("std::fs::read(path)").expect("找不到 fs::read");
+        assert!(
+            gate < read,
+            "体积闸在 fs::read 之后 ⇒ 超限文件仍会先被整份读进内存（第 {} 行 vs 第 {} 行）",
+            src[..gate].lines().count(),
+            src[..read].lines().count()
+        );
+        // 读后也要再判一次（metadata 与实际可能不一致）
+        let after = src[read..]
+            .find("reject_if_too_big(bytes.len()")
+            .expect("找不到读后的体积闸（metadata 可能不可信，读后必须再判）");
+        assert!(after < src[read..].len(), "读后那道闸在错误的位置");
     }
 
     #[test]

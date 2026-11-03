@@ -216,3 +216,62 @@ fn dir_channel_bad_message_does_not_block_later_ones() {
     );
     assert_eq!(batch.messages[0].text, "坏消息之后的好消息");
 }
+
+// ── 真渠道：微信 crate（crates/abb-channel-wechat）──────────────────
+
+/// `crates/abb-channel-wechat` 的二进制路径（同一次 `cargo build` 的产物）。
+///
+/// 找不到就 `[skip]`：那个包是独立 manifest，root 的构建**不保证**它存在。
+/// 这条测试的价值是「ABB 的生产协商代码能接上真微信 server」，
+/// 没构建过就跳过，而不是失败——环境问题不该伪装成代码问题。
+fn wechat_bin() -> Option<String> {
+    let p = format!(
+        "{}/../../abb-target-wx/debug/abb-channel-wechat",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let alt = "/Volumes/DataExt/tmp/abb-target-wx/debug/abb-channel-wechat";
+    for c in [p.as_str(), alt] {
+        if std::path::Path::new(c).exists() {
+            return Some(c.to_string());
+        }
+    }
+    eprintln!(
+        "[skip] 没找到 abb-channel-wechat 构建产物 ⇒ 跳过\
+         （先跑 cargo build --manifest-path crates/abb-channel-wechat/Cargo.toml）"
+    );
+    None
+}
+
+/// **用 ABB 的生产协商代码**接真微信 server：能力归纳 + 入站选路。
+///
+/// 与 `crates/abb-channel-wechat/tests/contract.rs` 的分工：
+/// - 那边验「微信 server 自己符合契约」（它自己发的请求）
+/// - 这边验「**ABB 的协商器**能认出它」（走 `build_source` 生产路径）
+///
+/// 只过前者可能只是"server 自己自洽"；两者都过才说明这条渠道真能接。
+#[test]
+fn abb_negotiates_real_wechat_channel() {
+    let Some(bin) = wechat_bin() else {
+        return;
+    };
+    let dir = TempDir::new("wx");
+    // 不提供 WX_TOKEN：握手与能力协商不需要网络（Tools/list 是纯本地应答）。
+    let args = vec!["--dir".to_string(), dir.path().display().to_string()];
+    let mut source = crate::mcp_channel_loop::build_source_for_test("wechat", &bin, &args, &[])
+        .unwrap_or_else(|e| panic!("ABB 的协商器接不上微信 server：{e}"));
+
+    // 协商出的入站方式必须是 Poll（微信不暴露 channel:// 资源）。
+    // `fetch` 在没有 WX_TOKEN 时会失败——但那已经证明**协商成功了**，
+    // 我们要的就是"走到 fetch 这一步"而不是"fetch 成功"。
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let err = rt.block_on(async { source.fetch().await }).unwrap_err();
+    assert!(
+        !err.contains("能力") && !err.contains("既没有"),
+        "不该是协商失败（那说明契约不满足）；实际：{err}"
+    );
+    // 网络/凭证错误是预期的（没 token）。
+    assert!(
+        err.contains("poll") || err.contains("失败") || err.contains("token"),
+        "应当是取消息阶段的错误（说明协商通过了）：{err}"
+    );
+}
