@@ -440,6 +440,27 @@ fn settle_w(window: &Rc<MinimalSoftwareWindow>, w: u32, h: u32) -> Frame {
     Frame { buf, w, h }
 }
 
+/// 右侧编辑区 `[240,940) × [190,560)` 内「非背景」的像素总数。
+///
+/// 背景色就地取样（面板内一个已知空白点），逐像素比通道差之和 > 40 才算墨迹——
+/// 抗锯齿边缘的 1–2 级抖动因此不进计数（本仓假绿清单形态 6：判据的噪声底比信号还大）。
+fn right_panel_ink(f: &Frame) -> u32 {
+    let bg = f.px(260, 200);
+    let mut n = 0;
+    for y in 190..560 {
+        for x in 240..940 {
+            let p = f.px(x, y);
+            let d = p.red.abs_diff(bg.red) as u32
+                + p.green.abs_diff(bg.green) as u32
+                + p.blue.abs_diff(bg.blue) as u32;
+            if d > 40 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 // ---------------------------------------------------------------------------
 // 字形可画性探针（卡 `abb-render-font-glyph-sensitivity-20261028`）
 // ---------------------------------------------------------------------------
@@ -2312,6 +2333,113 @@ fn self_managed_hit_zones_route_press_with_pointer_coords() {
 /// ⇒ 红（(973,673) 不再落块内）。接线类四处打在源码守卫上（`resize_hit_areas_follow_platform_rule`
 /// / `settings_window_min_constants_match_slint`：热区开关回「macOS 不画」、钩子删 `CursorMoved`、
 /// 下界改用对话窗的、`SETTINGS_MIN_W` 漂 10px ⇒ 各自那条红）。
+/// **设置页按 kind 显示的字段块真的画出来了**（像素级）。
+///
+/// ## 为什么不用「比两次渲染的差异」（卡 `abb-settings-render-harness-limit-20261103`）
+///
+/// 直觉写法是「建两个 `SettingsWindow` 比像素差」——**实测不行**：
+/// Slint 的 `set_platform` 每线程只能成功一次，第二个窗口复用第一个的平台与窗口，
+/// 两次「渲染」拍的是同一张图 ⇒ **任何变异都不影响差异量**（实测把三个 mcp 条件块
+/// 改成永不成立，差异仍是 248，一模一样）。
+///
+/// 换成一个窗口切 `selected` 后仍然不行：mcp 8 行 vs dingtalk 12 行，**整页会重排**，
+/// 任何固定坐标带都测不准（这也是本卡先前三次尝试失败的根因）。
+///
+/// ## 最终判据：右面板的「墨迹总量」
+///
+/// 不依赖任何固定坐标带，因此**不受重排影响**。实测三组数（2026-11-04）：
+///
+/// | 状态 | 右面板墨迹 |
+/// |---|---|
+/// | 选中 mcp（三个字段块正常渲染） | **4856** |
+/// | 选中 mcp，但把 `.slint` 里三处 `kind == "mcp"` 改成永不成立 | **3723** |
+/// | 选中 dingtalk | 8981 |
+///
+/// 判据取 4300：离正常值 +556、离变异值 -577，两边都有余量。
+/// 这个数看着像魔数，但它是**唯一被变异验证过的**量——换成「比两次差异」那种
+/// 看起来更聪明的写法，实测会在变异下完全失效。
+///
+/// ## 反向对照
+///
+/// 同时断言 dingtalk 的墨迹比 mcp 多 2000 以上。两个 kind 的字段集本来就不同
+/// （mcp 8 行、dingtalk 12 行），若哪天两条路都渲染成空页，主判据和这条会一起红。
+#[test]
+fn settings_page_renders_the_kind_specific_field_blocks() {
+    const SW: u32 = 980;
+    const SH: u32 = 680;
+    let windows = WINDOWS.with(|w| w.clone());
+    let _ = slint::platform::set_platform(Box::new(HeadlessPlatform {
+        windows: windows.clone(),
+    }));
+    let ui = SettingsWindow::new().expect("SettingsWindow 建窗失败");
+
+    // **每个输入框都必须是 `for opt[i] in root.*-editor-options` 里的一员才渲染**。
+    // 不灌这些 model，右侧只剩文字标签、输入框全空（出图一看就发现）。
+    let one = |v: &str| {
+        slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![EditorRow {
+            value: v.into(),
+        }])))
+    };
+    ui.set_name_editor_options(one("渠道 bot"));
+    ui.set_kind_editor_options(one("mcp"));
+    ui.set_provider_editor_options(one(""));
+    ui.set_owner_editor_options(one("ou_x"));
+    ui.set_app_id_editor_options(one("cli_x"));
+    ui.set_app_secret_editor_options(one("sec"));
+    ui.set_ding_robot_code_editor_options(one(""));
+    ui.set_ding_owner_ids_editor_options(one("staff_x"));
+    ui.set_mcp_command_editor_options(one("/usr/local/bin/abb-channel-mcp"));
+    ui.set_mcp_args_editor_options(one("--dir /tmp/x"));
+    ui.set_mcp_env_editor_options(one("TOKEN=abc123"));
+
+    let row = |kind: &str, name: &str| BotRow {
+        name: name.into(),
+        kind: kind.into(),
+        enabled: true,
+        provider: "".into(),
+        owner_open_id: "ou_x".into(),
+        wx_owner_configured: true,
+        owners: slint::ModelRc::from(Rc::new(slint::VecModel::from(Vec::<OwnerRow>::new()))),
+        app_id: "cli_x".into(),
+        app_secret: "sec".into(),
+        bot_name: "".into(),
+        bot_open_id: "".into(),
+        ding_user_id: "".into(),
+        ding_owner_ids: "staff_x".into(),
+        ding_robot_code: "".into(),
+        tidy_enabled: false,
+        mcp_command: "/usr/local/bin/abb-channel-mcp".into(),
+        mcp_args: "--dir /tmp/x".into(),
+        mcp_env: "TOKEN=abc123".into(),
+    };
+    ui.set_bots(slint::ModelRc::from(Rc::new(slint::VecModel::from(vec![
+        row("mcp", "渠道 bot"),
+        row("dingtalk", "钉钉 bot"),
+    ]))));
+    // **必须切到第 1 页（机器人配置）**：默认第 0 页是首页，不含 bot 编辑区 ⇒
+    // 切 `selected` 不会有任何像素变化（第一版就是这样差异恒为 0）。
+    ui.set_current_page(1);
+    ui.show().expect("设置窗 show 失败");
+    ui.window().set_size(slint::PhysicalSize::new(SW, SH));
+    let win = windows.borrow().last().expect("平台没发窗口").clone();
+
+    ui.set_selected(0);
+    let mcp = right_panel_ink(&settle_w(&win, SW, SH));
+    ui.set_selected(1);
+    let ding = right_panel_ink(&settle_w(&win, SW, SH));
+
+    assert!(
+        mcp >= 4300,
+        "选中 mcp 时右面板墨迹只有 {mcp}（正常 4856、字段块不渲染时 3723）\
+         ⇒ 按 kind 显示的三个字段块（可执行文件/参数/环境变量）没有真的画出来"
+    );
+    assert!(
+        ding > mcp + 2000,
+        "dingtalk 墨迹 {ding} 未显著多于 mcp {mcp} ⇒ 两条分支渲染结果雷同，\
+         可能都渲染成了空页"
+    );
+}
+
 #[test]
 fn settings_self_managed_hit_zones_route_press_with_pointer_coords() {
     const SW: u32 = 980;
