@@ -1746,6 +1746,40 @@ mod tests {
         );
     }
 
+    /// 提示词里对**界面**的断言必须与 `ui/app.slint` 实际一致。
+    ///
+    /// 2026-11-04 实况：这一节原本写着「ABB … 也不在界面里配渠道」，而设置页明明
+    /// 有「可执行文件 / 参数 / 环境变量」三个框（`ui/app.slint:2086-2112`）。
+    /// 助手会照着这句回答「界面里配不了，只能手改 JSON」——用户照着找，找不到。
+    ///
+    /// 这与 `check-prose-claims.sh` 第 6 条（「只有…实现」必须机器验）同型：
+    /// **否定/全称断言一个反例就假**，而这句的假只体现在另一个文件里，
+    /// 单看提示词读不出来。所以把两个文件放进同一条断言。
+    ///
+    /// 双向：真按 S3 把界面三格删了 ⇒ 这句断言成真，本测试绿（不是死钉现状）。
+    #[test]
+    fn prompt_claims_about_the_ui_match_app_slint() {
+        let prompt = include_str!("runtime/base_prompt.md");
+        let slint = include_str!("../ui/app.slint");
+        // 界面三格的标签（渠道通用配置 = command/args/env 三个输入框）。
+        const UI_CHANNEL_FIELDS: [&str; 3] = ["可执行文件", "参数", "环境变量"];
+        let ui_has_fields = UI_CHANNEL_FIELDS.iter().all(|l| slint.contains(l));
+        // 声称「界面里没有渠道配置」的各种写法。
+        const DENYING_CLAIMS: [&str; 3] =
+            ["不在界面里配渠道", "界面里配不了渠道", "界面没有渠道配置"];
+        for claim in DENYING_CLAIMS {
+            if !prompt.contains(claim) {
+                continue;
+            }
+            assert!(
+                !ui_has_fields,
+                "提示词断言「{claim}」，但 ui/app.slint 里仍有渠道三格 \
+                 （{UI_CHANNEL_FIELDS:?}）⇒ 助手会把用户指错方向。\
+                 要么改提示词承认界面能配，要么真把三个框删掉。"
+            );
+        }
+    }
+
     #[test]
     fn sandbox_mode_mode_serde_roundtrip_and_defaults() {
         // kebab-case 反序列化 + full-access 默认（旧 config 无字段兼容）+ Auto legacy 可读
