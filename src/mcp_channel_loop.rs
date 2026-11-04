@@ -105,6 +105,41 @@ pub struct BridgeSink {
 }
 
 impl BridgeSink {
+    /// 尝试把这条消息当授权码消费。返回 `true` = 已处理（调用方必须**就此返回**）。
+    ///
+    /// 三步：查展示名（best-effort）→ 消费 → 按结果回执。
+    /// 只有 `NotFound`（不匹配任何待消费码）才算「不是授权码」，其余两种都要回话。
+    async fn try_consume_owner_code(&self, ev: &mut crate::bridge::Ev) -> bool {
+        let text = ev.text.trim().to_string();
+        if text.is_empty() {
+            return false;
+        }
+        use crate::config::OwnerCodeResult as R;
+        // 查名放消费之前：失败不阻塞授权（名字只是展示用，落了 id 也能认）。
+        let name = self.bridge.msgr.user_display_name(&ev.sender_id).await;
+        let r = crate::config::Config::consume_owner_code(
+            &self.bridge.bot.key(),
+            &text,
+            &ev.sender_id,
+            name.as_deref().unwrap_or(""),
+        );
+        let reply = match r {
+            R::Admitted => "✅ 授权成功，你现在可以在这个 bot 里对话了。",
+            R::Expired => "❌ 授权码已过期，请联系管理员重新生成。",
+            // 不匹配任何待消费码 ⇒ 当普通消息，不打扰。
+            R::NotFound => return false,
+        };
+        if let Err(e) = self.bridge.msgr.send_text(&ev.chat_id, reply).await {
+            crate::log!("[mcp] 授权码回执发送失败 chat={}：{e:#}", ev.chat_id);
+        }
+        crate::log!(
+            "[mcp] 授权码已处理（bot={} sender={} result={r:?}）",
+            self.bridge.bot.key(),
+            ev.sender_id
+        );
+        true
+    }
+
     pub fn new(bridge: Arc<Bridge>) -> Self {
         Self { bridge }
     }
@@ -154,6 +189,17 @@ impl InboundSink for BridgeSink {
         // 放在 `handle` 之前、本条附件下载之后：`fill_quoted` 内部也下载引用附件，
         // 它用 `100 + i` 的 seq 段，与本条消息的 `0..n` 不冲突。
         self.bridge.fill_quoted(&mut ev, &msg.parent_id).await;
+
+        // 授权码消费（**必须是 `handle` 之前**）：命中就回执并吞掉这条消息，
+        // 不让它进 agent——一个授权码不该触发一轮对话。
+        //
+        // 与内置渠道的差别：不判 `is_p2p`。MCP 路径的 `chat_type` 恒为 `"mcp"`，
+        // 而渠道 server 已经把「没 @ bot 的群消息」过滤掉了；且
+        // `consume_owner_code` 对**不匹配的文本返回 `NotFound`**（不是报错），
+        // 所以「不判 p2p」不会让群里的随便一句话被当成授权码。
+        if self.try_consume_owner_code(&mut ev).await {
+            return Ok(());
+        }
 
         // 未读提醒（GUI 小红点 + 托盘通知）。
         //

@@ -2541,6 +2541,49 @@ mod tests {
         assert_eq!(bot.pending_codes.len(), 1);
     }
 
+    /// **不判「是不是私聊」也安全**：群里的任意普通消息必须 `NotFound`。
+    ///
+    /// 2026-11-04 MCP 路径接回授权码时，去掉了内置渠道时代的 `is_p2p` 判断
+    /// （MCP 的 `chat_type` 恒为 `"mcp"`，那个判据不成立）。去掉它的**前提**是
+    /// 「不匹配的文本一律 NotFound」——否则群里随便一句话都可能被当授权码消费掉。
+    ///
+    /// 这条把那个前提钉死：一整句中文、一串像码的字母、空串、纯空白，全部 NotFound，
+    /// 且**不删任何待消费码**。
+    #[test]
+    fn ordinary_group_text_is_never_mistaken_for_owner_code() {
+        let now = crate::chrono_lite::unix_secs();
+        let mut bot = bot_with_code("K3M8XQ2P", now + 1800);
+        // 先跑所有「不该命中」的形态——它们必须全部 NotFound 且不消费。
+        for text in [
+            "大家好，今晚的会改到八点",
+            "K3M8XQ2", // 少一位
+            "",
+            "   ",
+            "code=K3M8XQ2P", // 带前缀不算
+            "K3M8XQ2P 谢谢", // 带后缀不算
+        ] {
+            let r = consume_owner_code_on_bot(&mut bot, text, "ou_g", "", now);
+            assert_eq!(r, OwnerCodeResult::NotFound, "`{text}` 不该被当成授权码");
+            assert_eq!(bot.pending_codes.len(), 1, "`{text}` 不该消费掉待用码");
+        }
+        // **大小写不敏感是刻意的**（`eq_ignore_ascii_case`）：用户手抄码时大小写
+        // 容易错，而码本身是 8 位随机字符、不是口令，放宽大小写不降低多少强度。
+        // 前后空白也 trim。这两条一起测，免得有人「顺手加固」把它们改严——
+        // 那会让真实用户抄错一个字母就永久打不开。
+        for (i, text) in [" k3m8xq2p ", "K3M8XQ2P"].into_iter().enumerate() {
+            if i == 1 {
+                // 第一条已消费，重新造一个
+                bot = bot_with_code("K3M8XQ2P", now + 1800);
+            }
+            let r = consume_owner_code_on_bot(&mut bot, text, "ou_g", "", now);
+            assert_eq!(
+                r,
+                OwnerCodeResult::Admitted,
+                "`{text}` 应当命中（trim + 不区分大小写）"
+            );
+        }
+    }
+
     #[test]
     fn owner_code_admin_role_adds_owner() {
         // 管理员码（role=owner）→ 发送者成为 owner（管理员），不进授权者列表
