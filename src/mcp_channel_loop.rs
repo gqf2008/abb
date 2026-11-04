@@ -104,7 +104,48 @@ pub struct BridgeSink {
     bridge: Arc<Bridge>,
 }
 
+/// 准入判定的**纯函数**形态（`BridgeSink::admit` 只是从 bot 配置取值后转发）。
+///
+/// 抽出来是为了让判据顺序能被单测钉死——顺序错了不会报错，只会让
+/// 「新建 bot 收不到消息」或「陌生人能白嫖 token」悄悄发生。
+///
+/// 三条判据（**前两条是并列的 `return true`，彼此顺序无关**——实测互换算过，
+/// 行为等价。真正敏感的是它们必须都在第三条之前）：
+///
+/// 1. **空名单 ⇒ 放行**：那是 fail-closed 的「全部受限但都能对话」档，
+///    不是「全部丢弃」——否则新建 bot 没填 owner 就完全收不到消息。
+/// 2. `allow_ungranted` ⇒ 放行：用户显式要求放开。
+/// 3. 名单命中 ⇒ 放行；否则丢弃。匹配**逐字节精确**（与 `to_ev` 判 owner 同口径），
+///    且空 `sender_id` 永不算命中（名单里写了空串也不行）——否则一个「忘了带
+///    sender_id」的渠道会静默全开。
+///
+/// 「顺序无关」这句是自己实测过的：把 1、2 对调后四条测试全绿——那是对的，
+/// 因为它们都返回 `true`。写注释时差点把一个**等价的**顺序约束写成硬约束，
+/// 那会让后来的人以为改了会坏。
+fn admit_by(owner_ids: &[String], allow_ungranted: bool, sender_id: &str) -> bool {
+    if owner_ids.is_empty() {
+        return true;
+    }
+    if allow_ungranted {
+        return true;
+    }
+    !sender_id.is_empty() && owner_ids.iter().any(|o| o == sender_id)
+}
+
 impl BridgeSink {
+    /// 准入判定：这条消息该不该继续处理。
+    ///
+    /// 与 `config::Config::access_allows` 同语义，但**不看平台 kind**
+    /// （MCP 渠道没有 kind 概念，名单来自 `mcp_channel.owner_ids`）。
+    fn admit(&self, ev: &crate::bridge::Ev) -> bool {
+        match self.bridge.bot.mcp_channel.as_ref() {
+            // 没配渠道的 bot 根本不会走到这里（`messenger::build` 已挡），
+            // 保守放行让后续逻辑报出真正的错误。
+            None => true,
+            Some(ch) => admit_by(&ch.owner_ids, ch.allow_ungranted, &ev.sender_id),
+        }
+    }
+
     /// 尝试把这条消息当授权码消费。返回 `true` = 已处理（调用方必须**就此返回**）。
     ///
     /// 三步：查展示名（best-effort）→ 消费 → 按结果回执。
@@ -175,6 +216,27 @@ impl InboundSink for BridgeSink {
                 return Err(e);
             }
         };
+        // 准入闸（**与内置渠道退役前一致**）：不在 `owner_ids` 里的发送者，
+        // 其消息直接丢弃、不回复。
+        //
+        // 退役前 `access_allows` 就是 `!owner_ids.is_empty() && is_owner_allowed(...)`。
+        // MCP 路径保留同一语义，但可以用 `allow_ungranted` 显式放开
+        // （放开后是「受限会话」——不能执行命令、不能读写文件，但能对话）。
+        //
+        // 三条判据的顺序不能换：
+        // - **空名单先放行**：那是 fail-closed 的「全部受限但都能对话」档，
+        //   不是「全部丢弃」——否则新建 bot 没填 owner 就完全收不到消息；
+        // - `allow_ungranted` 次之：用户显式要求放开；
+        // - 最后才按名单丢。
+        if !self.admit(&ev) {
+            crate::log!(
+                "[mcp] 丢弃未授权消息 bot={} sender={}（不在 owner_ids 且未开 allow_ungranted）",
+                self.bridge.bot.key(),
+                ev.sender_id
+            );
+            return Ok(());
+        }
+
         // 附件下载：**在这里做，不在 `to_ev` 里**。
         //
         // `to_ev` 是纯函数（无 IO、可单测），而下载要等渠道 server 回包。
@@ -557,6 +619,57 @@ mod tests {
     use super::*;
     use crate::mcp_inbound_loop::TickReport;
     use std::sync::Mutex;
+
+    // ── 准入闸：不在 owner 名单的消息该不该丢 ─────────────────────
+    //
+    // 这一批测 `BridgeSink::admit` 的**四条判据及其顺序**。顺序错了不会报错，
+    // 只会让「新建 bot 收不到消息」或「陌生人能白嫖 token」悄悄发生。
+
+    /// 判定入口：直接调纯函数（不建 Bridge——它读的就是那两个字段）。
+    fn admit_with(owner_ids: &[&str], allow_ungranted: bool, sender: &str) -> bool {
+        let ids: Vec<String> = owner_ids.iter().map(|s| s.to_string()).collect();
+        admit_by(&ids, allow_ungranted, sender)
+    }
+
+    /// **空名单 ⇒ 放行**（fail-closed 的「全部受限但都能对话」档）。
+    ///
+    /// 这条最容易写反：直觉会认为「没有名单 = 谁都不许用」，但那会让**新建 bot
+    /// 还没填 owner 时完全收不到消息**，用户只会看到「机器人坏了」。
+    #[test]
+    fn empty_owner_list_admits_everyone() {
+        assert!(admit_with(&[], false, "ou_stranger"), "空名单必须放行");
+        assert!(admit_with(&[], false, ""), "空名单下空 sender 也放行");
+    }
+
+    /// 名单命中 ⇒ 放行；未命中 ⇒ 丢弃。
+    #[test]
+    fn listed_sender_admits_others_drop() {
+        assert!(admit_with(&["ou_boss"], false, "ou_boss"), "名单内必须放行");
+        assert!(
+            !admit_with(&["ou_boss"], false, "ou_other"),
+            "名单外必须丢弃"
+        );
+    }
+
+    /// `allow_ungranted: true` ⇒ 名单外也放行（用户显式要求）。
+    #[test]
+    fn allow_ungranted_opens_the_gate() {
+        assert!(
+            admit_with(&["ou_boss"], true, "ou_other"),
+            "显式放开后名单外也要放行"
+        );
+    }
+
+    /// **空 `sender_id` 永不算命中**，哪怕名单里写了空串。
+    ///
+    /// 否则一个「忘了带 sender_id」的渠道会静默全开。
+    #[test]
+    fn empty_sender_is_never_admitted_by_list() {
+        assert!(
+            !admit_with(&["ou_boss", ""], false, ""),
+            "空 sender 不能因为名单里有空串就被放行"
+        );
+    }
 
     // ── 附件下载接线：不下载 = 用户发图 agent 读不到内容 ─────────────
     //

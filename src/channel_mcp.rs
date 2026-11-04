@@ -140,6 +140,19 @@ pub struct McpServerConfig {
     /// 大小写归一而把不相干的 id 认成 owner。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owner_ids: Vec<String>,
+    /// 不在 `owner_ids` 里的发送者，其消息要不要**直接丢弃**（默认 `false` = 丢弃）。
+    ///
+    /// 默认值与内置渠道退役前的行为一致：`access_allows` 就是
+    /// `!owner_ids.is_empty() && is_owner_allowed(...)`，不在名单的人**静默丢弃、不回复**。
+    ///
+    /// 为什么用「默认丢弃」而不是「默认应答」：静默扩大用户现有 bot 的暴露面，
+    /// 比多一个字段危险得多。要放开的人显式写 `allow_ungranted: true`。
+    ///
+    /// **注意 `owner_ids` 为空时本字段不起作用**：空名单是 fail-closed 的
+    /// 「全部受限但都能对话」档（见 `owner_ids` 的文档），不是「全部丢弃」——
+    /// 否则新建 bot 还没填 owner 就完全收不到消息，用户会以为坏了。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_ungranted: bool,
 }
 
 /// 下发给 MCP 子进程的环境变量（与 `runtime/acp.rs::EnvVar` 逐字对应）。
@@ -274,6 +287,7 @@ mod tests {
             args: Vec::new(),
             env: Vec::new(),
             owner_ids: Vec::new(),
+            allow_ungranted: false,
         };
         assert!(ok.is_usable());
         assert!(!McpServerConfig {

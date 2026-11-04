@@ -80,6 +80,7 @@ fn mcp_bot(dir: &std::path::Path) -> crate::config::BotConfig {
             ],
             env: vec![],
             owner_ids: Vec::new(),
+            allow_ungranted: false,
         }),
         ..Default::default()
     }

@@ -2286,6 +2286,9 @@ fn ensure_mcp_channel(bot: &mut BotConfig) -> &mut crate::channel_mcp::McpServer
             // owner 名单**不由本界面维护**（与 env 里的 token 同性质的高权字段，
             // 手改 config.json）；在这里保留已存在的值不被回写清空。
             owner_ids: Vec::new(),
+            // 新建渠道默认「不在 owner 名单就丢弃」（与退役前一致）；
+            // 要放开的人手改 config.json 加 `"allow_ungranted": true`。
+            allow_ungranted: false,
         })
 }
 
@@ -11818,6 +11821,7 @@ mod tests {
                     args: vec!["--root".into()],
                     env: Vec::new(),
                     owner_ids: Vec::new(),
+                    allow_ungranted: false,
                 })
             }),
         ];
@@ -12378,6 +12382,7 @@ mod tests {
                 },
             ],
             owner_ids: vec!["ou_owner".into()],
+            allow_ungranted: false,
         }
     }
 
