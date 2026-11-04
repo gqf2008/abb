@@ -461,6 +461,15 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "delete_chat",
+            "description": "解散群（**不可恢复**；调用方须先做强确认）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"chat_id": {"type": "string"}},
+                "required": ["chat_id"]
+            }
+        },
+        {
             "name": "user_display_name",
             "description": "按 open_id 反查用户显示名（需通讯录 scope）",
             "inputSchema": {
@@ -888,6 +897,15 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 .map_err(|e| format!("改群资料失败：{e:#}"))?;
             Ok(json!({"content": [{"type": "text", "text": "{}"}]}))
         }
+        "delete_chat" => {
+            let cid = a.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+            if cid.is_empty() {
+                return Err("delete_chat 需要 chat_id".to_string());
+            }
+            rt().block_on(ch.client.delete_chat(cid))
+                .map_err(|e| format!("解散群失败：{e:#}"))?;
+            Ok(json!({"content": [{"type": "text", "text": "{}"}]}))
+        }
         "user_display_name" => {
             let user_id = need(&a, "user_display_name", "user_id")?;
             let name = rt().block_on(ch.client.user_name(user_id)).ok_or_else(|| {
@@ -1051,6 +1069,7 @@ mod tests {
                 "download_attachment",
                 "create_chat",
                 "update_chat",
+                "delete_chat",
                 "user_display_name",
                 "typing",
                 "del_typing",

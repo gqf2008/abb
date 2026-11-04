@@ -501,6 +501,26 @@ impl Messenger for McpChannelMessenger {
         Ok(())
     }
 
+    /// A：解散群（不可恢复）。缺它 ⇒ 只能到平台客户端手动解散。
+    async fn delete_chat(&self, chat_id: &str) -> Result<(), String> {
+        let v = self
+            .call_optional(
+                crate::mcp_bus::TOOL_DELETE_CHAT,
+                json!({ "chat_id": chat_id }),
+            )
+            .ok_or_else(|| {
+                format!(
+                    "渠道 `{}` 的 MCP 服务未声明 `{}` ⇒ 只能到平台客户端手动解散群",
+                    self.name,
+                    crate::mcp_bus::TOOL_DELETE_CHAT
+                )
+            })?;
+        if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
+            return Err(format!("渠道 `{}` 解散群失败：{e}", self.name));
+        }
+        Ok(())
+    }
+
     /// A：反查展示名。缺它 ⇒ 授权记录里只有 id。
     async fn user_display_name(&self, user_id: &str) -> Option<String> {
         self.call_optional(

@@ -962,7 +962,6 @@ impl FeishuClient {
 
     /// 解散群（虚拟 Bot 解散：DELETE /im/v1/chats/:chat_id，不可恢复——GUI 侧强确认）。
     /// 需要应用开通 im:chat 或 im:chat:delete 权限（99991672 权限拒绝见 scope_hint）。
-    #[allow(dead_code)] // 虚拟 Bot 解散：不可恢复动作，只应由 GUI 强确认触发
     pub async fn delete_chat(&self, chat_id: &str) -> Result<()> {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self

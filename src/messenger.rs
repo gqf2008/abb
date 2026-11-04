@@ -88,6 +88,16 @@ pub trait Messenger: Send + Sync {
             .to_string())
     }
 
+    /// 解散群（不可恢复）。契约 §3.4 的可选能力。
+    ///
+    /// 默认 `Err`：没实现的渠道必须显式说做不到。
+    /// **强确认不该在这里做**——那是调用方（GUI）的职责，渠道只执行。
+    async fn delete_chat(&self, _chat_id: &str) -> Result<(), String> {
+        Err("当前渠道不支持解散群（MCP 服务未声明 `delete_chat`）。\
+             请到平台客户端手动解散。"
+            .to_string())
+    }
+
     /// 处理中表情（可选）。返回 reaction_id 供 done 时删除。默认 None。
     async fn typing(&self, _message_id: &str) -> Option<String> {
         None

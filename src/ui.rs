@@ -107,6 +107,8 @@ enum UiCmd {
     },
     /// 解散群（红色强确认后）：调平台删除接口 + 移除登记。仅飞书有解散 API。
     VirtualBotDisband {
+        /// 完整 bot 配置（走 `Messenger::delete_chat`，渠道无关）。装 `Box` 压小枚举体。
+        bot: Box<crate::config::BotConfig>,
         #[allow(dead_code)]
         bot_key: String,
         #[allow(dead_code)]
@@ -260,9 +262,17 @@ enum VbAction {
     Deregister { bot_key: String, chat_id: String },
     /// 解散群：调平台删除接口（仅飞书有）+ 移除登记，不可恢复。
     Disband {
+        /// 完整 bot 配置（解散走 `Messenger::delete_chat`，渠道无关）。
+        ///
+        /// `Box` 只为压小枚举体：`BotConfig` 比同枚举的 `Deregister` 大一个数量级，
+        /// clippy 的 `large_enum_variant` 会拦。
+        bot: Box<crate::config::BotConfig>,
         bot_key: String,
+        #[allow(dead_code)]
         kind: String,
+        #[allow(dead_code)]
         app_id: String,
+        #[allow(dead_code)]
         app_secret: String,
         chat_id: String,
         /// owner open_id（权限不足时发授权指引给 owner；None = 未配置则不提示）。
@@ -5172,6 +5182,7 @@ pub fn run_gui() -> Result<()> {
                         UiCmd::VirtualBotDeregister { bot_key, chat_id }
                     }
                     VbAction::Disband {
+                        bot,
                         bot_key,
                         kind,
                         app_id,
@@ -5179,6 +5190,7 @@ pub fn run_gui() -> Result<()> {
                         chat_id,
                         owner,
                     } => UiCmd::VirtualBotDisband {
+                        bot,
                         bot_key,
                         kind,
                         app_id,
@@ -5830,6 +5842,7 @@ pub fn run_gui() -> Result<()> {
                         });
                     }
                     UiCmd::VirtualBotDisband {
+                        bot,
                         bot_key: _,
                         kind: _,
                         app_id: _,
@@ -5837,17 +5850,19 @@ pub fn run_gui() -> Result<()> {
                         chat_id,
                         owner: _,
                     } => {
-                        // **显式退役**（2026-11-04）：解散群要平台的 `delete_chat` API，
-                        // 契约里没有对应工具，内置渠道已删 ⇒ 没有实现可调。
+                        // 走**渠道无关**的 `Messenger::delete_chat`（契约 §3.4）。
+                        // 强确认在 GUI 侧已做过（红色确认弹窗），这里只执行。
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
+                            let r = match crate::messenger::build(&bot) {
+                                Err(e) => Err(format!("{e:#}")),
+                                Ok(msgr) => msgr
+                                    .delete_chat(&chat_id)
+                                    .await
+                                    .map(|()| "已解散".to_string()),
+                            };
                             let _ = vb_tx.send(VirtualBotEvt::Done {
-                                results: vec![(
-                                    chat_id.clone(),
-                                    Err("解散群能力随内置渠道退役（MCP 契约无此工具）；\
-                                         请到平台客户端手动解散，再点「注销登记」"
-                                        .to_string()),
-                                )],
+                                results: vec![(chat_id, r)],
                             });
                         });
                     }
@@ -7552,6 +7567,7 @@ pub fn run_gui() -> Result<()> {
             let regs = VirtualBotStore::new().load_for(&bot.key());
             let Some(reg) = regs.get(row as usize) else { return };
             *action.borrow_mut() = Some(VbAction::Disband {
+                bot: Box::new(bot.clone()),
                 bot_key: bot.key(),
                 kind: bot.kind.clone(),
                 app_id: bot.app_id.clone(),

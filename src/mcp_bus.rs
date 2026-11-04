@@ -68,6 +68,12 @@ pub const TOOL_DOWNLOAD_ATTACHMENT: &str = "download_attachment";
 /// 为什么它也是 A 档：虚拟 Bot 的完整生命周期里，**能建不能改**等于「建错了只能重建」——
 /// 而重建会丢话术历史与成员。用户能直接感知。
 pub const TOOL_UPDATE_CHAT: &str = "update_chat";
+/// A：解散群（不可恢复——调用方必须自己做强确认）。
+///
+/// 与 `update_chat` 一对：能建、能改、能删才构成完整生命周期。
+/// **ABB 侧不代替用户判断**：GUI 的红色强确认在 ABB 那一层做，
+/// 渠道只负责执行。
+pub const TOOL_DELETE_CHAT: &str = "delete_chat";
 /// A：创建群会话（虚拟 Bot 一键建群用）。
 ///
 /// 缺它 ⇒ 建群只能手动，聊天侧回落登记制指引。
