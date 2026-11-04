@@ -107,6 +107,7 @@ for s in ok_basic ok_comment_exempt ok_comment_exempt_blocking ok_no_reviews ok_
          ok_unknown_decision_historical ok_same_reviewer_multi_round ok_unverified_comment \
          ok_historical_contract_mismatch ok_merged_with_independent_waiver ok_merged_before_no_review_ts \
          ok_merged_historical_review_by_merger ok_merged_multi_merge_not_by_reviewer \
+         ok_three_rounds_converging \
          ok_merged_reviewed_before_merge ok_merged_blocking_then_fixed \
          ok_merged_review_on_ancestor_chain ok_merged_two_merges_each_reviewed; do
   expect_rc "合规：$s" 0 "$check" --json "$samples/$s.json" --contract-ts "$ts" --no-review-ts "$ts"
@@ -115,6 +116,7 @@ done
 # ── 违规样本（rc=1）─────────────────────────────────────────────────────────
 for s in bad_missing_after_threshold bad_missing_at_threshold bad_label_mismatch \
          bad_clean_but_request_changes bad_blocking_but_approve bad_three_rounds \
+         bad_three_rounds_same_file bad_three_rounds_no_path \
          bad_merge_unresolved bad_premerge_unresolved bad_unknown_decision_after_threshold \
          bad_self_review bad_final_review_by_merger bad_unverified_patch \
          bad_decoy_patch_after_self_review bad_review_array_order_bypass \

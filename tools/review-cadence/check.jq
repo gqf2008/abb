@@ -100,6 +100,44 @@ def ancestor_oids($by_oid; $oid):
       | .cur = (($by_oid[.cur].parent) // ""))
   | (.seen | keys);
 
+# 从一条 review 的 note 里提取「位置指纹」（文件路径，**去掉行号**）。
+#
+# 用途：判据 (b) 要区分两种 blocking 轮次——
+#   甲、同一个问题被反复提（代码真的没收敛）⇒ 该拦；
+#   乙、每轮都在收敛，只是中途又推了新提交引入**别的**问题 ⇒ 不该按「拉锯」处理。
+#
+# 判据是「两轮 blocking 是否指向同一批文件」：位置有交集 ⇒ 同一问题链继续；
+# 无交集 ⇒ 新问题链重新计数。
+#
+# 为什么去掉行号：同一处代码改动后行号必然漂移（`src/x.rs:120` → `src/x.rs:135`），
+# 带行号比会让「同一个文件里的同一个问题」永远算不重叠 ⇒ 判据形同失效。
+def position_fingerprints:
+  (. // "")
+  | [ scan("[A-Za-z0-9_./-]+\\.(?:rs|sh|py|slint|jq|toml|md|json)") ]
+  | unique;
+
+# 判据 (b) 的**未收敛链长**：不是数「总共几轮 blocking」，而是数「连续几轮指向同一处」。
+#
+# 输入：blocking 轮次的数组（按 ts 升序，每项带 `pos` = position_fingerprints）。
+# 输出：最长的那条「同一问题链」的长度。
+#
+# **解析不出位置时按重叠处理（fail-closed）**：真实账本里相当一部分 blocking 讲的是
+# 流程/审计问题（例如「作者与评审未真正分离」），note 里没有任何文件路径。
+# 那类问题往往**更严重**，绝不能因为「找不到路径」就被算成新问题、把轮数清零。
+def worst_convergence_chain:
+  reduce .[] as $b ({seen: [], chain: 0, max: 0};
+    ( ($b.pos | length) == 0
+      or ([ .seen[] as $s | $b.pos[] | select(. == $s) ] | length) > 0
+    ) as $same_problem
+    | if $same_problem
+      then .chain += 1
+      else .chain = 1
+      end
+    | .seen += $b.pos
+    | .max = ([.max, .chain] | max)
+  )
+  | .max;
+
 def label_counts:
   (. // "")
   | split("\n")
@@ -134,12 +172,21 @@ def label_counts:
         verified: .verified,
         decision: (.e.body.decision // null),
         contract: ((.e.body.note // "") | contract_of),
-        labels: ((.e.body.note // "") | label_counts) } ] as $reviews
+        labels: ((.e.body.note // "") | label_counts),
+        # 判据 (b) 要按「两轮 blocking 是否指向同一处文件」判断是否收敛，
+        # 所以要把 note 原文留在这里（`contract_of`/`label_counts` 都是摘要，取不出路径）。
+        note_text: (.e.body.note // "") } ] as $reviews
 # 结构性判据（§0b/§4）需要看“谁签的”：patch 作者、merge 执行者、以及每条 review 的 actor。
 | [ $items[] | select(.e.kind == "patch") | {oid, actor: (.e.actor // null), ts: (.e.ts // 0)} ] as $patches
 | [ $items[] | select(.e.kind == "merge_result" and (.e.body.merged == true)) | {oid, actor: (.e.actor // null), ts: (.e.ts // 0), idx} ] as $merge_items
 | [ $items[] | select(.e.kind == "merge_result" and (.e.body.merged == true)) | .idx ] as $merges
-| ($reviews | map(select(.decision != "comment" and .contract != null and .contract.blocking > 0)) | length) as $blocking_rounds
+# 判据 (b) 的输入：blocking 轮次 + 每轮的位置指纹（按 ts 升序）。
+# **不是简单计数**（卡 abb-cadence-b-rounds-semantics-20261104）：旧写法只数条数，
+# 把「同一个问题被反复提」（该拦）和「每轮收敛但中途引入新问题」（不该拦）算成一样。
+| [ $reviews[] | select(.decision != "comment" and .contract != null and .contract.blocking > 0)
+    | {oid, ts, pos: ((.note_text // "") | position_fingerprints)} ] as $blocking_items
+| ($blocking_items | length) as $blocking_rounds
+| ($blocking_items | worst_convergence_chain) as $worst_chain
 # 历史自审（告警，不阻塞）：逐条比对该 review 之前的最新 patch。只用于 summary 上报，
 # 让「曾经自审过、后来被纠正」这件事仍可审计 —— 但不进 violations，否则自我纠正的
 # 真实卡会被永久锁死（见 (d) 的注释）。
@@ -199,8 +246,14 @@ def label_counts:
         | ( $judged | final_judged )[] | contract_problems($contract_ts) ),
 
       # (b) blocking 轮数 ≤ 2
-      ( if ($blocking_rounds > 2) then
-          "thread blocking 轮数 \($blocking_rounds) > 2（应升级为架构问题，不再开第 3 轮）"
+      # (b) **同一问题的阻塞链 ≤ 2 轮**（语义见 `worst_convergence_chain` 的注释）。
+      #
+      # 旧写法 `$blocking_rounds > 2` 只数条数，把两种相反的情形判成同一种：
+      # 代码真没收敛（该拦） vs 每轮都在收敛但中途引入新问题（不该拦）。
+      # 卡 abb-cadence-b-rounds-semantics-20261104 的实测：三轮 blocking 全是真缺陷、
+      # 全部修好、每条都因此加强了判据，却被数成「三轮拉锯」。
+      ( if ($worst_chain > 2) then
+          "同一问题的 blocking 已连续 \($worst_chain) 轮未收敛（> 2，应升级为架构问题）；共 \($blocking_rounds) 轮 blocking"
         else empty end ),
 
       # (c) 可合并：thread 内最后一条（ts ≥ 契约阈值）判决类 review 必须是 blocking=0 的 approve。
