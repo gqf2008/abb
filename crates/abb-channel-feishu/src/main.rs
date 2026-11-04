@@ -461,6 +461,11 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "bot_info",
+            "description": "查本渠道 bot 自己的名称与 open_id（GUI「拉取」按钮用）",
+            "inputSchema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
             "name": "delete_chat",
             "description": "解散群（**不可恢复**；调用方须先做强确认）",
             "inputSchema": {
@@ -897,6 +902,13 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 .map_err(|e| format!("改群资料失败：{e:#}"))?;
             Ok(json!({"content": [{"type": "text", "text": "{}"}]}))
         }
+        "bot_info" => {
+            let (name, oid) = rt()
+                .block_on(ch.client.bot_info())
+                .map_err(|e| format!("查 bot 资料失败：{e:#}"))?;
+            Ok(json!({"content": [{"type": "text",
+                "text": json!({"name": name, "open_id": oid}).to_string()}]}))
+        }
         "delete_chat" => {
             let cid = a.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
             if cid.is_empty() {
@@ -1069,6 +1081,7 @@ mod tests {
                 "download_attachment",
                 "create_chat",
                 "update_chat",
+                "bot_info",
                 "delete_chat",
                 "user_display_name",
                 "typing",

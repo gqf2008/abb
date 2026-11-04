@@ -475,6 +475,18 @@ impl Messenger for McpChannelMessenger {
             .ok_or_else(|| format!("渠道 `{}` 建了群但没给 chat_id", self.name))
     }
 
+    /// A：查本渠道 bot 自己的身份。缺它 ⇒ GUI 只能手动填 bot 名称。
+    async fn bot_info(&self) -> Option<(String, String)> {
+        let v = self.call_optional(crate::mcp_bus::TOOL_BOT_INFO, json!({}))?;
+        Some((
+            v.get("name")?.as_str()?.to_string(),
+            v.get("open_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ))
+    }
+
     /// A：改群资料（群名 / 群介绍）。缺它 ⇒ 建错了只能重建（丢掉话术与成员）。
     async fn update_chat(
         &self,

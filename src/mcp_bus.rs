@@ -63,6 +63,12 @@ pub const TOOL_GET_QUOTED_MESSAGE: &str = "get_quoted_message";
 ///
 /// 缺它 ⇒ 用户发来的图片/文件**存不下来**，agent 只能看到「有一个附件」。
 pub const TOOL_DOWNLOAD_ATTACHMENT: &str = "download_attachment";
+/// A：查本渠道 bot 自己的身份（名字 + 平台 id）。
+///
+/// 用途：GUI 里「⟳ 拉取」按钮把 bot 名称/open_id 填进配置，省掉手抄。
+/// **返回的是「ABB 连的这个 bot 是谁」**，不是「任意用户是谁」——
+/// 后者是 [`TOOL_USER_DISPLAY_NAME`]。
+pub const TOOL_BOT_INFO: &str = "bot_info";
 /// A：改群资料（群名 / 群介绍）。
 ///
 /// 为什么它也是 A 档：虚拟 Bot 的完整生命周期里，**能建不能改**等于「建错了只能重建」——

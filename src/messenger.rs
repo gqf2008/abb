@@ -73,6 +73,13 @@ pub trait Messenger: Send + Sync {
         Err("当前平台不支持自动建群（微信）。请手动建群后在 GUI 虚拟 Bot 面板登记。".to_string())
     }
 
+    /// 查本渠道 bot 自己的身份：`(名称, 平台 id)`。契约 §3.4 的可选能力。
+    ///
+    /// 默认 `None`：没实现的渠道让调用方回落「手动填写」，不编造。
+    async fn bot_info(&self) -> Option<(String, String)> {
+        None
+    }
+
     /// 改群资料（群名 / 群介绍）。契约 §3.4 的可选能力。
     ///
     /// 默认返回 `Err` 而不是 `Ok`：没实现的渠道必须**显式说做不到**，

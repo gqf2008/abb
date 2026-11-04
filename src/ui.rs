@@ -42,6 +42,8 @@ enum UiCmd {
     /// 对应工具 ⇒ 处理器直接回「已退役」错误，保留 `idx` 让 UI 能定位是哪一行。
     FetchBotInfo {
         idx: i32,
+        /// 完整 bot 配置（走 `Messenger::bot_info`，渠道无关）。
+        bot: Box<crate::config::BotConfig>,
     },
     /// 安装某个依赖（node/lark-cli/dingtalk-cli/git）。结果经 dep_rx 回主线程。
     InstallDep(String),
@@ -5451,16 +5453,19 @@ pub fn run_gui() -> Result<()> {
                             crate::log!("[gui] 配置保存失败");
                         }
                     }
-                    UiCmd::FetchBotInfo { idx } => {
-                        // **显式退役**（2026-11-04）：查 bot 资料要平台的 `bot_info` API，
-                        // 契约里没有对应工具，内置渠道已删 ⇒ 没有实现可调。
-                        // 明确报错，别让 UI 停在前端「拉取中」的假状态。
-                        let _ = bot_tx.send((
-                            idx,
-                            Err("查平台 bot 资料随内置渠道退役（MCP 契约无此工具）；\
-                                 请手动填写 bot 名称与 open_id"
-                                .to_string()),
-                        ));
+                    UiCmd::FetchBotInfo { idx, bot } => {
+                        // 走**渠道无关**的 `Messenger::bot_info`（契约 §3.4）。
+                        let bot_tx = bot_tx.clone();
+                        tokio::spawn(async move {
+                            let r = match crate::messenger::build(&bot) {
+                                Err(e) => Err(format!("{e:#}")),
+                                Ok(msgr) => msgr.bot_info().await.ok_or_else(|| {
+                                    "渠道未声明 bot_info 能力 ⇒ 请手动填写 bot 名称与 open_id"
+                                        .to_string()
+                                }),
+                            };
+                            let _ = bot_tx.send((idx, r));
+                        });
                     }
                     UiCmd::InstallDep(dep_id) => {
                         // #60：与一键装同款 spawn 解耦——recv 循环是单消费者串行处理所有
@@ -6796,7 +6801,13 @@ pub fn run_gui() -> Result<()> {
         settings.on_fetch_bot_info(move |idx| {
             let b = work.borrow();
             if idx >= 0 && (idx as usize) < b.len() {
-                let _ = tx.send(UiCmd::FetchBotInfo { idx });
+                let Some(bot) = b.get(idx as usize).cloned() else {
+                    return;
+                };
+                let _ = tx.send(UiCmd::FetchBotInfo {
+                    idx,
+                    bot: Box::new(bot),
+                });
             }
         });
     }
