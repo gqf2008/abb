@@ -367,6 +367,19 @@ fn display_name(name: &str, kind: &str) -> String {
 /// 单行、给**动作 + 原因**：toast 是用户唯一能看到的反馈（细节留在 logs/bridge.out）。
 /// Windows 上追加可操作提示 —— 「权限不足」是高完整性形态最常见的失败原因，而这一态下
 /// 普通权限怎么点都不会生效，必须告诉用户往哪走（2026-09-29 owner 实报「停不了也没提示」）。
+/// 管理密码弹窗**没能打开**时的用户可见文案（纯函数，便于单测）。
+///
+/// 为什么单独抽出来：这个文案是「点了没反应」这类缺陷的唯一可见证据。
+/// 2026-11-04 owner 实报「托盘停止点了啥反应也没有」，根因就是失败路径
+/// 两处静默（`if let Some(d)` 无 else、`let _ = d.show()` 吞错）——
+/// 而当时**连一句日志都没留**，只能靠进程状态反推。
+fn svc_pw_fail_text(why: &str, err: Option<&str>) -> String {
+    match err {
+        Some(e) if !e.is_empty() => format!("密码窗口没能打开：{e}"),
+        _ => format!("密码窗口没能打开：{why}"),
+    }
+}
+
 fn svc_action_toast(action: &str, err: &anyhow::Error) -> String {
     let hint = if cfg!(target_os = "windows") {
         "（若为权限不足：用设置页「以管理员身份重启」，或检查任务计划程序里的 ABB-Bridge）"
@@ -6316,12 +6329,35 @@ pub fn run_gui() -> Result<()> {
     let ask_admin: Rc<dyn Fn(UiCmd)> = {
         let dlg = svc_pw.as_weak();
         let pending = svc_pw_pending.clone();
+        let toast = svc_toast.clone();
         Rc::new(move |cmd: UiCmd| {
             *pending.borrow_mut() = Some(cmd);
             let record = crate::config::Config::load()
                 .map(|c| c.admin_password)
                 .unwrap_or_default();
-            if let Some(d) = dlg.upgrade() {
+            // **弹窗失败绝不能静默**（2026-11-04 owner 实报：「点了停止啥反应也没有」）。
+            //
+            // 原来只有 `if let Some(d) = dlg.upgrade()` 和 `let _ = d.show()`：
+            // 句柄失效就什么都不做，`show()` 失败连错误都扔了 ⇒ 用户看到的是
+            // **按钮吞掉点击**。而这种状态恰好在「进程跑久了 / 被反复重启」时出现，
+            // 用户唯一的自愈手段是重启 ABB —— 却没有任何提示告诉他这一点。
+            //
+            // 安全约束不变：**失败路径绝不执行 cmd**。密码门不能被「绕过去更省事」。
+            let fail = |why: &str, err: Option<String>| {
+                let msg = svc_pw_fail_text(why, err.as_deref());
+                crate::log!("[watchdog] {msg}（命令未执行，需重启 ABB 恢复）");
+                if let Ok(mut slot) = toast.lock() {
+                    // 复用既有 toast 通道：托盘下方的提示条，5s 后自动收起。
+                    *slot = Some(crate::agent::truncate(&msg, 200));
+                }
+                // 悬挂命令必须清掉：否则窗口万一稍后能显示，会拿着旧命令直接执行。
+                pending.borrow_mut().take();
+            };
+            let Some(d) = dlg.upgrade() else {
+                fail("窗口句柄已失效", None);
+                return;
+            };
+            {
                 let first = !crate::admin_pass::is_set(&record);
                 d.set_need_password(true);
                 d.set_password_input("".into());
@@ -6337,7 +6373,9 @@ pub fn run_gui() -> Result<()> {
                 } else {
                     "启动 / 停止 / 重启服务需要管理密码。".into()
                 });
-                let _ = d.show();
+                if let Err(e) = d.show() {
+                    fail("窗口显示失败", Some(e.to_string()));
+                }
             }
         })
     };
@@ -10760,6 +10798,34 @@ pub(crate) mod share_render;
 
 #[cfg(test)]
 mod tests {
+
+    /// 管理密码弹窗失败时**必须有话说**。
+    ///
+    /// 2026-11-04 owner 实报「托盘停止点了啥反应也没有」——根因是失败路径两处静默
+    /// （`if let Some(d)` 无 else、`let _ = d.show()` 吞错）。这条钉住「文案非空
+    /// 且指明原因」，因为用户唯一能自救的动作（重启 ABB）必须被告知。
+    #[test]
+    fn svc_pw_failure_text_names_the_reason() {
+        let no_err = svc_pw_fail_text("窗口句柄已失效", None);
+        assert!(no_err.contains("密码窗口没能打开"), "{no_err}");
+        assert!(
+            no_err.contains("窗口句柄已失效"),
+            "必须带上具体原因：{no_err}"
+        );
+
+        let with_err = svc_pw_fail_text("窗口显示失败", Some("platform error"));
+        assert!(
+            with_err.contains("platform error"),
+            "有底层错误时必须转述它（否则用户/排障都看不到真因）：{with_err}"
+        );
+        assert!(
+            !with_err.contains("窗口显示失败"),
+            "有真错误时不该用笼统原因顶替：{with_err}"
+        );
+
+        // 空串等同没有（`anyhow!("")` 的形态）。
+        assert_eq!(svc_pw_fail_text("窗口句柄已失效", Some("")), no_err);
+    }
 
     // ── B 批 O3 / C 批 O3：块渲染与 ⌘V 的纯逻辑 ─────────────────────────────
 
