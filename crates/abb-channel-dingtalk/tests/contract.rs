@@ -94,6 +94,7 @@ fn declares_exactly_the_implemented_tools() {
             "send_text",
             "send_attachment",
             "create_chat",
+            "update_chat",
             "download_attachment",
             "get_chat_info",
             "chat_brief",

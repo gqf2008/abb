@@ -552,6 +552,19 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "update_chat",
+            "description": "改群名（topapi/im/chat/update）。钉钉群没有群介绍字段，description 被忽略",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string", "description": "群 cid…"},
+                    "name": {"type": "string", "description": "新群名"},
+                    "description": {"type": "string", "description": "群介绍（钉钉无此字段，传了也忽略）"}
+                },
+                "required": ["chat_id", "name"]
+            }
+        },
+        {
             "name": "download_attachment",
             "description": "把某条入站消息的第 seq 个附件下载到本地，返回落盘路径（钉钉的 downloadCode 只在入站帧里出现一次，本进程按 message_id 反查）",
             "inputSchema": {
@@ -774,6 +787,23 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
         // ── 可选能力（契约 §3.4）：钉钉能做的，声明了就必须真做 ──
         "create_chat" => create_chat(ch, &a),
         "download_attachment" => download_attachment(ch, &a),
+        "update_chat" => {
+            let cid = a.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = a.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            if cid.is_empty() {
+                return Err("update_chat 缺 chat_id".into());
+            }
+            if name.trim().is_empty() {
+                return Err("update_chat 缺 name（群名）".into());
+            }
+            rt().block_on(ch.client.update_chat(cid, name, desc))
+                .map_err(|e| format!("改群名失败：{e:#}"))?;
+            // 本进程的群名缓存同步更新：`chat_brief`/`get_chat_info` 立即答新名，
+            // 不必等下一帧入站消息把新标题带回来。
+            ch.note_chat_name(cid, name);
+            Ok(json!({"content": [{"type": "text", "text": "{}"}]}))
+        }
         "get_chat_info" => get_chat_info(ch, &a),
         "chat_brief" => chat_brief(ch, &a),
         "user_display_name" => user_display_name(ch, &a),
@@ -1211,6 +1241,7 @@ mod tests {
                 "send_text",
                 "send_attachment",
                 "create_chat",
+                "update_chat",
                 "download_attachment",
                 "get_chat_info",
                 "chat_brief",
