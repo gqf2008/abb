@@ -75,8 +75,8 @@ enum UiCmd {
     },
     /// 编辑保存：PATCH 平台群资料（改名/改介绍）+ 登记表角色名同步。
     VirtualBotUpdate {
-        /// **显式退役**（2026-11-04）：改群资料在 MCP 契约里无对应工具，
-        /// 处理器只回错误，保留 `name` 让结果能定位到是哪个群。
+        /// 完整 bot 配置（走 `Messenger::update_chat`，渠道无关）。
+        bot: crate::config::BotConfig,
         #[allow(dead_code)]
         bot_key: String,
         #[allow(dead_code)]
@@ -5748,30 +5748,29 @@ pub fn run_gui() -> Result<()> {
                         });
                     }
                     UiCmd::VirtualBotUpdate {
+                        bot,
                         bot_key: _,
                         kind: _,
                         app_id: _,
                         app_secret: _,
-                        chat_id: _,
+                        chat_id,
                         name,
-                        prompt: _,
+                        prompt,
                         owner: _,
                     } => {
-                        // **显式退役**（2026-11-04）：改群资料在契约 §3.4 里**没有**
-                        // 对应工具（三个渠道 crate 都没 `update_chat`），而内置渠道
-                        // 已删 ⇒ 这条路径没有实现可调。
-                        //
-                        // 为什么不悄悄删掉：用户点「保存」会什么也不发生。
-                        // 明确说明 + 指路（手动改群名，或等契约补 `update_chat`）。
+                        // 走**渠道无关**的 `Messenger::update_chat`（契约 §3.4）。
+                        // 2026-11-04 补上这个工具之前，这里是「显式退役」的占位实现。
                         let vb_tx = vb_tx.clone();
                         tokio::spawn(async move {
+                            let r = match crate::messenger::build(&bot) {
+                                Err(e) => Err(format!("{e:#}")),
+                                Ok(msgr) => msgr
+                                    .update_chat(&chat_id, &name, &prompt)
+                                    .await
+                                    .map(|()| "已更新群资料".to_string()),
+                            };
                             let _ = vb_tx.send(VirtualBotEvt::Done {
-                                results: vec![(
-                                    name,
-                                    Err("改群资料能力随内置渠道退役（MCP 契约暂无 update_chat 工具）。\
-                                         请到平台客户端手动改群名/介绍，再点「重新登记」"
-                                        .to_string()),
-                                )],
+                                results: vec![(name, r)],
                             });
                         });
                     }
@@ -7063,6 +7062,7 @@ pub fn run_gui() -> Result<()> {
                         }
                         let chat_id = d.get_edit_chat_id().to_string();
                         let _ = tx.send(UiCmd::VirtualBotUpdate {
+                            bot: bot_cfg.clone().unwrap_or_default(),
                             bot_key,
                             kind,
                             app_id: String::new(),

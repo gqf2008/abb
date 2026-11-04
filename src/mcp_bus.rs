@@ -63,6 +63,11 @@ pub const TOOL_GET_QUOTED_MESSAGE: &str = "get_quoted_message";
 ///
 /// 缺它 ⇒ 用户发来的图片/文件**存不下来**，agent 只能看到「有一个附件」。
 pub const TOOL_DOWNLOAD_ATTACHMENT: &str = "download_attachment";
+/// A：改群资料（群名 / 群介绍）。
+///
+/// 为什么它也是 A 档：虚拟 Bot 的完整生命周期里，**能建不能改**等于「建错了只能重建」——
+/// 而重建会丢话术历史与成员。用户能直接感知。
+pub const TOOL_UPDATE_CHAT: &str = "update_chat";
 /// A：创建群会话（虚拟 Bot 一键建群用）。
 ///
 /// 缺它 ⇒ 建群只能手动，聊天侧回落登记制指引。

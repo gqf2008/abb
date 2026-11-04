@@ -936,7 +936,6 @@ impl FeishuClient {
     /// ⚠️ 方法是 **PUT** 不是 PATCH（8-20 真机实测：PATCH /im/v1/chats/:id 返回
     /// 404 page not found——mock 只验形状不验路由，假绿；lark-cli im.chats.update
     /// dry-run 显示 PUT）。owner_id 字段可顺带转让群主（新群主必须在群里）。
-    #[allow(dead_code)] // 虚拟 Bot 编辑：群资料修改（GUI 流程，不是契约能力）
     pub async fn update_chat(&self, chat_id: &str, name: &str, description: &str) -> Result<()> {
         let token = self.tenant_token().await?;
         let resp: serde_json::Value = self

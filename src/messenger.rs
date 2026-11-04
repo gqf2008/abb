@@ -73,6 +73,21 @@ pub trait Messenger: Send + Sync {
         Err("当前平台不支持自动建群（微信）。请手动建群后在 GUI 虚拟 Bot 面板登记。".to_string())
     }
 
+    /// 改群资料（群名 / 群介绍）。契约 §3.4 的可选能力。
+    ///
+    /// 默认返回 `Err` 而不是 `Ok`：没实现的渠道必须**显式说做不到**，
+    /// 静默成功会让用户以为改了（与 `create_chat` 同口径）。
+    async fn update_chat(
+        &self,
+        _chat_id: &str,
+        _name: &str,
+        _description: &str,
+    ) -> Result<(), String> {
+        Err("当前渠道不支持改群资料（MCP 服务未声明 `update_chat`）。\
+             请到平台客户端手动改群名/介绍。"
+            .to_string())
+    }
+
     /// 处理中表情（可选）。返回 reaction_id 供 done 时删除。默认 None。
     async fn typing(&self, _message_id: &str) -> Option<String> {
         None

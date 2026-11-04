@@ -475,6 +475,32 @@ impl Messenger for McpChannelMessenger {
             .ok_or_else(|| format!("渠道 `{}` 建了群但没给 chat_id", self.name))
     }
 
+    /// A：改群资料（群名 / 群介绍）。缺它 ⇒ 建错了只能重建（丢掉话术与成员）。
+    async fn update_chat(
+        &self,
+        chat_id: &str,
+        name: &str,
+        description: &str,
+    ) -> Result<(), String> {
+        let v = self
+            .call_optional(
+                crate::mcp_bus::TOOL_UPDATE_CHAT,
+                json!({ "chat_id": chat_id, "name": name, "description": description }),
+            )
+            .ok_or_else(|| {
+                format!(
+                    "渠道 `{}` 的 MCP 服务未声明 `{}` ⇒ 只能到平台客户端手动改群资料",
+                    self.name,
+                    crate::mcp_bus::TOOL_UPDATE_CHAT
+                )
+            })?;
+        // 契约只要求「成功即无字段」；有 `error` 字段则当作失败（不静默）。
+        if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
+            return Err(format!("渠道 `{}` 改群资料失败：{e}", self.name));
+        }
+        Ok(())
+    }
+
     /// A：反查展示名。缺它 ⇒ 授权记录里只有 id。
     async fn user_display_name(&self, user_id: &str) -> Option<String> {
         self.call_optional(

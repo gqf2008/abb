@@ -448,6 +448,19 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "update_chat",
+            "description": "改群资料（群名 / 群介绍）；群主转让需走平台客户端",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"}
+                },
+                "required": ["chat_id", "name"]
+            }
+        },
+        {
             "name": "user_display_name",
             "description": "按 open_id 反查用户显示名（需通讯录 scope）",
             "inputSchema": {
@@ -860,6 +873,21 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             eprintln!("[feishu-mcp] 已建群 {chat_id} name={name} owner={owner}");
             Ok(json_text(json!({"chat_id": chat_id})))
         }
+        "update_chat" => {
+            let cid = a.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = a.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            if cid.is_empty() {
+                return Err("update_chat 需要 chat_id".to_string());
+            }
+            if name.trim().is_empty() {
+                // 空群名会被飞书拒（400）且报错含糊，这里先挡。
+                return Err("update_chat 需要非空 name".to_string());
+            }
+            rt().block_on(ch.client.update_chat(cid, name, desc))
+                .map_err(|e| format!("改群资料失败：{e:#}"))?;
+            Ok(json!({"content": [{"type": "text", "text": "{}"}]}))
+        }
         "user_display_name" => {
             let user_id = need(&a, "user_display_name", "user_id")?;
             let name = rt().block_on(ch.client.user_name(user_id)).ok_or_else(|| {
@@ -1022,6 +1050,7 @@ mod tests {
                 "get_quoted_message",
                 "download_attachment",
                 "create_chat",
+                "update_chat",
                 "user_display_name",
                 "typing",
                 "del_typing",
