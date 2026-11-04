@@ -158,6 +158,9 @@ impl StdioChannelClient {
             .take()
             .ok_or_else(|| ClientError::Spawn("拿不到 stdout".into()))?;
         let rx = spawn_reader(stdout);
+        // 登记：`process::exit` 跳 Drop 时由 atexit 兜底杀掉（见 reap_on_exit）。
+        #[cfg(unix)]
+        reap_on_exit::register(child.id());
         Ok(Self {
             name: name.to_string(),
             child,
@@ -241,6 +244,7 @@ impl StdioChannelClient {
             }
         }
         if self.reader_done {
+            self.reap_if_stream_ended();
             return Err(ClientError::NoResponseForId(want));
         }
         loop {
@@ -268,12 +272,32 @@ impl StdioChannelClient {
         }
     }
 
+    /// 流已结束 ⇒ 子进程多半也退了，**必须 `try_wait` 回收**。
+    ///
+    /// 2026-11-04 owner 报「停止渠道会产生僵尸进程」的根因就在这里：
+    /// `reader_done` 原来只置标志，`wait()` 只写在 `Drop` 里。于是
+    /// 「server 自己退出（崩溃/OOM/EOF 自退）」到「client 被 drop」这段窗口里，
+    /// 子进程是 **Z 状态**挂着——而 client 被 `SubscribeSource` 长期持有，
+    /// 这个窗口可以长到进程结束。
+    ///
+    /// 为什么无条件重试而不是「置位那一刻回收一次」：`try_wait` 在进程还活着时
+    /// 返回 `Ok(None)`，那一刻收不到；下一轮再试才有机会。调用点放在
+    /// `call` / `drain_notifications` 入口（真实现里 fetch 每轮都过这里）。
+    fn reap_if_stream_ended(&mut self) {
+        if self.reader_done {
+            // 失败无妨：ECHILD = 别人已回收；其他错误也只能留待 Drop。
+            let _ = self.child.try_wait();
+        }
+    }
+
     /// 取出缓存里所有已到达的非响应消息（上层用来收 `notifications/resources/updated`）。
     ///
     /// 为什么单独取而不是在 [`call`] 里回调：回调会要求持锁调上层，容易死锁；
     /// 让调用方在自己方便的时候取更简单。
     #[allow(dead_code)]
     pub fn drain_notifications(&mut self) -> Vec<Value> {
+        // 入口先回收一次：上一轮已看到 EOF 的话，此刻进程可能已经退了。
+        self.reap_if_stream_ended();
         // 先把通道里已到达的都收进来（非阻塞）。
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -295,6 +319,8 @@ impl StdioChannelClient {
             }
         }
         self.pending = keep;
+        // 本轮刚置上 `reader_done`（流在本轮结束）⇒ 立刻回收，不等下一轮。
+        self.reap_if_stream_ended();
         got
     }
 }
@@ -305,6 +331,73 @@ impl Drop for StdioChannelClient {
         // 不这么做的话，托盘里每换一个渠道就漏一个子进程。
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // 已回收 ⇒ 从 exit 兜底表里摘掉，免得 atexit 对复用过的 pid 误杀。
+        #[cfg(unix)]
+        reap_on_exit::unregister(self.child.id());
+    }
+}
+
+/// 进程退出时兜底杀掉还活着的渠道子进程。
+///
+/// ## 为什么 Drop 里的 kill 不够
+///
+/// `std::process::exit` **跳过所有 Drop**。而 service 有多处 exit：
+/// 配置读不出（`service.rs` 两处）、收尾 20s 超时强退（`service.rs:696`）——
+/// 这些路径下 [`StdioChannelClient::drop`] 的 `kill()` 根本不会跑，
+/// MCP server 子进程（`abb-channel-*`、`ki`）就留在系统里继续跑。
+/// owner 2026-11-04 报的「停止渠道产生残留进程」就是这一类。
+///
+/// ## 为什么用 atexit 而不是改掉 exit
+///
+/// `process::exit` 走 libc `exit(3)`，**会执行 atexit 处理器**。所以这里注册一个
+/// 就够了，不必去动 service 收尾那 5 处 exit（那些位置各自有「防挂死占锁」的
+/// 明确理由，改成正常返回会重新引入挂死）。
+///
+/// 只 kill 不 wait：进程正要在毫秒内死掉，僵尸会被 launchd/init 立刻收养。
+#[cfg(unix)]
+mod reap_on_exit {
+    use std::sync::Mutex;
+
+    /// 还活着的子进程 pid（spawn 成功登记，Drop 回收后注销）。
+    static LIVE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+    extern "C" fn kill_all() {
+        // `try_lock`：exit 可能发生在持锁的线程上，卡在 exit 里比漏杀更糟。
+        if let Ok(g) = LIVE.try_lock() {
+            for pid in g.iter() {
+                // 失败无妨：进程可能已经自己退了。
+                unsafe {
+                    libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    pub fn register(pid: u32) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            libc::atexit(kill_all);
+        });
+        if let Ok(mut g) = LIVE.lock() {
+            g.push(pid);
+        }
+    }
+
+    pub fn unregister(pid: u32) {
+        if let Ok(mut g) = LIVE.lock() {
+            g.retain(|p| *p != pid);
+        }
+    }
+
+    /// 某个 pid 是否在登记表里（**只在测试里读**；加 `cfg(test)` 免得被
+    /// `-D dead-code` 判成死代码）。
+    ///
+    /// 为什么按 pid 而不是按总数：测试默认**并行**跑，全局计数会被别的用例
+    /// spawn 的子进程干扰——第一版用 `before + 1` 在完整测试集里就红了
+    /// （单跑绿、全跑红，正是测试隔离缺陷的典型形态）。
+    #[cfg(test)]
+    pub fn is_tracked(pid: u32) -> bool {
+        LIVE.lock().map(|g| g.contains(&pid)).unwrap_or(false)
     }
 }
 
@@ -383,6 +476,65 @@ mod tests {
     fn script_client(body: &str) -> StdioChannelClient {
         StdioChannelClient::spawn("fake", "/bin/sh", &["-c".into(), body.into()], &[])
             .expect("起不来测试脚本")
+    }
+
+    /// 子进程必须登记进 exit 兜底表，drop 后必须摘掉。
+    ///
+    /// 判据两头都要：只验「登记了」会把「永不注销」的泄漏漏掉（表越涨越大，
+    /// atexit 时对早已回收的 pid 发 SIGKILL —— pid 复用后就是**误杀别人的进程**）。
+    #[cfg(unix)]
+    #[test]
+    fn child_is_tracked_for_exit_and_untracked_after_drop() {
+        let c = script_client("sleep 5");
+        let pid = c.child.id();
+        assert!(
+            super::reap_on_exit::is_tracked(pid),
+            "spawn 后必须登记（否则 process::exit 时会漏杀）"
+        );
+        drop(c);
+        assert!(
+            !super::reap_on_exit::is_tracked(pid),
+            "drop 后必须注销（否则 pid 复用时会误杀无辜进程）"
+        );
+    }
+
+    /// **MCP server 自己退出后必须被回收**（否则留僵尸进程）。
+    ///
+    /// 2026-11-04 owner 实报「停止渠道会产生僵尸进程」。根因：`reader_done`
+    /// 只置标志、**从不 `wait()`**——`wait()` 原来只在 `Drop` 里。于是
+    /// 「server 崩溃/自己退出」到「client 被 drop」之间，子进程是 Z 状态挂着；
+    /// 而 client 被 `SubscribeSource` 长期持有，这个窗口可以很长。
+    ///
+    /// 判据用 `ps -o stat=`：空 = 已回收（正确）；`Z` = 僵尸（缺陷）。
+    /// 不用 `/proc`：macOS 没有。
+    #[cfg(unix)]
+    #[test]
+    fn exited_server_is_reaped_not_left_zombie() {
+        use std::time::Duration;
+        // 立刻退出：模拟 server 崩溃/自退（最常见形态）。
+        let mut c = StdioChannelClient::spawn("t", "/bin/sh", &["-c".into(), "exit 0".into()], &[])
+            .expect("起不来测试脚本");
+        let pid = c.child.id();
+        // 等它变成「已退出未回收」。
+        std::thread::sleep(Duration::from_millis(300));
+        // 触发检测点（真实现里 fetch 每轮都会调它）。
+        let _ = c.drain_notifications();
+        std::thread::sleep(Duration::from_millis(200));
+        // **不能用 `ps` 判**：本机沙箱里 `ps` 直接 Operation not permitted，
+        // `Command::output()` 返回 Err 被 unwrap_or_default 吞成空串 ⇒ 断言恒过
+        // （第一版就是这么假绿的，实测 stat="" 才发现）。
+        //
+        // `waitpid(WNOHANG)` 是真系统调用，三种返回都有意义：
+        //   r == pid  ⇒ 已退出且**没人回收** ⇒ 僵尸（缺陷）
+        //   r == 0    ⇒ 还活着（没退出，不算僵尸）
+        //   r == -1   ⇒ 早被别人回收了（正确路径）
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert!(
+            r != pid as libc::pid_t,
+            "server 已退出但没人 wait ⇒ pid={pid} 成了僵尸（waitpid={r}）；\
+             必须在检测到流结束时 try_wait 回收"
+        );
     }
 
     #[test]
