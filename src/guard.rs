@@ -1730,6 +1730,22 @@ mod tests {
             }
         }
         assert_ne!(decide(r#"$ABB_BIN session nuke"#), Decision::Allow);
+        // `restart`（2026-11-04 新增的服务重启 CLI）**必须继续被拒**。
+        //
+        // 它给的是「代填 config.json 之后让它生效」的入口，而受限会话**写不了** config.json
+        // （写盘限工作区）⇒ 对它没有任何正当用途，只会杀掉自己所在的会话。
+        // 这里钉的是**默认拒绝**这个事实：将来谁想「顺手把它加进白名单」，这条会红。
+        for bad in [r#"$ABB_BIN restart"#, r#"$ABB_BIN restart --force"#] {
+            match decide(bad) {
+                Decision::Deny(why) => assert!(
+                    why.contains("不在白名单"),
+                    "拒绝原因应指明白名单（实际：{why}）"
+                ),
+                other => {
+                    panic!("{bad} 必须拒绝（受限会话写不了配置，重启无正当用途），实际 {other:?}")
+                }
+            }
+        }
 
         // 图形生成（卡 abb-chart-cli-20261013）：owner 决策 = 画图是基本工具，
         // **授权者（受限）会话也要能用**。放行的是 `chart render`，且路径参数限工作区。

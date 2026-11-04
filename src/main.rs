@@ -587,6 +587,28 @@ fn main() {
         std::process::exit(guard::guard_check_main());
     }
 
+    // 服务重启 CLI：`agent-bridge restart`。
+    //
+    // ## 为什么需要它
+    //
+    // 渠道配置改成手写/代填之后（S4 退役内置渠道，mcp_channel 只剩 command/args/env），
+    // 出现一个半条腿的流程：助手能把启动命令写进 config.json，但**改盘不会让正在跑的
+    // 渠道换程序** —— 服务只在「GUI 点保存且 bots_struct_sig 变化」那条路上重启。
+    // 助手于是只能对用户说「你去点一下重启」，而它自己没有任何入口。
+    //
+    // 这里给的就是那个入口，且**只走 ABB 自己的重启实现**（`install::svc_restart`）：
+    // macOS 托管形态 = `launchctl kickstart -k`、非托管 = 先杀后起、Windows = 计划任务
+    // /end + /run，并且都校验「换了一个新 pid」。让助手自己拼 launchctl 会漏掉这些。
+    //
+    // ## 受限（授权者）会话拿不到它 —— 这是有意的
+    //
+    // `guard.rs::check_abb_bin` 对未知子命令**默认拒绝**，所以本命令只在全权限会话
+    // 与人工终端可用。理由：受限会话本来就写不了 `config.json`（写盘限工作区），
+    // 重启对它没有任何正当用途，只会杀掉自己所在的会话。
+    if args.len() >= 2 && args[1] == "restart" {
+        std::process::exit(run_restart_cli());
+    }
+
     // 跨会话投递 CLI：供 claude 用 Bash 调用（也可人用）。
     //   agent-bridge deliver --text "内容" [--file <路径>]…
     //     （不给目标 = 缺省发回创建者会话，等价 --to-current；见 parse_deliver_args）
@@ -1967,6 +1989,60 @@ fn converge_deliver_source(
     Ok(())
 }
 
+/// 服务没在跑时 `restart` 必须**拒绝**，而不是顺手把它启动起来。
+///
+/// 这是本命令最容易写错的地方：`install::svc_restart` = 停 + 起，**不看当前状态**；
+/// 托管形态下 `svc_start` 还会 `set_desired(true)`。于是对「owner 主动停掉的服务」
+/// 执行 restart，等于**绕过 owner 的意图**把服务拉起来、把渠道重新连上——而渠道一连上
+/// 就可能开始回消息（对外发声）。所以判据 fail-safe 的方向是「宁可不启」。
+///
+/// 返回 `Some(原因)` = 拒绝；`None` = 可以重启。
+///
+/// 为什么只看 `status().running`：它是「pid 存活 **且** 身份对得上」。
+/// pid 文件陈旧但服务其实在跑时会误判成「没在跑」⇒ 拒绝。这个方向的误判是安全的
+/// （用户会被告知去界面确认，而不是被我们悄悄启动一堆 bot）。
+fn restart_refusal(running: bool) -> Option<&'static str> {
+    if running {
+        return None;
+    }
+    Some(
+        "服务当前没有在运行。`restart` 只重启**正在跑的**服务，不会替你把一个停掉的服务 \
+         拉起来 —— 那会绕过 owner 的停止意图、把渠道重新连上（可能开始对外回消息）。\n\
+         要启动请用托盘里的启动按钮（或重开 ABB）；确认界面显示「运行中」之后再 restart。",
+    )
+}
+
+/// `agent-bridge restart` 的实现：重启服务并如实报结果。
+///
+/// 退出码：**0** = 确实换了一个新实例；**1** = 重启失败；**2** = 拒绝（服务本来就没在跑）。
+/// 三种必须区分：助手靠退出码决定对用户说什么，「拒绝」和「失败」混成一个会让它去
+/// 重试一件不该重试的事。
+/// **不静默成功**：`svc_restart` 内部已经校验「新 pid ≠ 旧 pid」，这里原样转达。
+fn run_restart_cli() -> i32 {
+    if let Some(why) = restart_refusal(crate::install::status().running) {
+        eprintln!("{why}");
+        return 2;
+    }
+    match crate::install::svc_restart() {
+        Ok(()) => {
+            println!("已重启（新实例已起来）");
+            0
+        }
+        Err(e) => {
+            eprintln!("重启失败：{e:#}");
+            eprintln!(
+                "提示：服务日志在 {}（若服务已停，托盘里的启动按钮或重开 ABB 会拉起它）",
+                crate::config::Config::path()
+                    .parent()
+                    .map(|d| d.join("logs/bridge.out"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("logs/bridge.out"))
+                    .display()
+            );
+            1
+        }
+    }
+}
+
 /// 跨会话投递 CLI（供 claude 用 Bash 调用，也可人用）。退出码 0=已入队 1=失败。
 /// 来源缺省取 AGENT_BRIDGE_BOT_KEY / AGENT_BRIDGE_CHAT_ID（桥 spawn agent 时注入）。
 /// 目标缺省 = 创建者会话（不给 --bot/--chat/--to-current 时，等价 --to-current）。
@@ -2724,6 +2800,71 @@ mod tests {
         describe_trigger, job_cli_to_task_args, parse_task_to, parse_task_to_target,
         read_task_logs, session_reset_chat_id, take_proc_cmd, TASK_ADD_USAGE,
     };
+
+    /// `restart` 子命令必须**接在调度链上**，而不是只定义了函数没人调。
+    ///
+    /// 这是本仓踩过的形态：`ui.rs` 的渠道三格曾经有 UI、有 model、有 refresh，
+    /// 但缺少一步「真正写进 bots」（见 `check_claimed_unwired` 那类事故）。
+    /// 判据只能读源码文本——真跑一次会真的重启服务。
+    ///
+    /// 三件事都要在：
+    /// 1. `main()` 里按 `args[1] == "restart"` 分派（不是落进 GUI/service 启动）；
+    /// 2. 走 `install::svc_restart`（不自己拼 launchctl：托管/非托管/Windows 三种形态它都管，
+    ///    且都校验「换了一个新 pid」）；
+    /// 3. 失败要**非零退出码**（助手靠它判断成没成，静默成功最坏）。
+    #[test]
+    fn restart_subcommand_is_wired_to_svc_restart() {
+        let src = crate::platform::src_lf(include_str!("main.rs"));
+        let dispatch = src
+            .split(r#"args[1] == "restart""#)
+            .nth(1)
+            .expect("main() 应按 args[1] == \"restart\" 分派");
+        let dispatch: String = dispatch.chars().take(200).collect();
+        assert!(
+            dispatch.contains("run_restart_cli()"),
+            "分派后必须调 run_restart_cli：{dispatch}"
+        );
+        let body = src
+            .split("fn run_restart_cli() -> i32 {")
+            .nth(1)
+            .expect("应有 run_restart_cli");
+        let body: String = body.chars().take(700).collect();
+        assert!(
+            body.contains("install::svc_restart()"),
+            "必须走 install::svc_restart：{body}"
+        );
+        assert!(body.contains("        0\n"), "成功返回 0：{body}");
+        assert!(body.contains("        1\n"), "失败返回非零：{body}");
+        assert!(
+            body.contains("return 2;"),
+            "拒绝（服务本来就没在跑）必须用另一个退出码：助手靠它区分「不该重试」与「重试」：{body}"
+        );
+    }
+
+    /// **服务没在跑时 `restart` 必须拒绝**，不能变成「顺手启动」。
+    ///
+    /// `install::svc_restart` = 停 + 起，**不看当前状态**；托管形态下 `svc_start`
+    /// 还会 `set_desired(true)`。所以对「owner 主动停掉的服务」执行 restart，
+    /// 等于绕过 owner 的停止意图、把渠道重新连上（而渠道连着就可能对外回消息）。
+    ///
+    /// 双向：`running=true` ⇒ 必须放行（不能把正常路径也堵上）。
+    #[test]
+    fn restart_refuses_when_service_is_not_running() {
+        assert!(
+            super::restart_refusal(true).is_none(),
+            "服务在跑时必须允许重启，否则这个命令就没用了"
+        );
+        let why = super::restart_refusal(false).expect("服务没在跑时必须拒绝");
+        assert!(why.contains("没有在运行"), "拒绝理由要点明状态：{why}");
+        assert!(
+            why.contains("不会替你把一个停掉的服务"),
+            "要点明「不会替你启动」而不是笼统报错：{why}"
+        );
+        assert!(
+            why.contains("托盘里的启动按钮"),
+            "要给出路（用户接下来该做什么）：{why}"
+        );
+    }
 
     /// `chart` 子命令转发器找到随包 `abb-chart`（同目录存在即命中，并按平台拼 `.exe`）。
     ///

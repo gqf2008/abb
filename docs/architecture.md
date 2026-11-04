@@ -85,7 +85,7 @@ config.rs access_allows           SandboxMode
   ├─ granted（授权码激活）            ├─ ReadOnly
   └─ 其它 → 拦截                     ├─ WorkspaceWrite
                                     └─ FullAccess（默认）
-guard.rs 2673 行：删除保护 + 受限会话闸
+guard.rs 2689 行：删除保护 + 受限会话闸
 runtime/acp.rs 把档位经 `_meta.abbSandbox` 下发；执行层不声明该能力时，
 受限档会话在建会话处 fail-closed 拒建。
 ```
@@ -115,7 +115,7 @@ $AGENT_BRIDGE_HOME 或 ~/.agent-bridge/        （main.rs:97 bridge_dir）
 |---|---|
 | `src/` 顶层 | 见下表 |
 | `src/runtime/`（从上游移植的会话层）**全目录 13727** | 主要 5 个：acp 4888 / harness 4332 / pool 2173 / queue 1536 / oneshot 571；其余 4 个小文件合计 227 |
-| `src/` 合计 | **110780** |
+| `src/` 合计 | **110941** |
 | `ui/app.slint` | 5964 |
 | GUI 三件合计（ui.rs + syschat.rs + 渲染台） | **26148** |
 
@@ -124,7 +124,7 @@ MCP 总线拆成七个文件（`mcp_bus` 697 契约与帧 / `mcp_client` 传输 
 加上 `crates/abb-channel-wechat/`（微信渠道的独立 server）后，渠道实现可以整块搬出主仓。
 
 最大的六个文件：`ui.rs` 12630、`syschat.rs` 7671、`ui_headless_render_test.rs` 5847、
-`task_run.rs` 4563、`platform.rs` 4096、`main.rs` 3372。
+`task_run.rs` 4563、`platform.rs` 4096、`main.rs` 3513。
 
 > **重心在 GUI**：`ui.rs` + `syschat.rs` + 渲染台三件（见上表）比整个 `src/runtime/` 全目录还大。
 > 所以「ABB 是个桥」这个说法在代码量上不成立：它一半是桌面应用。
