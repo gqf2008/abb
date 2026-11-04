@@ -154,6 +154,26 @@ impl InboundSink for BridgeSink {
         // 放在 `handle` 之前、本条附件下载之后：`fill_quoted` 内部也下载引用附件，
         // 它用 `100 + i` 的 seq 段，与本条消息的 `0..n` 不冲突。
         self.bridge.fill_quoted(&mut ev, &msg.parent_id).await;
+
+        // 未读提醒（GUI 小红点 + 托盘通知）。
+        //
+        // **不判 chat_type**（2026-11-04 Jev `always_notify` p=0.94/conf=0.92）：
+        // 内置渠道时代这里判 `chat_type == "p2p"`（只提醒私聊），但 MCP 路径的
+        // chat_type 恒为 `"mcp"`——那是有意的（填 `p2p` 会让它参与主会话选举）。
+        //
+        // 也不需要新判据：**渠道 server 已经做过过滤**，没 @ bot 的群消息根本不会
+        // 进到总线。所以进到这里的每条消息，事实上都是「对 bot 说的」。
+        //
+        // 顺序：放在 `handle` 之前——`handle` 里可能长时间跑 agent，先记提醒才能让
+        // 用户立刻看到「有人找你」；失败只记日志，不阻断消息处理。
+        self.bridge.unread.report(
+            &self.bridge.bot.key(),
+            &ev.sender_id,
+            &msg.sender_name,
+            &crate::agent::truncate(&ev.text, 40),
+            ev.ts,
+        );
+
         self.bridge.handle(ev).await;
         Ok(())
     }

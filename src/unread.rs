@@ -20,6 +20,9 @@ fn path() -> std::path::PathBuf {
 
 /// 未读队列句柄（进程内 Mutex 串行写）。生产用 `production()`；
 /// 测试用 `at(临时路径)` 隔离——handle 内的提醒绝不能碰真实用户 unread.json。
+/// 队列上限（条）。超出丢最旧——未读提醒是「最近有人找你」的提示，不是完整收件箱。
+pub const MAX_ITEMS: usize = 20;
+
 pub struct UnreadStore {
     path: std::path::PathBuf,
     mu: Mutex<()>,
@@ -39,6 +42,21 @@ impl UnreadStore {
             path,
             mu: Mutex::new(()),
         }
+    }
+
+    pub fn report(&self, bot_key: &str, sender: &str, name: &str, preview: &str, ts: i64) {
+        let _g = self.mu.lock().unwrap();
+        let mut items: Vec<Value> = std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v["items"].as_array().cloned())
+            .unwrap_or_default();
+        items.insert(
+            0,
+            json!({"bot_key": bot_key, "sender": sender, "name": name, "preview": preview, "ts": ts}),
+        );
+        items.truncate(MAX_ITEMS);
+        self.write(&items);
     }
 
     /// 清空未读（「弹出即已读」/ 手动清除的执行端）。只允许 service 侧调用（唯一写方）。
@@ -97,6 +115,45 @@ mod tests {
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("abb-unread-test-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// `report` 写进去的东西能被 `snapshot` 原样读回，且**最新的在最前**。
+    ///
+    /// 这条守的是「未读提醒真的有写入方」——2026-11-04 内置渠道退役后，
+    /// `report` 随三个入站入口一起被删，`UnreadStore` 只剩读方（GUI），
+    /// **小红点再也不会出现而没有任何报错**。MCP 入站路径接回它之后，
+    /// 这条测试保证「写了能读、顺序对」。
+    #[test]
+    fn report_then_snapshot_roundtrip_newest_first() {
+        let st = UnreadStore::at(temp_path("roundtrip"));
+        st.report("b1", "ou_a", "张三", "第一条", 100);
+        st.report("b1", "ou_b", "李四", "第二条", 200);
+        let got = st.snapshot().expect("应当读得回来");
+        assert_eq!(got.len(), 2, "两条都要在：{got:?}");
+        assert_eq!(got[0].preview, "第二条", "最新的必须在最前");
+        assert_eq!(got[1].preview, "第一条");
+        assert_eq!(got[0].name, "李四");
+        assert_eq!(got[0].ts, 200);
+    }
+
+    /// 超过上限时丢**最旧**的，不是丢最新的。
+    #[test]
+    fn report_caps_at_max_items_dropping_oldest() {
+        let st = UnreadStore::at(temp_path("roundtrip"));
+        for i in 0..(MAX_ITEMS + 5) {
+            st.report("b1", "ou_x", "", &format!("m{i}"), i as i64);
+        }
+        let got = st.snapshot().expect("应当读得回来");
+        assert_eq!(got.len(), MAX_ITEMS, "必须被截到上限");
+        assert_eq!(
+            got[0].preview,
+            format!("m{}", MAX_ITEMS + 4),
+            "最前必须是最新那条"
+        );
+        assert!(
+            !got.iter().any(|x| x.preview == "m0"),
+            "最旧的应当被丢掉（{got:?}）"
+        );
     }
 
     #[test]
