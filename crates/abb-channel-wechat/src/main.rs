@@ -51,10 +51,22 @@ use weixin::{WechatMedia, WeixinClient, WeixinMessage};
 /// 为什么必须在进程内缓存：ilink **没有消息库/历史 API**，一条消息的
 /// `encrypt_query_param` + `aes_key` 只随入站那一帧来一次；不在那时记下来，
 /// 之后谁也拿不到（契约里 `download_attachment` 只传 `{message_id, seq}`）。
+/// 引用附件的 `seq` 段起点（与 ABB 的 `mcp_bus::QUOTED_SEQ_BASE` 同值）。
+///
+/// 两个 crate 不能互相依赖，所以各存一份；改一处必须同步另一处
+/// （契约 §3.4 的约定，`seq >= 100` 即「被引用消息的附件」）。
+const QUOTED_SEQ_BASE: usize = 100;
+
 #[derive(Default)]
 struct MediaCache {
     /// 旧 → 新。超过 [`MAX_CACHED_MESSAGES`] 从最旧的丢。
     entries: Vec<(String, Vec<WechatMedia>)>,
+    /// 引用消息（被回复的那条）的媒体，按 `message_id` 记。
+    ///
+    /// 为什么单独一张表：一条消息可能**既有自己的图、又引用了带图的消息**。
+    /// 塞进同一个 `Vec` 会让 `seq` 语义含糊（第 0 个到底是哪张？），
+    /// 而契约已经用「`seq >= 100` = 引用段」把两段分开了。
+    quoted: Vec<(String, Vec<WechatMedia>)>,
 }
 
 /// 缓存多少条消息：ABB 的入站循环「拉到就处理」，几十条够用；
@@ -78,6 +90,25 @@ impl MediaCache {
 
     fn get(&self, message_id: &str) -> Option<&Vec<WechatMedia>> {
         self.entries
+            .iter()
+            .find(|(id, _)| id == message_id)
+            .map(|(_, v)| v)
+    }
+
+    /// 记下**被引用消息**的媒体（`seq` 从 [`QUOTED_SEQ_BASE`] 起）。
+    fn put_quoted(&mut self, message_id: &str, items: Vec<WechatMedia>) {
+        if items.is_empty() {
+            return;
+        }
+        self.quoted.retain(|(id, _)| id != message_id);
+        self.quoted.push((message_id.to_string(), items));
+        while self.quoted.len() > MAX_CACHED_MESSAGES {
+            self.quoted.remove(0);
+        }
+    }
+
+    fn get_quoted(&self, message_id: &str) -> Option<&Vec<WechatMedia>> {
+        self.quoted
             .iter()
             .find(|(id, _)| id == message_id)
             .map(|(_, v)| v)
@@ -424,24 +455,39 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| "download_attachment 缺 seq（整数，从 0 开始）".to_string())?
                 as usize;
-            let media = ch
-                .media
-                .lock()
-                .map_err(|_| "media 缓存锁中毒".to_string())?
-                .get(mid)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "message_id={mid} 不在媒体缓存里：只缓存本进程 poll 见过的最近 \
+            // `seq >= QUOTED_SEQ_BASE` ⇒ 要的是**被引用消息**的附件（契约 §3.4）。
+            let (list, is_quoted, idx) = if seq >= QUOTED_SEQ_BASE {
+                let g = ch
+                    .media
+                    .lock()
+                    .map_err(|_| "media 缓存锁中毒".to_string())?;
+                (g.get_quoted(mid).cloned(), true, seq - QUOTED_SEQ_BASE)
+            } else {
+                let g = ch
+                    .media
+                    .lock()
+                    .map_err(|_| "media 缓存锁中毒".to_string())?;
+                (g.get(mid).cloned(), false, seq)
+            };
+            let media = list.ok_or_else(|| {
+                format!(
+                    "message_id={mid} 不在媒体缓存里：只缓存本进程 poll 见过的最近 \
                          {MAX_CACHED_MESSAGES} 条带附件消息（ilink 没有历史消息 API，\
                          进程重启前的附件已无法下载）"
-                    )
-                })?;
-            let item = media.get(seq).cloned().ok_or_else(|| {
-                format!(
-                    "seq={seq} 越界：message_id={mid} 只有 {} 个附件",
-                    media.len()
                 )
+            })?;
+            let item = media.get(idx).cloned().ok_or_else(|| {
+                if is_quoted {
+                    format!(
+                        "seq={seq} 越界：message_id={mid} 的被引用消息只有 {} 个附件",
+                        media.len()
+                    )
+                } else {
+                    format!(
+                        "seq={seq} 越界：message_id={mid} 只有 {} 个附件",
+                        media.len()
+                    )
+                }
             })?;
             let rt = rt();
             let got = rt
@@ -695,8 +741,8 @@ fn to_channel_message(ch: &Arc<Channel>, m: &WeixinMessage) -> Option<Value> {
             c.put(&m.message_id, media.clone());
         }
     }
-    // 附件列表只报**本条消息自带**的媒体（引用消息里的媒体是另一回事，
-    // 契约的 `ChannelMessage` 没有引用字段）。顺序 = 缓存顺序 = `seq`。
+    // 附件列表只报**本条消息自带**的媒体（引用消息里的媒体走 `quoted` 段，
+    // seq 从 `QUOTED_SEQ_BASE` 起）。顺序 = 缓存顺序 = `seq`。
     let attachments: Vec<Value> = media
         .iter()
         .map(|wm| {
@@ -710,6 +756,30 @@ fn to_channel_message(ch: &Arc<Channel>, m: &WeixinMessage) -> Option<Value> {
         })
         .collect();
     let text = m.text();
+    // **引用/回复的内联内容**（契约 `quoted`）。
+    //
+    // 为什么必须内联而不是走 `parent_id` 反查：ilink 的 `ref_msg` 只有
+    // `title` + 完整 `message_item`，**不带原消息 id**，而 ilink 也没有历史消息
+    // API。内容只随这一帧到达，过了就再也拿不到。不给内联字段 = 微信没有引用功能
+    // （用户在群里引用一条消息问「这个是啥」，agent 看不到被引用的是什么）。
+    //
+    // 引用里的媒体同样在这一帧才有句柄 ⇒ 一起并进缓存，让 `download_attachment`
+    // 用 `QUOTED_SEQ_BASE + i` 拿得到。
+    let quoted_media = m.quoted_media();
+    if !quoted_media.is_empty() {
+        if let Ok(mut c) = ch.media.lock() {
+            c.put_quoted(&m.message_id, quoted_media.clone());
+        }
+    }
+    let quoted_text = m.quoted_text();
+    let quoted = if quoted_text.trim().is_empty() && quoted_media.is_empty() {
+        Value::Null
+    } else {
+        json!({
+            "text": quoted_text,
+            "attachment_count": quoted_media.len(),
+        })
+    };
     Some(json!({
         "chat_id": from,
         "message_id": m.message_id,
@@ -718,6 +788,7 @@ fn to_channel_message(ch: &Arc<Channel>, m: &WeixinMessage) -> Option<Value> {
         "text": text,
         "ts": if m.create_time_ms > 0 { m.create_time_ms / 1000 } else { 0 },
         "attachments": attachments,
+        "quoted": quoted,
     }))
 }
 
@@ -815,6 +886,81 @@ mod tests {
                 "不该声明 `{tool}`：{why}（声明了 ABB 会去调）"
             );
         }
+    }
+
+    /// 入站必须产出契约要求的 `quoted` 引用内容。
+    ///
+    /// **这条测的是「字段有没有生产者」**，不是「字段存不存在」。2026-11-04 之前
+    /// `ChannelMessage` 只有 `parent_id`（按 id 反查），而 ilink 的 `ref_msg`
+    /// **不带原消息 id** ⇒ 用户引用一条消息问「这个啥意思」时，agent 什么也看不到。
+    /// `quoted_text()` / `quoted_media()` 两个提取函数因此一直是死代码。
+    #[test]
+    fn inbound_produces_inline_quoted_content() {
+        let ch = fake_channel();
+        let m: WeixinMessage = serde_json::from_value(json!({
+            "from_user_id": "wx_u1",
+            "message_id": "m1",
+            "item_list": [{
+                "type": 1,
+                "text_item": {"text": "这个啥意思"},
+                "ref_msg": {
+                    "title": "原消息摘要",
+                    "message_item": {"type": 1, "text_item": {"text": "被引用的原文"}},
+                },
+            }],
+        }))
+        .expect("构造入站消息");
+        let v = to_channel_message(&ch, &m).expect("应当产出 ChannelMessage");
+        let q = &v["quoted"];
+        assert_eq!(
+            q["text"], "原消息摘要 | 被引用的原文",
+            "被引用内容必须内联带出（摘要 + 原文），实际：{q}"
+        );
+        assert_eq!(q["attachment_count"], 0, "纯文本引用没有附件");
+    }
+
+    /// 没有引用时 `quoted` 必须是 null——不能让下游看到空引用块。
+    #[test]
+    fn inbound_without_quote_has_null_quoted() {
+        let ch = fake_channel();
+        let m: WeixinMessage = serde_json::from_value(json!({
+            "from_user_id": "wx_u1",
+            "message_id": "m2",
+            "item_list": [{"type": 1, "text_item": {"text": "普通消息"}}],
+        }))
+        .expect("构造入站消息");
+        let v = to_channel_message(&ch, &m).expect("应当产出");
+        assert!(
+            v["quoted"].is_null(),
+            "无引用时必须 null，实际：{}",
+            v["quoted"]
+        );
+    }
+
+    /// 引用附件与主附件**分两段**存在，不互相串位。
+    ///
+    /// `seq >= QUOTED_SEQ_BASE` 取引用段、否则取主段（契约 §3.4）。
+    /// 混在一张表里会让「本条的第 0 个」与「它引用的第 0 个」变成同一个。
+    #[test]
+    fn quoted_media_lives_in_its_own_segment() {
+        let mut c = MediaCache::default();
+        c.put("m1", vec![sample_media("image")]);
+        c.put_quoted("m1", vec![sample_media("file"), sample_media("image")]);
+        assert_eq!(c.get("m1").map(|v| v.len()), Some(1), "主段仍是 1 个");
+        assert_eq!(
+            c.get_quoted("m1").map(|v| v.len()),
+            Some(2),
+            "引用段是 2 个"
+        );
+        assert!(
+            c.get_quoted("other").is_none(),
+            "没引用过的消息不该有引用段"
+        );
+        // 引用段同样要封顶（否则长跑进程线性吃内存）。
+        for i in 0..(MAX_CACHED_MESSAGES + 5) {
+            c.put_quoted(&format!("q{i}"), vec![sample_media("image")]);
+        }
+        assert_eq!(c.quoted.len(), MAX_CACHED_MESSAGES, "引用段也要封顶");
     }
 
     /// 媒体缓存容量上限真的生效（否则长跑进程随消息量线性吃内存）。

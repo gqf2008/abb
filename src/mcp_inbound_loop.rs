@@ -152,6 +152,7 @@ mod tests {
             ts: 0,
             attachments: vec![],
             parent_id: String::new(),
+            quoted: None,
         }
     }
 

@@ -120,10 +120,35 @@ pub const INBOX_URI_PREFIX: &str = "channel://";
 /// 首选入站资源 URI（全局收件箱）。
 pub const INBOX_URI: &str = "channel://inbox";
 
+/// 引用附件的 `seq` 段起点（契约 §3.4 `download_attachment` 的约定）。
+///
+/// 主消息的附件用 `0..n`，被引用消息的附件用 `100 + i`——两段分开，
+/// 「本条消息的第 0 个附件」与「它引用的那条的第 0 个附件」不会串。
+/// 这个数在三个渠道 crate 里各自有一份同名常量（它们不能依赖 ABB 的 crate），
+/// 改这里必须同步改那三处，`check_channel_tool_names.sh` 之外由各 crate 的
+/// 契约测试盯着。
+pub const QUOTED_SEQ_BASE: usize = 100;
+
 /// 一条入站消息（契约 §3.3）。
 ///
 /// `chat_id` 的语义照 [`crate::messenger::Messenger`] 既有约定：渠道内会话键
 /// （飞书 = `chat_id`，微信 = `ilink_user_id`，邮件 = 线程键……）。
+/// 内联的被引用内容（微信/钉钉形态：内容随入站帧到达，没有原消息 id）。
+///
+/// **附件不在这里传**：`attachment_count` 只说明「被引用消息有几个附件」，
+/// 真正的字节由 ABB 调 `download_attachment(message_id, 100 + i)` 拿
+/// （100 是 `QUOTED_SEQ_BASE` 约定，与主消息的 `0..n` 段分开）。
+/// 这样契约不用承载二进制，渠道也不用在入站时预下载。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ChannelQuoted {
+    /// 被引用消息的文本（取不到就空串——**有附件时文本可能为空**，那是合法的）。
+    #[serde(default)]
+    pub text: String,
+    /// 被引用消息的附件个数。ABB 据此决定要下载几个。
+    #[serde(default)]
+    pub attachment_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelMessage {
     pub chat_id: String,
@@ -139,6 +164,15 @@ pub struct ChannelMessage {
     pub ts: i64,
     #[serde(default)]
     pub attachments: Vec<ChannelAttachment>,
+    /// **内联**的被引用内容（微信/钉钉形态）。`None` = 没有内联引用。
+    ///
+    /// 为什么契约要支持两种形态：飞书能给 `parent_id`（按 id 反查），但
+    /// **微信的 `RefMessage` 和钉钉的 `repliedMsg` 都不带原消息 id**——内容只随
+    /// 入站那一帧到达，过时即失效。只支持反查就等于这两个渠道没有引用功能。
+    ///
+    /// 优先级：本字段有内容时 ABB 直接用它，**不再**走 `parent_id` 反查。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted: Option<ChannelQuoted>,
     /// 被引用（回复）的消息 id；空 = 不是引用消息。
     ///
     /// 渠道把它自己平台的 `parent_id` 填这里，ABB 侧再按 id 回查内容

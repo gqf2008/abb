@@ -146,6 +146,52 @@ impl BridgeSink {
         }
     }
 
+    /// 把**内联**引用内容（微信/钉钉形态）填进 `ev.quoted`。
+    ///
+    /// 附件按 `100 + i` 段向渠道要——它们就缓存在渠道进程里（入站时记下的），
+    /// 与本条消息自己的 `0..n` 段分开，不会串。
+    ///
+    /// 与 `Bridge::fill_quoted` 的分工：那个走「按 id 反查」（飞书），这个走
+    /// 「内容已经在手」（微信/钉钉）。两条路都填 `ev.quoted`，下游 `handle` 无感。
+    async fn fill_inline_quoted(
+        &self,
+        ev: &mut crate::bridge::Ev,
+        q: &crate::mcp_bus::ChannelQuoted,
+    ) {
+        let mut quoted = crate::messenger::QuotedContent {
+            text: q.text.trim().to_string(),
+            attachments: Vec::new(),
+        };
+        let bot_key = self.bridge.bot.key();
+        for i in 0..q.attachment_count {
+            // 下载失败**不丢整条引用**：文本可能是有用的，附件单独缺。
+            if let Some(meta) = self
+                .bridge
+                .msgr
+                .download_attachment(
+                    &bot_key,
+                    &ev.mid,
+                    crate::mcp_bus::QUOTED_SEQ_BASE + i,
+                    &crate::attachments::AttachmentDesc::Mcp,
+                )
+                .await
+            {
+                quoted.attachments.push(meta);
+            }
+        }
+        if quoted.text.is_empty() && quoted.attachments.is_empty() {
+            // 内联引用声明了但什么都没拿到 ⇒ 不设，免得下游出现空引用块。
+            return;
+        }
+        crate::log!(
+            "[mcp] 内联引用 mid={} 文本长度={} 附件数={}",
+            crate::agent::truncate(&ev.mid, 12),
+            quoted.text.chars().count(),
+            quoted.attachments.len()
+        );
+        ev.quoted = quoted;
+    }
+
     /// 尝试把这条消息当授权码消费。返回 `true` = 已处理（调用方必须**就此返回**）。
     ///
     /// 三步：查展示名（best-effort）→ 消费 → 按结果回执。
@@ -247,10 +293,22 @@ impl InboundSink for BridgeSink {
         // agent 会如实告诉用户「附件拿不到」。
         let mut ev =
             download_attachments(self.bridge.msgr.as_ref(), &self.bridge.bot.key(), ev).await;
-        // 引用/回复：渠道只给 `parent_id`，内容由 ABB 回查（渠道无关）。
-        // 放在 `handle` 之前、本条附件下载之后：`fill_quoted` 内部也下载引用附件，
-        // 它用 `100 + i` 的 seq 段，与本条消息的 `0..n` 不冲突。
-        self.bridge.fill_quoted(&mut ev, &msg.parent_id).await;
+        // 引用/回复：**两种形态，内联优先**。
+        //
+        // 1. `msg.quoted`（微信/钉钉）：内容随入站帧到达，没有原消息 id。
+        // 2. `parent_id`（飞书）：按 id 反查。
+        //
+        // 为什么必须先判内联：微信/钉钉**根本没有 parent_id**，走反查路径会在
+        // `fill_quoted` 第一行就 return，引用内容静默丢失（用户在群里引用一条消息
+        // 问「这个啥意思」，agent 看不到被引用的是什么）。
+        //
+        // 位置在 `handle` 之前、本条附件下载之后：引用附件用 `100 + i` 的 seq 段，
+        // 与本条消息的 `0..n` 不冲突。
+        if let Some(q) = msg.quoted.as_ref() {
+            self.fill_inline_quoted(&mut ev, q).await;
+        } else {
+            self.bridge.fill_quoted(&mut ev, &msg.parent_id).await;
+        }
 
         // 授权码消费（**必须是 `handle` 之前**）：命中就回执并吞掉这条消息，
         // 不让它进 agent——一个授权码不该触发一轮对话。
@@ -896,6 +954,7 @@ mod tests {
             ts: 1,
             attachments: vec![],
             parent_id: String::new(),
+            quoted: None,
         }
     }
 

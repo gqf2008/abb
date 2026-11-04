@@ -284,19 +284,21 @@ async fn ingest(ch: &Arc<Channel>, frame: &Value) {
 ///    ⇒ agent 看到的上下文与搬迁前一致。被引用消息里的**附件**不并进来：它们同样没有
 ///    本地位置（本批不下载），硬塞进 attachments 只会让 agent 去读不存在的文件。
 pub fn to_channel_message(msg: &DingtalkMessage, sender_name: &str) -> Value {
-    let mut text = String::new();
-    if !msg.quoted_text.is_empty() {
-        text.push_str("[引用消息]\n");
-        text.push_str(&msg.quoted_text);
-        text.push_str("\n\n");
-        if !msg.quoted_attachments.is_empty() {
-            eprintln!(
-                "[dingtalk-ws] 被引用消息带 {} 个附件，本批不下载（契约无位置字段）",
-                msg.quoted_attachments.len()
-            );
-        }
-    }
-    text.push_str(&msg.text);
+    // 引用内容走契约的 `quoted` 字段，**不再拼进 text**。
+    //
+    // 原来拼成 `[引用消息]\n…\n\n` + 正文：那是契约还没有引用字段时的变通，
+    // 后果是 agent 分不清「用户说的」和「被引用的」，也没法单独引用渲染。
+    // 现在 ABB 侧把它填进 `Ev.quoted`（与飞书的 `parent_id` 反查同一个下游），
+    // 引用块由 ABB 统一排版。
+    let quoted = if msg.quoted_text.trim().is_empty() && msg.quoted_attachments.is_empty() {
+        Value::Null
+    } else {
+        json!({
+            "text": msg.quoted_text,
+            "attachment_count": msg.quoted_attachments.len(),
+        })
+    };
+    let text = msg.text.clone();
     let attachments: Vec<Value> = msg
         .attachments
         .iter()
@@ -319,6 +321,7 @@ pub fn to_channel_message(msg: &DingtalkMessage, sender_name: &str) -> Value {
         "text": text,
         "ts": now_secs(),
         "attachments": attachments,
+        "quoted": quoted,
     })
 }
 
@@ -430,16 +433,29 @@ mod tests {
         });
         let msg = dingtalk::parse_message(&frame).expect("应当解出一条");
         let m = to_channel_message(&msg, "张三");
-        // 与 ABB `bridge/mod.rs::on_dingtalk_quoted_text_in_prompt` 的断言逐字一致
-        assert_eq!(m["text"], "[引用消息]\n被引用的原消息\n\n回复内容");
+        // **行为在 2026-11-04 变了**：原来把引用拼进 `text`
+        // （`[引用消息]\n…\n\n` + 正文），那是契约还没有引用字段时的变通。
+        // 现在走 `quoted`，正文保持干净——agent 能分清「用户说的」与「被引用的」，
+        // 引用块由 ABB 统一排版。
+        assert_eq!(m["text"], "回复内容", "正文不许再带 [引用消息] 前缀");
+        assert_eq!(m["quoted"]["text"], "被引用的原消息", "被引用内容走 quoted");
+        assert_eq!(m["quoted"]["attachment_count"], 0);
     }
 
-    /// 不带引用的普通消息**不许**多出 `[引用消息]` 前缀。
+    /// 不带引用的普通消息：正文干净，且 `quoted` 必须是 null。
+    ///
+    /// `quoted: null` 很关键——ABB 侧靠它区分「有引用」与「没引用」，
+    /// 空对象会让下游渲染出一个空的引用块。
     #[test]
-    fn plain_text_has_no_quote_prefix() {
+    fn plain_text_has_no_quote() {
         let msg = dingtalk::parse_message(&callback_frame()).unwrap();
         let m = to_channel_message(&msg, "");
         assert!(!m["text"].as_str().unwrap().contains("[引用消息]"));
+        assert!(
+            m["quoted"].is_null(),
+            "无引用时必须 null，实际：{}",
+            m["quoted"]
+        );
     }
 
     /// 纯图片消息：文本为空但有附件 ⇒ 必须保留（合法输入），且位置留空不编造。

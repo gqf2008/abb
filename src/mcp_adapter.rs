@@ -163,6 +163,7 @@ mod tests {
             ts: 1793600000,
             attachments: vec![],
             parent_id: String::new(),
+            quoted: None,
         }
     }
 
