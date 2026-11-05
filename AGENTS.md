@@ -2,6 +2,59 @@
 
 Contributor guide for **ABB (agent-bridge)**, a Rust + Slint menu-bar app that bridges Feishu/WeChat/DingTalk messages to local Claude/Codex agents. It runs as a tray controller (default) or a headless bridge daemon (`--service`).
 
+## 0. 参数表
+
+> 本文件是**协作章程**，不是入门教程。项目无关的模板来自 `team-charter` skill；
+> 下表把模板里的占位符换成本仓真实值。**与全局规则（`~/.ki/agent/AGENTS.md`、
+> `~/.agents/rules/`）冲突时以全局规则为准**，尤其是安全、授权、删除类规则。
+
+| 参数 | 本仓的值 |
+| --- | --- |
+| 项目名 | **ABB (agent-bridge)** — Rust + Slint 菜单栏应用 |
+| 仓库根 | `/Volumes/DataExt/GitHub/abb` |
+| 主分支 | `main` |
+| 成员 worktree 根 | `/Volumes/DataExt/GitHub/abb-<role>`（**同级目录**） |
+| 成员分支前缀 | `feat/` 或 `docs/`（本仓无统一 `team/` 前缀） |
+| 构建命令 | `bash tools/gates.sh`（内含 `cargo build --locked`） |
+| 检查命令 | `bash tools/gates.sh`（内含 `fmt --check` + `clippy -D warnings`） |
+| 测试命令 | `bash tools/gates.sh`（内含 `tools/check_test_isolation.sh`） |
+| 集成测试 | 同上门禁；真渠道 e2e 靠 `gates.sh` 传 `ABB_CHANNEL_BIN` 才真跑 |
+| 评审方式 | walgit `review` 条目，`abb-reviewer-N`（**必须与作者不同 principal**） |
+| 定时推进 | **无**（本仓明确不起常驻 CI runner，见下） |
+| 决策辅助 | Jev（`jev_ask`），常设口径见 `docs/decision-defaults.md` |
+| 跨团队 tracker | **walgit collab threads**（`refs/collab/*`）；GitHub 只是镜像 |
+
+### 模板与本仓实际不符的三处（照事实写，不照模板写）
+
+1. **worktree 不在 `<REPO_ROOT>/.worktree`**，而在 `/Volumes/DataExt/GitHub/abb-<role>`
+   同级目录。理由：构建中间产物必须外置到数据卷（见「Build, Test」），把 worktree
+   也放同级更省心；`.worktree` 嵌在检出内会被 `tools/gates.sh` 的「base 不得在
+   检出内」判据挡下。
+2. **分支前缀没有统一 `team/`**，历史上是 `feat/` 与 `docs/`。
+3. **§7「以 Issue 为准」在本仓指 walgit collab thread，不是 GitHub Issues**。
+   本仓明令「Do not open new GitHub issues or PRs for normal development」。
+   GitHub 只是镜像/发布远端。
+
+## 1. 角色
+
+### Leader（架构师 + 项目负责人）
+
+- 架构设计与技术方案决策、任务拆解与派工、代码审查、验收与合并。
+- owner 已明确自己的角色：**只验收，不当决策关口**。可执行含义见
+  「Decision Making → owner 已明确自己的角色」一节。
+- **原则上不写代码**：代码/测试/配置/脚本变更交给子代理；Leader 做设计、
+  审查、验收、合并。人类明确要求时 Leader 可直接改非代码文件（本文档、`docs/`），
+  但仍应优先派工。
+
+### 团队成员（子代理）
+
+- 以**子代理**形式工作，每人独立 worktree（`/Volumes/DataExt/GitHub/abb-<role>`）
+  与分支（`feat/<role>` 或 `docs/<role>`）。
+- **只在自身 worktree 内工作**，不碰主工作区与其他成员工作区。
+- **不得再派生下级子代理**（避免任务失控与资源争抢）。
+- 交付时必须给出：分支名、commit SHA、改动摘要、**实际跑过的命令与结果**、
+  剩余风险/未验证项。只报「已完成」不算交付。
+
 ## Project Structure & Module Organization
 
 - `src/` — Rust source; one module per concern (`agent`, `bridge`, `wechat`, `feishu`, `dingtalk`, `schedule`, `ws`, …). Unit tests live inline at the bottom of each file.
@@ -250,6 +303,43 @@ entire runtime directory; empty means default); per-bot workspaces under
 - **保持可见**：无人值守不等于安静。多步工作用 `todo` 跟踪，关键结论写进卡片/注释，
   合并前跑完门禁并留证据。
 
+## 2. 交付流程与验收
+
+1. Leader 在 `main` 上维护可构建、可测试的基线。
+2. 拆卡并创建 worktree/分支派工；**任务边界必须互不重叠**（改同一文件的卡串行）。
+3. 成员在自身 worktree 内实现、自测、提交。
+4. Leader 审查 diff 与设计，逐项核对「3. 验收标准」。
+5. 独立评审（**不同 principal**）→ `tools/check_review_cadence.sh <thread-id>` 绿 →
+   才允许写 `merge_result`。
+6. 通过后合并（**优先 fast-forward**）；未通过则附具体失败信息退回返工。
+
+## 3. 验收标准（合并任何分支前，Leader 至少执行）
+
+```sh
+bash tools/gates.sh          # 40 项，含 root 四条 + abb-channel 四条 + abb-chart 四条 + 全部守卫
+```
+
+外加下列检查（本仓特有，缺一即视为未验收）：
+
+- **测试必须真的咬住**：功能能用 + 测试通过**都不够**，要做变异验证——
+  把被守护的行为改坏，断言必须红。`docs/false-green-checklist.md` 列了 9 种假绿形态。
+- **判据本身要验「它红得起来吗」**：一条断言如果在沙箱里恒真（例如 `ps` 被禁、
+  `output()` 的 `Err` 被 `unwrap_or_default()` 吞成空串），它就是假绿。
+- **测试不得依赖全局计数**：并行用例共享全局状态 ⇒ 单跑绿、全跑红。
+- 不破坏对外契约（MCP 渠道工具集 18 个、`config.json` 字段、CLI 退出码）；
+- 新增配置项同步更新 `docs/mcp-bus-architecture.md` 等文档与示例；
+- 日志只写 stderr，**stdout 只有 JSON-RPC**（渠道进程的铁律）；
+- UI 改动附改动前后截图；出图类改动必须**亲眼看**产出的图。
+
+## 4. 推进节奏
+
+- 本仓**没有常驻推进任务**，也不要启动 `tools/run_ci_runner.sh`。
+  推进靠会话内的 `todo` + walgit 看板，不靠 cron 轮询。
+- `cron.json` / 定时任务只在当前会话内有效；跨会话的长期状态**只认看板**，
+  `todo` 只装「这一轮要做的几步」，做完即清、跨轮重建。
+  （教训：有三个早已完成的事项在 todo 里挂了很久，因为会话压缩丢了勾；
+  看板才是权威。）
+
 ## Build, Test, and Development Commands
 
 Every cargo command below **must** carry the build-intermediate env prefix (user policy:
@@ -347,3 +437,65 @@ tools/check_test_isolation.sh
   `chat_handles_extra_env_carries_abb_bin`、`public_oneshot_wrapper_*` 与探针 `probes/abb_bin_reaches_agent.py`。
 - Don't commit `logs/`, `target/`, or generated `.app` bundles.
 - Before touching signing, read `scripts/sign.sh`: usage-description entitlements on the bare binary can cause a startup `SIGKILL`.
+
+## 5. 工程纪律（本仓补充，模板 §8 里本仓还没覆盖的部分）
+
+- **小步提交**：一个提交只做一件事；提交信息写「为什么」，不只是「改了什么」。
+  每个提交都必须**独立可构建**——不要交出「后面那个提交才补全」的中间态。
+  自查方法：`git worktree add` 到临时目录跑一遍门禁，确认干净检出也是绿的。
+  （教训：一次提交漏了未暂存文件，`gates.sh` 还指旧路径，那个 commit 本身是破的。）
+- **主分支保护**：显著变更走「卡 + patch + 独立评审 + `merge_result`」。
+  **已知偏离**：纯文档/记账类小改与个别工程改动曾直接提交到 `main`
+  （如 `06fa240` 渠道合并），未开卡。这不构成惯例——真要再这么做，
+  至少在提交信息里写明「为何不走卡」。长期应收紧到全部走卡。
+- **契约与兼容**：MCP 渠道工具集、`config.json` 字段、CLI 退出码约定属对外契约；
+  变更必须同步文档、示例与迁移说明；破坏性变更先征得人类同意。
+- **缺陷处理**：先复现 → 写失败测试 → 修复 → 全量验证 → 记录根因。
+  **不得用重试、忽略或放宽断言掩盖可复现缺陷**，也不得删/跳过测试让门禁变绿。
+- **依赖与体积**：默认最小依赖；新增依赖需说明理由并固定版本。
+  **合并二进制以摊薄固定成本**是既定策略（三渠道合一省 55%），
+  由 `tools/check_channel_layout.sh` 盯住回退。
+- **技术债**：临时方案必须关联卡并写明移除条件，不允许无记录的「临时」长期存在。
+
+## 6. 派工模板（Leader 复制使用）
+
+```markdown
+你是本项目团队成员。仓库：/Volumes/DataExt/GitHub/abb（Rust，MSRV 见各 crate）。
+工作区/分支（已建好）：/Volumes/DataExt/GitHub/abb-<role>，分支 feat/<role>。
+只在该 worktree 内改动；不要 push、不要合并、不要派生下级代理。
+
+## 任务
+<背景、目标、边界、明确不做的事>
+
+## 环境（必须照做）
+export TMPDIR=/Volumes/DataExt/tmp
+export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target-abb-<role>   # 每 worktree 一个
+
+**绝对不要跑 `bash tools/gates.sh`、也不要裸跑 `cargo test`**：
+- 多 worktree 共用 target 目录会争 cargo 文件锁，实测能把 build 卡 25 分钟，
+  并且让测试超时——看起来像测试失败，其实是锁饿死。
+- 裸 `cargo test` 会写真实 `~/.agent-bridge`，导致假红。
+- 全量门禁由 Leader 串行跑。你只跑自己动到的那些测试，并在报告里写明命令。
+
+## 约束
+- 不新增依赖（新增须说明理由）；不改其他成员的文件；任务边界不重叠
+- 日志写 stderr；渠道进程的 stdout 只能是 JSON-RPC
+- 测试要能咬住：改坏行为后断言必须红（变异自测）
+
+## 交付
+小步提交，每个提交可构建；不合并。
+报告：分支、commit SHA、改动摘要、红→绿证据（含变异）、命令与结果、剩余风险。
+```
+
+## 7. Definition of Done
+
+一个分支可以合并，当且仅当：
+
+- [ ] 目标行为已实现，边界外未扩散
+- [ ] `bash tools/gates.sh` 全绿（40 项），且在**干净检出**里复跑过
+- [ ] 新增/修改行为有测试，缺陷有回归测试，**且做过变异验证**
+- [ ] 文档、示例、`docs/architecture.md` 行数台账同步（`tools/arch-check.sh`）
+- [ ] 无硬编码密钥、无调试输出污染 stdout / 协议通道
+- [ ] 独立评审完成（**不同 principal**），P0/P1 已处置或有不合并的明确结论
+- [ ] `tools/check_review_cadence.sh <thread-id>` 绿之后才写 `merge_result`
+- [ ] 提交信息清晰、范围单一、独立可构建
