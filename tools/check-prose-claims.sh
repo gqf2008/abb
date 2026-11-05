@@ -236,8 +236,46 @@ if [ -f "$plan_doc" ]; then
     fi
 fi
 
+
+# ── 第 7 条：文档不得声称「镜像会自动同步」───────────────────────────────
+#
+# 2026-11-05 实测：GitHub 的 main 停在 v3.2.9（10-30），本地已领先 153 个提交／6 天，
+# 而 `docs/walgit-collaboration.md` 当时写的是「The local walgit-to-GitHub mirror
+# syncs refs/heads/* and refs/tags/*」——**没有任何进程在做这件事**（仓库内无脚本，
+# walgit.toml 无 [upstream] 段，crontab 与 LaunchAgents 均无相关项）。
+# 后果不是「镜像旧」，而是 tag 打在 walgit 上**根本不会触发 release.yml**（它监听
+# GitHub 的 push:tags），等于「以为发版了，其实没发」。
+#
+# 判据双向：
+#   · 出现「自动同步」式的断言 ⇒ 红（除非同一行明确否定它）
+#   · 缺「必须显式推镜像」的说明 ⇒ 红（只删不补会让人以为不用管）
+mirror_doc="docs/walgit-collaboration.md"
+if [ -f "$mirror_doc" ]; then
+    # 「自动」与「镜像/同步」同句出现，且该行没说「不会/不」⇒ 断言它是自动的，报红。
+    # 排除**引号内引用旧说法**的行（如「此前把它写成『自动同步』是不实陈述」）——
+    # 那类句子正是在纠正错误，不该判红。判据只咬「mirror syncs / 会自动同步」这种
+    # **肯定式陈述**，不咬对它的引用。
+    # 中英双语都要咬：原不实陈述是**英文**写的（"The local walgit-to-GitHub mirror
+    # syncs ... "），第一版判据只认中文「自动」⇒ 变异测试直接逃逸。这类配对必须两边都列。
+    stale=$(grep -niE '(mirror|镜像|同步|sync).{0,40}(自动|automatic|automatically|auto-)|(自动|automatic|automatically).{0,40}(mirror|镜像|同步|sync)' "$mirror_doc" \
+        | grep -vE '不会|不要|不再|并非|不是|必须显式|无任何|没有' \
+        | grep -vE '「[^」]*自动[^」]*」|【[^】]*自动[^】]*】|写成|此前|旧写法|不实陈述' || true)
+    if [ -n "$stale" ]; then
+        fail=$((fail + 1))
+        printf '❌ %s 声称镜像「自动」同步，但没有进程在做这件事（2026-11-05 实测：落后 153 提交）\n' "$mirror_doc"
+        printf '%s\n' "$stale" | sed 's/^/   /'
+        printf '   改成「必须显式 git push github main <tag>」\n'
+    fi
+    # 反向：必须写明要显式推，否则读者以为不用管
+    if ! grep -qE 'git push github (main|<tag>|main v)' "$mirror_doc"; then
+        fail=$((fail + 1))
+        printf '❌ %s 没有写明「发布必须显式推镜像」的命令\n' "$mirror_doc"
+        printf '   缺了这句，tag 只存在于 walgit ⇒ release.yml 不会触发\n'
+    fi
+fi
+
 if [ "$fail" -eq 0 ]; then
-    echo "✅ 注释声称的事实与代码一致（已登记的 6 条检查，双向）"
+    echo "✅ 注释声称的事实与代码一致（已登记的 7 条检查，双向）"
     exit 0
 fi
 echo

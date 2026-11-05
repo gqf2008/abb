@@ -133,9 +133,34 @@
   因此**不要把 Windows 主机指到这些任务上**——Windows 的门禁覆盖走 GitHub Actions `ci.yml` 的
   windows job。背景与实测见卡 `abb-ci-coverage-win-20261007`；**"cmd 侧会响亮失败"这一句是机制推断，
   未在 Windows 实机验证**（本仓当前无 Windows 主机；将来若真启用 Windows runner 须先实跑确认）。
-- **Mirror discipline**: push normal heads/tags to `origin` only. The local
-  walgit-to-GitHub mirror syncs `refs/heads/*` and `refs/tags/*`; GitHub Actions is
-  used for mirror/release artifacts, not day-to-day collaboration.
+- **镜像纪律（2026-11-05 更正：此前把它写成「自动同步」是不实陈述）**：
+  日常 push 只推 `origin`（walgit），GitHub 用于镜像与发布产物，不用于日常协作。
+  **但镜像不会自己更新。**
+  - 2026-11-05 实测：GitHub 的 `main` 停在 `005bff0`（= v3.2.9，2026-10-30），
+    本地 `main` 已领先 **152 个提交 / 6 天**；tag 也没同步（`v3.3.0` 只存在于 walgit）。
+    仓库内没有任何脚本、cron 或 LaunchAgent 负责这条链路（`~/.walgit/walgit.toml`
+    无 `[upstream]`/mirror 段，`crontab -l` 与 `~/Library/LaunchAgents` 均无相关项）。
+  - 所以**发布必须显式推镜像**，否则 `release.yml` 不会被触发（它监听的是
+    GitHub 上的 `push: tags: v*`）——tag 打在 walgit 上等于没发版。
+  - **本机可用凭证是 `aerodesk-io`，对 `gqf2008/abb` 无写权限**（403），SSH 也不通
+    （`Permission denied (publickey)`）⇒ 推镜像这一步**当前只能由 owner 执行**：
+
+    ```sh
+    git push github main v3.3.0          # 需要 gqf2008 身份的凭证
+    # 或：git push https://<token>@github.com/gqf2008/abb.git main v3.3.0
+    ```
+
+  - **落后多少，用命令问，别靠印象**：
+
+    ```sh
+    git fetch github
+    git log --oneline github/main..main | wc -l    # 0 = 已同步
+    git ls-remote --tags github | grep "$(git describe --tags --abbrev=0)" || echo "❌ tag 未镜像"
+    ```
+
+  - **后果不只是「镜像旧」**：GitHub Actions 的 `ci.yml` 也只在镜像上跑，
+    镜像落后多久，那套 windows/ubuntu 覆盖就空窗多久。别把「CI 绿」当成对
+    walgit 最新提交的验证。
   **`release.yml` 跨仓库取 pi-rust 源码时，钉的 SHA 必须是完整 40 位**（`actions/checkout`
   把 `ref` 当分支/标签名 fetch，短 SHA 会直接红在 checkout），且**该 SHA 必须已推到 GitHub
   镜像**——只存在于 walgit 的提交在 CI 里不存在（2026-10-23 首次真跑两个 job 同时踩到）。

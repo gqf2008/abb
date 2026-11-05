@@ -26,7 +26,7 @@
 | 评审方式 `<REVIEW_CMD/流程>` | walgit `review` 条目，`abb-reviewer-N`（**必须与作者不同 principal**） |
 | 定时推进间隔 `<TICK_INTERVAL>` | **无**（本仓不起常驻 CI runner，也不起 cron 轮询） |
 | 决策辅助模型 `<DECISION_MODEL>` | Jev（`jev_ask`），已裁决口径见 `docs/decision-defaults.md` |
-| 跨团队 tracker `<TRACKER>` | **walgit collab thread**（`refs/collab/*`）；GitHub 只是镜像/发布远端 |
+| 跨团队 tracker `<TRACKER>` | **walgit collab thread**（`refs/collab/*`）；GitHub 只是镜像/发布远端，**且镜像不会自动同步**（发布须显式推，见 `docs/walgit-collaboration.md`） |
 
 ### 与通用模板刻意不同的三处（照本仓事实写，不照模板写）
 
@@ -248,7 +248,7 @@ export CARGO_TARGET_DIR=/Volumes/DataExt/tmp/abb-target-abb-<role>   # 每 workt
 
 | 主题 | 文档 |
 | --- | --- |
-| walgit 协作细则：身份/签名/claim/patch/review/merge、MCP 车道、镜像纪律、陈旧即假绿 | [`docs/walgit-collaboration.md`](docs/walgit-collaboration.md) |
+| walgit 协作细则：身份/签名/claim/patch/review/merge、MCP 车道、**镜像纪律（含「必须显式推」与滞后自查命令）**、陈旧即假绿 | [`docs/walgit-collaboration.md`](docs/walgit-collaboration.md) |
 | 什么该问 Jev、什么自己拍；T1–T5 硬触发清单；`decisions` 字段怎么查 | [`docs/decision-making.md`](docs/decision-making.md) |
 | 已裁决的常设口径（D1–D7，带 `request_id`） | [`docs/decision-defaults.md`](docs/decision-defaults.md) |
 | 评审轮数与契约行判据 (a)–(g) | [`docs/review-findings-contract.md`](docs/review-findings-contract.md) |
