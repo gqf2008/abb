@@ -6863,8 +6863,8 @@ pub fn run_gui() -> Result<()> {
             if let Some(w) = sw.upgrade() {
                 w.set_status_is_error(false);
                 w.set_status_line(
-                    "微信扫码登录已迁到 MCP 渠道：用 abb-channel-wechat 的 login / login_status \
-                     工具拿 token，填进该 bot 的 mcp_channel.env（WX_TOKEN 等）后重启。"
+                    "微信扫码登录已迁到 MCP 渠道：用 abb-channel --transport wechat 的 \
+                     login / login_status 工具拿 token，填进该 bot 的 mcp_channel.env（WX_TOKEN 等）后重启。"
                         .into(),
                 );
             }

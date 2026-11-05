@@ -122,6 +122,17 @@ pub struct BridgeSink {
 /// 「顺序无关」这句是自己实测过的：把 1、2 对调后四条测试全绿——那是对的，
 /// 因为它们都返回 `true`。写注释时差点把一个**等价的**顺序约束写成硬约束，
 /// 那会让后来的人以为改了会坏。
+/// 单测入口：让 `config` 侧的迁移测试能对**真实准入函数**断言，
+/// 而不是只比对字段形状（字段对了但语义反了，是这类迁移最典型的错法）。
+#[cfg(test)]
+pub(crate) fn admit_by_for_test(
+    owner_ids: &[String],
+    allow_ungranted: bool,
+    sender_id: &str,
+) -> bool {
+    admit_by(owner_ids, allow_ungranted, sender_id)
+}
+
 fn admit_by(owner_ids: &[String], allow_ungranted: bool, sender_id: &str) -> bool {
     if owner_ids.is_empty() {
         return true;

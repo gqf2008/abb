@@ -79,6 +79,10 @@ Source: "..\crates\abb-agent\target\release\abb-agent.exe"; DestDir: "{app}"; Fl
 ; abb-chart（图形生成，卡 abb-chart-cli-20261013）：由 `agent-bridge chart` 转发调用，
 ; 同样按 current_exe 同目录解析——必须落在 {app} 根，不能放子目录。
 Source: "..\crates\abb-chart\target\release\abb-chart.exe"; DestDir: "{app}"; Flags: ignoreversion
+; abb-channel（渠道 MCP server，三渠道合一）：老配置的 kind: feishu/wechat/dingtalk
+; 在内置渠道退役后由 `--transport <名>` 承载，config 侧 load 时自动迁移。
+; **必须随包**：缺它则升级后既有 bot 全起不来（解析不到命令 ⇒ 迁移放弃 ⇒ 服务退出）。
+Source: "..\crates\abb-channel\target\release\abb-channel.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; ABB 本体 MIT：再分发需附副本。
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "ABB-LICENSE.txt"; Flags: ignoreversion
 ; 随包工具：rg/jq/uv/gh；git/bun/sed/find 明确不随包。
@@ -112,6 +116,9 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM abb-agent.exe"; Flags: ru
 ; abb-chart 是一次性进程（渲染完即退），但升级瞬间可能正在渲染：它锁着 {app}\abb-chart.exe，
 ; 不结束就会让覆盖写失败（与上面同一类问题，只是窗口更小）。
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM abb-chart.exe"; Flags: runhidden; RunOnceId: "AbbKillChart"
+; abb-channel 是常驻子进程（每个 MCP 渠道 bot 一个）：升级瞬间它锁着 {app}\abb-channel.exe，
+; 不先结束会覆盖失败（安装器报文件占用）。
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM abb-channel.exe"; Flags: runhidden; RunOnceId: "AbbKillChannel"
 Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ABB /f"; Flags: runhidden; RunOnceId: "AbbDelRunKey"
 
 [Run]
@@ -150,6 +157,8 @@ begin
   Log('ABB: 结束 agent-bridge.exe rc=' + IntToStr(Rc));
   Exec('taskkill.exe', '/F /T /IM buzz-agent.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   // abb-agent（新执行层）也要收：它可能正跑着工具/shell 子进程。
+  // abb-channel 同理：常驻渠道子进程，卸载/升级时要一并结束。
+  TASK: "abb-channel.exe";
   Exec('taskkill.exe', '/F /T /IM abb-agent.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   // abb-chart（图形生成）：一次性进程，但升级瞬间可能正在渲染——它锁着 {app}\abb-chart.exe，
   // 不结束的话覆盖写会失败（同 RestartManager 关不掉的那类问题，只是窗口更小）。

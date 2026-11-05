@@ -191,10 +191,20 @@ pub fn build(bot: &BotConfig) -> Result<std::sync::Arc<dyn Messenger>> {
     //
     // 这里**必须响亮失败**，不能静默回落任何一个渠道：
     // 拿一种渠道的凭证去连另一种，症状是「bot 在线但收发全乱」，比启动失败难查得多。
+    // 二进制名与参数**必须与现役 crates/abb-channel 对齐**：三个渠道已合成一个
+    // 二进制（`--transport` 分派）。写旧名字会让用户去找一个不再产出的文件，
+    // 而这正是升级后他第一条看到的话（`tools/check_channel_layout.sh` 会盯文档，
+    // 但盯不到这里的字符串字面量——所以下面有单测钉住）。
     let hint = match bot.kind.as_str() {
-        "feishu" => "abb-channel-feishu（FS_APP_ID / FS_APP_SECRET）",
-        "wechat" => "abb-channel-wechat（--dir <目录> + WX_TOKEN / WX_BASE_URL / WX_USER_ID）",
-        "dingtalk" => "abb-channel-dingtalk（DT_APP_ID / DT_APP_SECRET / DT_ROBOT_CODE）",
+        "feishu" => {
+            "abb-channel --transport feishu（env: FS_APP_ID / FS_APP_SECRET）"
+        }
+        "wechat" => {
+            "abb-channel --transport wechat --dir <目录>（env: WX_TOKEN / WX_BASE_URL / WX_USER_ID）"
+        }
+        "dingtalk" => {
+            "abb-channel --transport dingtalk（env: DT_APP_ID / DT_APP_SECRET / DT_ROBOT_CODE）"
+        }
         other => {
             return Err(anyhow::anyhow!(
                 "bot「{}」的 kind=`{other}` 不是 `mcp`；内置渠道已退役，只支持 kind=mcp",
@@ -207,4 +217,70 @@ pub fn build(bot: &BotConfig) -> Result<std::sync::Arc<dyn Messenger>> {
         bot.name,
         bot.kind
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BotConfig;
+
+    fn legacy(kind: &str) -> BotConfig {
+        serde_json::from_str(&format!(
+            r#"{{"name":"legacy","kind":"{kind}","enabled":true}}"#
+        ))
+        .expect("旧配置必须仍能反序列化（否则用户升级后连错误信息都看不到）")
+    }
+
+    /// 内置渠道退役后的错误信息**必须推荐现役二进制**。
+    ///
+    /// 为什么这条要单独钉住：三个渠道合成 `abb-channel --transport <name>` 之后，
+    /// `abb-channel-feishu` / `-wechat` / `-dingtalk` **不再产出**。而这条消息是
+    /// 用户升级后**第一条看到的话**——写旧名字等于让他去找一个不存在的文件。
+    ///
+    /// 第一版真的写错了（合并渠道时漏改这三行），而当时所有守卫都没抓住：
+    /// `tools/check_channel_layout.sh` 只扫 `docs/` 与 crate 的 `[[bin]]`，
+    /// 扫不到 `src/` 里的字符串字面量。所以判据必须落在代码里。
+    #[test]
+    fn retired_kind_hint_names_the_live_binary() {
+        for (kind, expect) in [
+            ("feishu", "--transport feishu"),
+            ("wechat", "--transport wechat"),
+            ("dingtalk", "--transport dingtalk"),
+        ] {
+            let err = build(&legacy(kind))
+                .err()
+                .unwrap_or_else(|| panic!("kind={kind} 必须响亮失败（内置渠道已退役）"))
+                .to_string();
+            assert!(
+                err.contains("abb-channel "),
+                "kind={kind} 的提示必须指向现役二进制 `abb-channel`：{err}"
+            );
+            assert!(
+                err.contains(expect),
+                "kind={kind} 的提示必须带 `{expect}`（三渠道合一靠 --transport 分派）：{err}"
+            );
+            // **反向断言**：绝不能出现旧二进制名。这条才是真正咬住回归的那一半——
+            // 只断言「含 abb-channel」会漏过 `abb-channel-feishu`（它也确实含这个前缀）。
+            for stale in [
+                "abb-channel-feishu",
+                "abb-channel-wechat",
+                "abb-channel-dingtalk",
+            ] {
+                assert!(
+                    !err.contains(stale),
+                    "kind={kind} 的提示里残留已不存在的 `{stale}`：{err}"
+                );
+            }
+        }
+    }
+
+    /// 未知 kind 走另一条分支，也必须拒绝（不能静默回落某个渠道）。
+    #[test]
+    fn unknown_kind_is_rejected_too() {
+        let err = build(&legacy("slack"))
+            .err()
+            .expect("未知 kind 必须失败")
+            .to_string();
+        assert!(err.contains("只支持 kind=mcp"), "{err}");
+    }
 }

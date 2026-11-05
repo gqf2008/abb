@@ -217,13 +217,13 @@ fn dir_channel_bad_message_does_not_block_later_ones() {
     assert_eq!(batch.messages[0].text, "坏消息之后的好消息");
 }
 
-// ── 真渠道：微信 crate（crates/abb-channel-wechat）──────────────────
+// ── 真渠道：微信（crates/abb-channel 的 --transport wechat）──────────
 
-/// `crates/abb-channel-wechat` 的二进制路径。
+/// 渠道二进制路径（三渠道共用一个 `abb-channel`）。
 ///
 /// ## 为什么不能硬编码（评审 a0e0ff0 的 non-blocking，属实）
 ///
-/// 第一版写死了 `/Volumes/DataExt/tmp/abb-target-wx/debug/abb-channel-wechat`。
+/// 第一版写死了作者本机的绝对路径。
 /// 那在作者本机能跑，但：
 /// - 别人机器上没有这个路径 ⇒ 永远走 `[skip]`
 /// - CI 上更是必然 skip（`ci.yml` 不构建这个 crate）
@@ -234,7 +234,7 @@ fn dir_channel_bad_message_does_not_block_later_ones() {
 /// ## 现在的寻址顺序
 ///
 /// 1. `ABB_WECHAT_BIN` 环境变量（`tools/gates.sh` 在跑微信 crate 那组时**会传**）
-/// 2. `target/debug/abb-channel-wechat`（同一次 `cargo build` 的常规产物路径，
+/// 2. `target/debug/abb-channel`（同一次 `cargo build` 的常规产物路径，
 ///    用 `CARGO_TARGET_DIR` 或默认 `target`）
 ///
 /// 都找不到就 `[skip]` **并打印找过哪些路径**——"跳过"必须能看出是环境问题，
@@ -291,7 +291,7 @@ fn channel_bin(transport: &str) -> Option<String> {
 
 /// **用 ABB 的生产协商代码**接真微信 server：能力归纳 + 入站选路。
 ///
-/// 与 `crates/abb-channel-wechat/tests/contract.rs` 的分工：
+/// 与 `crates/abb-channel/tests/wechat_contract.rs` 的分工：
 /// - 那边验「微信 server 自己符合契约」（它自己发的请求）
 /// - 这边验「**ABB 的协商器**能认出它」（走 `build_source` 生产路径）
 ///
@@ -333,7 +333,7 @@ fn abb_negotiates_real_wechat_channel() {
     eprintln!("ABB_WECHAT_E2E_RAN（已起真子进程并完成协商）");
 }
 
-// ── 真渠道：飞书 crate（crates/abb-channel-feishu）──────────────────
+// ── 真渠道：飞书（crates/abb-channel 的 --transport feishu）──────────
 
 /// 飞书 crate 的二进制路径（同一次 `cargo build` 的产物）。
 /// **ABB 的生产协商器必须对飞书选 `Subscribe`，不是 `Poll`**。
@@ -370,7 +370,7 @@ fn abb_negotiates_feishu_via_subscribe_not_poll() {
     eprintln!("ABB_FEISHU_E2E_RAN（订阅路径协商成功，fetch 走的是通知排空）");
 }
 
-// ── 真渠道：钉钉 crate（crates/abb-channel-dingtalk）──────────────────
+// ── 真渠道：钉钉（crates/abb-channel 的 --transport dingtalk）────────
 
 /// **ABB 的生产协商器必须对钉钉选 `Subscribe`**（Stream 是推模型，没有 poll 工具）。
 ///
@@ -408,7 +408,7 @@ fn abb_negotiates_dingtalk_via_subscribe() {
 // server**（我用 `printf` 拼 JSON）。假 server 只证明「ABB 解析器能吃我喂的形状」，
 // **不证明真 crate 返回那个形状**。
 //
-// 这条用真 `abb-channel-feishu` 二进制走一遍：能力协商 → `has_tool` →
+// 这条用真 `abb-channel --transport feishu` 走一遍：能力协商 → `has_tool` →
 // `call_optional` → 解析。它咬住的是两侧**名字与形状**的对接，而那正是
 // 最容易错、且错了不会报错的地方（回落 trait 默认 = 静默降级）。
 

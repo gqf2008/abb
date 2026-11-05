@@ -19,7 +19,7 @@
                                    ▼
               ┌─────────────────────────────────────────────────┐
               │  agent-bridge --service（无头桥守护）            │  锁名 "service"
-              │  src/service.rs 2608 行                          │
+              │  src/service.rs 2625 行                          │
               │  职责：连 IM、收消息、开回合、投递、定时任务      │
               └─────────────────────────────────────────────────┘
 ```
@@ -115,7 +115,7 @@ $AGENT_BRIDGE_HOME 或 ~/.agent-bridge/        （main.rs:97 bridge_dir）
 |---|---|
 | `src/` 顶层 | 见下表 |
 | `src/runtime/`（从上游移植的会话层）**全目录 13727** | 主要 5 个：acp 4888 / harness 4332 / pool 2173 / queue 1536 / oneshot 571；其余 4 个小文件合计 227 |
-| `src/` 合计 | **110919** |
+| `src/` 合计 | **111405** |
 | `ui/app.slint` | 5964 |
 | GUI 三件合计（ui.rs + syschat.rs + 渲染台） | **26148** |
 

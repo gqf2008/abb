@@ -16,6 +16,23 @@ use std::sync::Arc;
 /// 随包执行层的文件名（同一个二进制名在两平台一致，Windows 追加 `.exe` 由调用方处理）。
 const BUNDLED_AGENT: &str = "abb-agent";
 
+/// 随包渠道服务的文件名（三渠道合一，靠 `--transport` 分派）。
+///
+/// 为什么它必须随包：老用户配置里是 `kind: "feishu"/"wechat"/"dingtalk"`（进程内
+/// 内置渠道，不需要任何外部程序）。内置渠道退役后这些 bot 要靠 `abb-channel` 子进程
+/// 承载；若该二进制不随包也不在 `PATH`，升级就等于把用户的 bot 弄死。所以
+/// ①`release.yml` 把它打进 `Contents/MacOS/`，②`config` 侧的自动迁移按这里解析路径。
+const BUNDLED_CHANNEL: &str = "abb-channel";
+
+/// 解析渠道服务命令：主程序同目录随包 `abb-channel` 优先，缺失回落 `PATH abb-channel`。
+///
+/// 返回 `None` 表示两处都没有——此时**不能**瞎迁：迁移出来的 `kind=mcp` 会指向一个
+/// 拉不起来的程序，症状比「内置渠道已退役」更难查。调用方应按「保持原样 + 响亮告警」处理。
+pub(crate) fn resolve_channel_command() -> Option<String> {
+    bundled_agent_in_dir(&[BUNDLED_CHANNEL], None)
+        .or_else(|| crate::deps::find_in_path(BUNDLED_CHANNEL).map(|p| p.display().to_string()))
+}
+
 /// 按给定顺序在「主程序同目录」找随包执行层（找不到该名字就试下一个）。
 fn bundled_agent_in_dir(bundled: &[&str], exe_dir: Option<&std::path::Path>) -> Option<String> {
     let dir = match exe_dir {

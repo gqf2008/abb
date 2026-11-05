@@ -99,6 +99,14 @@ jobs:
       - name: Build abb-chart (aarch64)
         run: cargo build --release --manifest-path crates/abb-chart/Cargo.toml --target aarch64-apple-darwin
 
+      # abb-channel（渠道 MCP server，三渠道合一）：**必须随包**。
+      # 老用户配置里是 `kind: "feishu"/"wechat"/"dingtalk"`（进程内内置渠道，不需要外部程序），
+      # 内置渠道退役后这些 bot 由本二进制的 `--transport <名>` 承载；`config` 侧在 load 时
+      # 自动迁移（`migrate_builtin_channels_to_mcp`）。缺了它，升级后既有 bot 一个都起不来
+      # ⇒「没有可用 bot，退出」⇒ 看门狗不再拉起。升级无感依赖这一步。
+      - name: Build abb-channel (aarch64)
+        run: cargo build --release --manifest-path crates/abb-channel/Cargo.toml --target aarch64-apple-darwin
+
       - name: Assemble ABB.app and sign (hardened runtime + timestamp)
         run: |
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
@@ -114,6 +122,8 @@ jobs:
           # abb-chart（图形生成，卡 abb-chart-cli-20261013）：与 abb-agent 同目录随包，
           # 由 `agent-bridge chart` 转发调用（同目录查找见 src/main.rs::bundled_chart_path_in）。
           cp crates/abb-chart/target/aarch64-apple-darwin/release/abb-chart ABB.app/Contents/MacOS/
+          # abb-channel：与 agent-bridge 同目录（`resolve_channel_command` 按此查找）。
+          cp crates/abb-channel/target/aarch64-apple-darwin/release/abb-channel ABB.app/Contents/MacOS/
           cp LICENSE ABB.app/Contents/Resources/ABB-LICENSE.txt
           cp app-assets/Info.plist ABB.app/Contents/Info.plist
           cp app-assets/AppIcon.icns ABB.app/Contents/Resources/ 2>/dev/null || true
@@ -157,6 +167,10 @@ jobs:
           # 内部可执行会被 Gatekeeper 拦（`agent-bridge chart` 转发直接失败）。带上 entitlements
           # 与其它内部可执行保持一致（多签不影响，少签才是静默失败）。
           sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-chart
+          # abb-channel 会 spawn 网络连接、并读 FS_*/WX_*/DT_* 环境变量；不碰 TCC，
+          # 但同样必须签名（hardened runtime 下未签名的内部可执行会被拦，
+          # 症状是「渠道进程拉不起来 ⇒ bot 全挂」）。与其它内部可执行同口径。
+          sign --force --options runtime --timestamp --entitlements "$ENT" --sign "$IDENTITY" ABB.app/Contents/MacOS/abb-channel
           # 随包工具清单从 tools/tool-lock.tsv 生成（唯一事实源）——不再另手抄一份枚举，
           # 否则加/删工具时会静默漏签（`--require-bundled-tools` 只查 PATH 解析、不查签名）。
           # 签名清单 = tool-lock 的包产物名 **∪** 多调包按名暴露的工具名，**按平台过滤**
@@ -273,10 +287,16 @@ jobs:
       - name: Build abb-chart
         run: cargo build --release --manifest-path crates/abb-chart/Cargo.toml
 
+      # abb-channel（渠道 MCP server，三渠道合一）：**必须随包**，理由同 macOS 侧——
+      # 老配置的 `kind: feishu/wechat/dingtalk` 在内置渠道退役后由它承载，
+      # `config` 侧 load 时自动迁移；缺它则升级后既有 bot 全起不来。
+      - name: Build abb-channel
+        run: cargo build --release --manifest-path crates/abb-channel/Cargo.toml
+
       # #331 守卫：**分发的产物**不许依赖 VC++ Redistributable。
       # 背景：用户首次安装即报「找不到 VCRUNTIME140.dll」——MSVC 默认动态 CRT，
       # 而这两个 DLL 来自 Redist，干净 Windows 上没有。修法见 .cargo/config.toml
-      # 的 +crt-static；这条守卫保证「修完不许回退」。**三个 exe 都要查**：
+      # 的 +crt-static；这条守卫保证「修完不许回退」。**每个分发的 exe 都要查**：
       # abb-agent.exe 由 agent-bridge 派生运行，abb-chart.exe 由 `agent-bridge chart` 转发运行
       # ——两者都缺 DLL 的话，会在第一次真用到时才炸（装完第一次聊天看不出问题）。
       # 守卫本身已用「坏样本/好样本」在本机验过会红/会绿（tools/check_dynamic_crt.sh）。
@@ -286,12 +306,13 @@ jobs:
           bash tools/check_dynamic_crt.sh \
             target/release/agent-bridge.exe \
             crates/abb-agent/target/release/abb-agent.exe \
+            crates/abb-channel/target/release/abb-channel.exe \
             crates/abb-chart/target/release/abb-chart.exe
           # 可见性：把真实导入表打出来（llvm-objdump 随 rustup，取不到就跳过，不阻塞）
           if rustup component add llvm-tools-preview >/dev/null 2>&1; then
             OBJDUMP=$(find "$(rustc --print sysroot)" -type f -name 'llvm-objdump*' 2>/dev/null | head -1)
             if [ -n "$OBJDUMP" ]; then
-              for f in target/release/agent-bridge.exe crates/abb-agent/target/release/abb-agent.exe crates/abb-chart/target/release/abb-chart.exe; do
+              for f in target/release/agent-bridge.exe crates/abb-agent/target/release/abb-agent.exe crates/abb-chart/target/release/abb-chart.exe crates/abb-channel/target/release/abb-channel.exe; do
                 echo "── $f 的导入表："
                 "$OBJDUMP" -p "$f" | grep -i "DLL Name" || true
               done

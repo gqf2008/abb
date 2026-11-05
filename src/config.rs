@@ -568,7 +568,17 @@ impl BotConfig {
     /// 缺哪些凭证（仅人读，用于 missing() 报错）。
     fn missing_fields(&self) -> Vec<String> {
         let mut v = Vec::new();
-        if self.is_wechat() {
+        // `kind=mcp` 要的不是平台凭证，而是「拉得起来一个渠道 server」。
+        // **这一支曾经缺失**：`missing()` 是 service 的启动硬闸（不满足直接 exit(1)），
+        // 所以缺了它 ⇒ 任何 MCP 渠道 bot 都被误报「缺 app_id/app_secret」⇒
+        // 整个服务起不来。内置渠道退役后所有 bot 都该走这条，漏了就是全站不可用。
+        if self.is_mcp() {
+            match self.mcp_channel.as_ref() {
+                Some(c) if c.is_usable() => {}
+                Some(_) => v.push("mcp_channel.command（渠道 server 的命令）".to_string()),
+                None => v.push("mcp_channel（kind=mcp 必须配渠道 server）".to_string()),
+            }
+        } else if self.is_wechat() {
             if self.wx_token.is_empty() {
                 v.push("wx_token（微信需先扫码登录）".to_string());
             }
@@ -1160,6 +1170,43 @@ pub enum MentionModeSave {
     Failed,
 }
 
+/// “旧配置没有任何 owner 名单”这个事实的载体。
+///
+/// 旧语义是「名单为空 ⇒ 拒绝所有人」（`access_allows`），而 MCP 渠道的
+/// `admit_by` 把空名单读成「全部放行」。为避免迁移**静默扩大暴露面**，
+/// 这条不可匹配的哨兵值与 `allow_ungranted=false` 一起把「全拒」原样搬到新语义。
+/// 它出现在用户配置里是**有意为之**：用户看到后会去填真正的 owner。
+pub(crate) const NO_OWNER_SENTINEL: &str = "__abb_no_owner__";
+
+/// 迁移说明只在进程内打印一次（`Config::load` 会被 GUI 与 service 各调一遍）。
+static MIGRATION_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 把 bot 名压成安全的单层目录名（微信二维码目录用）。
+///
+/// 只保留字母/数字/`-`/`_`，其余折叠成 `-`，并挡掉 `.` / `..`——
+/// 这个名字来自用户输入，直接拼路径会给出 `../` 穿越的机会。
+fn sanitize_dir_name(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() || out == "." || out == ".." {
+        "bot".to_string()
+    } else {
+        out
+    }
+}
+
 impl Config {
     pub fn path() -> PathBuf {
         crate::bridge_dir().join("config.json")
@@ -1176,9 +1223,129 @@ impl Config {
             serde_json::from_str(&text).with_context(|| "config.json 不是合法 JSON")?;
         cfg.migrate_legacy();
         cfg.migrate_ding_owner();
+        // 内置渠道退役后的自动迁移（升级无感）：必须排在 migrate_legacy 之后——
+        // 后者会把旧单 bot 顶层字段造成 `kind="feishu"` 的 bots[0]，那一条也要迁。
+        // 迁移发生在**内存**里（每次 load 都跑，天然幂等）；只在进程内首次说明一次，
+        // 否则 Config::load 被 GUI/service 各调一遍，同一句话会刷三行。
+        let moved = cfg
+            .migrate_builtin_channels_to_mcp(crate::service::resolve_channel_command().as_deref());
+        if !moved.is_empty() && !MIGRATION_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!(
+                "[config] 内置渠道已退役：{} 个 bot 自动迁为 kind=mcp（abb-channel 子进程）：{}。\
+                 原 kind/凭据字段保留不动；迁移在内存生效，设置窗保存后落盘。",
+                moved.len(),
+                moved.join("、")
+            );
+        }
         // #174：内存分配同名 suffix（确定性；GUI 保存时落盘固化）
         cfg.assign_unique_keys();
         Ok(cfg)
+    }
+
+    /// 把已退役的内置渠道（`kind` = feishu/wechat/dingtalk）自动迁成 `kind=mcp`。
+    ///
+    /// **为什么必须自动迁**：内置渠道退役（`9a0b7ef`）后 `messenger::build` 对这三种
+    /// `kind` 响亮失败，而失败发生在 bot 装配第一遍——一个失败都没有的 bot 会走到
+    /// 「没有可用 bot，退出」→ `exit(1)` → `set_desired(false)`，**看门狗从此不再拉起**。
+    /// 也就是说不迁移的后果不是「这个 bot 不工作」，而是「用户的 ABB 整个静默停摆」。
+    /// 升级必须对用户无感，所以配置在 load 时就地转换。
+    ///
+    /// **准入语义必须原样保住**（这条比迁移本身更容易出错）。旧 `access_allows` 是
+    /// 「名单非空且命中才放行」，**名单为空 = 拒绝所有人**；而 MCP 渠道的 `admit_by`
+    /// 把 `owner_ids` **为空读成「全部放行」**（只是都进受限档）。两者对「空名单」的
+    /// 解释正好相反，直接搬会让原本谁都不理的 bot 开始回陌生人，是静默扩大暴露面。
+    ///
+    /// 所以名单为空时写入 `NO_OWNER_SENTINEL`（永不匹配任何真实 sender，配合
+    /// `allow_ungranted=false` 得到「全拒」），把旧语义一字不差地保住。
+    ///
+    /// 幂等：已有 `mcp_channel` 的 bot 一律跳过；非内置 kind 一律跳过。
+    /// 返回被迁移的 bot 名（供日志）；解析不到渠道命令时返回空 [`Vec`] 并保持原样。
+    pub(crate) fn migrate_builtin_channels_to_mcp(
+        &mut self,
+        channel_cmd: Option<&str>,
+    ) -> Vec<String> {
+        let Some(cmd) = channel_cmd.map(str::trim).filter(|c| !c.is_empty()) else {
+            return Vec::new();
+        };
+        let mut moved = Vec::new();
+        for bot in &mut self.bots {
+            if bot.mcp_channel.is_some() {
+                continue;
+            }
+            let transport = match bot.kind.as_str() {
+                "feishu" => "feishu",
+                "wechat" => "wechat",
+                "dingtalk" => "dingtalk",
+                _ => continue,
+            };
+            let mut env: Vec<crate::channel_mcp::McpEnvVar> = Vec::new();
+            let push = |k: &str, v: &str, env: &mut Vec<crate::channel_mcp::McpEnvVar>| {
+                if !v.trim().is_empty() {
+                    env.push(crate::channel_mcp::McpEnvVar {
+                        name: k.to_string(),
+                        value: v.to_string(),
+                    });
+                }
+            };
+            // 字段名以 `crates/abb-channel` 实际读的 env 为准（见该 crate 三个 transport 的
+            // `env(...)` 调用）；写错名字的症状是「渠道起来了但连不上平台」。
+            match transport {
+                "feishu" => {
+                    push("FS_APP_ID", &bot.app_id, &mut env);
+                    push("FS_APP_SECRET", &bot.app_secret, &mut env);
+                }
+                "wechat" => {
+                    push("WX_TOKEN", &bot.wx_token, &mut env);
+                    push("WX_BASE_URL", &bot.wx_base_url, &mut env);
+                    push("WX_USER_ID", &bot.wx_user_id, &mut env);
+                    push("WX_CDN_BASE_URL", &bot.wx_cdn_base_url, &mut env);
+                }
+                _ => {
+                    push("DT_APP_ID", &bot.app_id, &mut env);
+                    push("DT_APP_SECRET", &bot.app_secret, &mut env);
+                    push("DT_ROBOT_CODE", &bot.ding_robot_code, &mut env);
+                }
+            }
+            // 旧两套名单字段（飞书用 owner_open_id，钉钉用 ding_owner_ids；微信旧语义
+            // 恒放行，见 `access_allows` 的 `is_wechat` 提前 return）。
+            let legacy_owners = if bot.is_dingtalk() {
+                bot.ding_owner_ids.trim()
+            } else {
+                bot.owner_open_id.trim()
+            };
+            let owner_ids: Vec<String> = if transport == "wechat" {
+                // 微信旧语义：不按 sender 限制 ⇒ 传空名单即等价（空 = 全放行）。
+                Vec::new()
+            } else if legacy_owners.is_empty() {
+                vec![NO_OWNER_SENTINEL.to_string()]
+            } else {
+                legacy_owners
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            let mut args = vec!["--transport".to_string(), transport.to_string()];
+            if transport == "wechat" {
+                // 微信的扫码登录把二维码落在 `--dir`；按 bot 分目录，避免两个微信 bot 互踩。
+                let dir = crate::bridge_dir()
+                    .join("channels")
+                    .join(sanitize_dir_name(&bot.name));
+                args.push("--dir".to_string());
+                args.push(dir.display().to_string());
+            }
+            bot.mcp_channel = Some(crate::channel_mcp::McpServerConfig {
+                name: transport.to_string(),
+                command: cmd.to_string(),
+                args,
+                env,
+                owner_ids,
+                allow_ungranted: false,
+            });
+            moved.push(bot.name.clone());
+            bot.kind = "mcp".to_string();
+        }
+        moved
     }
 
     /// 把旧单 bot 顶层字段迁移成 bots[0]（仅当 bots 为空且旧字段有值）。
@@ -2991,6 +3158,221 @@ mod tests {
         let back_old: Config = serde_json::from_str(old).unwrap();
         assert!(back_old.bots[0].mention_modes.is_empty(), "旧文件兼容缺省");
     }
+}
+// ── 内置渠道退役后的自动迁移（升级无感）─────────────────────────────────
+
+#[cfg(test)]
+fn legacy_bot(kind: &str) -> BotConfig {
+    serde_json::from_str(&format!(
+        r#"{{"name":"我的{kind}","kind":"{kind}","enabled":true}}"#
+    ))
+    .expect("旧配置必须仍可反序列化")
+}
+
+#[cfg(test)]
+fn cfg_with(bots: Vec<BotConfig>) -> Config {
+    Config {
+        bots,
+        ..Default::default()
+    }
+}
+
+/// 三种内置渠道都要迁成 `kind=mcp`，且带 `--transport <同名>`。
+///
+/// 不迁的后果不是「这个 bot 不工作」，而是整个服务 `exit(1)` 并让看门狗
+/// 不再拉起（见 `migrate_builtin_channels_to_mcp` 的文档）。
+#[test]
+fn builtin_channels_migrate_to_mcp_with_transport() {
+    for kind in ["feishu", "wechat", "dingtalk"] {
+        let mut c = cfg_with(vec![legacy_bot(kind)]);
+        let moved = c.migrate_builtin_channels_to_mcp(Some("/bundled/abb-channel"));
+        assert_eq!(moved.len(), 1, "kind={kind} 应被迁移");
+        let b = &c.bots[0];
+        assert_eq!(b.kind, "mcp", "kind={kind} 迁移后必须是 mcp");
+        let ch = b.mcp_channel.as_ref().expect("必须配上 mcp_channel");
+        assert_eq!(ch.command, "/bundled/abb-channel");
+        assert_eq!(
+            &ch.args[..2],
+            &["--transport".to_string(), kind.to_string()],
+            "kind={kind} 的 args 必须以 --transport {kind} 开头"
+        );
+        assert!(b.credentials_ready(), "kind={kind} 迁移后应视为就绪");
+    }
+}
+
+/// **幂等**：已迁过或有 `mcp_channel` 的不再动（load 每次都跑）。
+#[test]
+fn migration_is_idempotent() {
+    let mut c = cfg_with(vec![legacy_bot("feishu")]);
+    assert_eq!(
+        c.migrate_builtin_channels_to_mcp(Some("/b/abb-channel"))
+            .len(),
+        1
+    );
+    let first = c.bots[0].clone();
+    assert_eq!(
+        c.migrate_builtin_channels_to_mcp(Some("/b/abb-channel"))
+            .len(),
+        0,
+        "第二次必须无事可做"
+    );
+    assert_eq!(c.bots[0].kind, first.kind);
+    assert_eq!(c.bots[0].mcp_channel, first.mcp_channel);
+}
+
+/// 解析不到渠道二进制时**不许瞎迁**：迁出来的 mcp 指向拉不起来的程序，
+/// 比「内置渠道已退役」更难查。保持原样 + 上层报错。
+#[test]
+fn migration_skips_when_binary_missing() {
+    let mut c = cfg_with(vec![legacy_bot("feishu")]);
+    assert!(c.migrate_builtin_channels_to_mcp(None).is_empty());
+    assert_eq!(c.bots[0].kind, "feishu", "不应改动");
+    assert!(c.bots[0].mcp_channel.is_none());
+    assert!(c.migrate_builtin_channels_to_mcp(Some("   ")).is_empty());
+}
+
+/// **安全项**：旧语义「owner 名单为空 ⇒ 拒绝所有人」，新语义「名单为空 ⇒ 全放行」。
+/// 迁移必须把「全拒」原样保住，否则原本谁都不理的 bot 开始回陌生人。
+#[test]
+fn empty_legacy_owner_list_must_not_become_allow_all() {
+    let mut c = cfg_with(vec![legacy_bot("feishu")]);
+    c.migrate_builtin_channels_to_mcp(Some("/b/abb-channel"));
+    let ch = c.bots[0].mcp_channel.as_ref().unwrap();
+    assert_eq!(
+        ch.owner_ids,
+        vec![NO_OWNER_SENTINEL.to_string()],
+        "空名单必须落成不可匹配的哨兵，而不是空 Vec（空 Vec = 全放行）"
+    );
+    assert!(!ch.allow_ungranted);
+    // 用真实准入函数验一遍，而不是只看字段——这才是用户实际承受的语义。
+    // 探针取三个平台**真实存在**的 id 形状：飞书 open_id、微信 wxid、钉钉 userid。
+    //
+    // **残余风险（有意接受，写在这里而不是藏起来）**：哨兵是普通字符串，`admit_by`
+    // 也只是字符串比较，所以「sender_id 恰好等于哨兵」在原理上能通过。之所以接受：
+    // `sender_id` 不是对端自选，而是 abb-channel 从平台读回来的（飞书 `ou_…` /
+    // 微信 `wxid_…` / 钉钉 userid），三个平台的 id 空间都不产出 `__abb_no_owner__`
+    // 这种形状。换成「空 owner_ids + allow_ungranted=false」则是**确定**的全放行，
+    // 比这个残余危险得多。
+    for probe in [
+        "ou_7d8a1e2f3b4c5d6e7f8a9b0c1d2e3f4a",
+        "wxid_abc123",
+        "manager1234",
+        "",
+    ] {
+        assert!(
+            !crate::mcp_channel_loop::admit_by_for_test(&ch.owner_ids, ch.allow_ungranted, probe),
+            "旧空名单的 bot 不应放行 sender={probe:?}"
+        );
+    }
+}
+
+/// 有 owner 名单的：精确搬过来，且仍只放行名单内的人。
+#[test]
+fn legacy_owner_list_is_carried_over() {
+    let mut b = legacy_bot("feishu");
+    b.owner_open_id = "ou_a, ou_b".to_string();
+    let mut c = cfg_with(vec![b]);
+    c.migrate_builtin_channels_to_mcp(Some("/b/abb-channel"));
+    let ch = c.bots[0].mcp_channel.as_ref().unwrap();
+    assert_eq!(ch.owner_ids, vec!["ou_a".to_string(), "ou_b".to_string()]);
+    assert!(crate::mcp_channel_loop::admit_by_for_test(
+        &ch.owner_ids,
+        false,
+        "ou_a"
+    ));
+    assert!(!crate::mcp_channel_loop::admit_by_for_test(
+        &ch.owner_ids,
+        false,
+        "ou_c"
+    ));
+}
+
+/// 微信旧语义恒放行（`access_allows` 对 wechat 提前 return true）⇒ 迁成空名单。
+#[test]
+fn wechat_keeps_open_admission() {
+    let mut c = cfg_with(vec![legacy_bot("wechat")]);
+    c.migrate_builtin_channels_to_mcp(Some("/b/abb-channel"));
+    let ch = c.bots[0].mcp_channel.as_ref().unwrap();
+    assert!(ch.owner_ids.is_empty(), "微信旧语义是恒放行，不能凭空收紧");
+    assert!(crate::mcp_channel_loop::admit_by_for_test(
+        &ch.owner_ids,
+        false,
+        "anyone"
+    ));
+    // 微信要 --dir（扫码二维码落点）
+    assert!(
+        ch.args.iter().any(|a| a == "--dir"),
+        "微信必须带 --dir：{:?}",
+        ch.args
+    );
+}
+
+/// 凭据字段要翻成渠道真读的 env 名（写错名的症状是「起来了但连不上平台」）。
+#[test]
+fn credential_fields_map_to_channel_env_names() {
+    let cases = [
+        ("feishu", "FS_APP_ID", "FS_APP_SECRET", None),
+        (
+            "dingtalk",
+            "DT_APP_ID",
+            "DT_APP_SECRET",
+            Some("DT_ROBOT_CODE"),
+        ),
+        ("wechat", "WX_TOKEN", "WX_BASE_URL", None),
+    ];
+    for (kind, k1, k2, k3) in cases {
+        let mut b = legacy_bot(kind);
+        b.app_id = "id1".into();
+        b.app_secret = "sec1".into();
+        b.ding_robot_code = "robot1".into();
+        b.wx_token = "tok1".into();
+        b.wx_base_url = "http://b".into();
+        b.wx_user_id = "u1".into();
+        let mut c = cfg_with(vec![b]);
+        c.migrate_builtin_channels_to_mcp(Some("/b/abb-channel"));
+        let ch = c.bots[0].mcp_channel.as_ref().unwrap();
+        let names: Vec<&str> = ch.env.iter().map(|e| e.name.as_str()).collect();
+        for want in [k1, k2].into_iter().chain(k3) {
+            assert!(
+                names.contains(&want),
+                "kind={kind} 缺 env {want}：{names:?}"
+            );
+        }
+    }
+}
+
+/// `missing()` 是 service 的**启动硬闸**（不满足直接 `exit(1)` 并让看门狗停拉）。
+/// `kind=mcp` 的 bot 不能被误报「缺 app_id/app_secret」——否则 MCP 渠道永远起不来。
+#[test]
+fn mcp_bot_is_not_reported_missing_platform_credentials() {
+    let mut c = cfg_with(vec![legacy_bot("feishu")]);
+    c.bots[0].app_id = String::new();
+    c.bots[0].app_secret = String::new();
+    c.migrate_builtin_channels_to_mcp(Some("/b/abb-channel"));
+    assert!(
+        c.missing().is_empty(),
+        "迁移后的 mcp bot 不该报缺凭证：{:?}",
+        c.missing()
+    );
+
+    // 反过来：真没配渠道时必须报出来，不能静默放行一个拉不起来的 bot。
+    let mut bare = cfg_with(vec![legacy_bot("feishu")]);
+    bare.bots[0].kind = "mcp".to_string();
+    bare.bots[0].mcp_channel = None;
+    assert!(
+        bare.missing().iter().any(|m| m.contains("mcp_channel")),
+        "kind=mcp 却没配渠道必须报缺：{:?}",
+        bare.missing()
+    );
+}
+
+/// 目录名清洗必须挡掉路径穿越（名字来自用户输入）。
+#[test]
+fn channel_dir_name_has_no_traversal() {
+    assert_eq!(sanitize_dir_name("../../etc"), "etc");
+    assert_eq!(sanitize_dir_name(".."), "bot");
+    assert_eq!(sanitize_dir_name(""), "bot");
+    assert_eq!(sanitize_dir_name("我的 飞书"), "我的-飞书");
 }
 
 #[test]

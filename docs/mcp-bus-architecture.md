@@ -226,9 +226,23 @@ MCP 渠道的 `sender_id` 是**渠道服务自报**的字符串，ABB 没有任�
 #### 从内置渠道迁到 MCP 渠道
 
 **内置渠道已于 2026-11-04 退役**（`src/{feishu,wechat,dingtalk,ws,proto}.rs` 全部删除）。
-所以现在**只有 `kind = "mcp"` 能启动**：配置文件里留着 `kind = "feishu"` 的 bot
-会在启动时报错并指到本节，不会静默降级。
+所以现在**只有 `kind = "mcp"` 能启动**。
 
+**但老配置不需要你动手**：`Config::load()` 会把 `kind` 为 `feishu`/`wechat`/`dingtalk`
+的 bot **自动就地迁成 `kind=mcp`**（`Config::migrate_builtin_channels_to_mcp`）——
+`abb-channel` 随包分发，所以升级后既有 bot 照常工作，用户无感。要点：
+
+- 迁移在**内存**里做，每次 load 都跑（幂等）；在设置窗保存一次才落盘固化。
+- 原 `app_id`/`app_secret` 等字段**保留不动**，只是同时翻成渠道要的
+  `FS_*` / `DT_*` / `WX_*` env。
+- **准入语义原样保住**：旧语义「owner 名单为空 = 拒绝所有人」，而 MCP 渠道的
+  `owner_ids` 为空等于「全部放行」；迁移在空名单时写入不可匹配的哨兵
+  `__abb_no_owner__`（`allow_ungranted=false`）来维持「全拒」，
+  所以升级不会把原本谁都不理的 bot 变成回陌生人。
+- 找不到 `abb-channel`（既不同目录也不在 `PATH`）时**不迁移**并响亮告警——
+  迁成一个拉不起来的 `kind=mcp` 比报错更难查。
+
+下面这份手写步骤只在你要**改配置/换渠道/新装**时需要。
 **一条飞书 bot 的迁移步骤**：
 
 1. 记下原 bot 的 `app_id` / `app_secret`（`config.json` 里那一项）
