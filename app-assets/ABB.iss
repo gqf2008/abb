@@ -157,9 +157,9 @@ begin
   Log('ABB: 结束 agent-bridge.exe rc=' + IntToStr(Rc));
   Exec('taskkill.exe', '/F /T /IM buzz-agent.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   // abb-agent（新执行层）也要收：它可能正跑着工具/shell 子进程。
-  // abb-channel 同理：常驻渠道子进程，卸载/升级时要一并结束。
-  TASK: "abb-channel.exe";
   Exec('taskkill.exe', '/F /T /IM abb-agent.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
+  // abb-channel 同理：常驻渠道子进程（每个 MCP 渠道 bot 一个），卸载/升级时要一并结束。
+  Exec('taskkill.exe', '/F /T /IM abb-channel.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   // abb-chart（图形生成）：一次性进程，但升级瞬间可能正在渲染——它锁着 {app}\abb-chart.exe，
   // 不结束的话覆盖写会失败（同 RestartManager 关不掉的那类问题，只是窗口更小）。
   Exec('taskkill.exe', '/F /T /IM abb-chart.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);

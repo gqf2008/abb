@@ -306,6 +306,13 @@ tools/check_channel_tool_names.sh
 # rustls+ring+webpki-roots，约 4 MB 的 HTTPS 地板付了三遍（15.3 MB → 6.9 MB）。
 # 拆回去在功能/测试里**都不会报错**，只在发版体积上悄悄变差 ⇒ 让脚本盯。
 tools/check_channel_layout.sh
+# `app-assets/ABB.iss` 在 macOS 上**编译不了**（ISCC 只有 Windows 有），所以它的语法错
+# 在本地门禁里完全看不见，只有发版时才会在 Windows release job 里炸。
+# 2026-11-05 真实事故：给 [UninstallRun] 加 abb-channel 时把 `TASK: "abb-channel.exe";`
+# 插进了 [Code] 的 Pascal 函数体 ⇒ 本地 40 项全绿，Windows 安装包直接没产出。
+# 这条只查文本层能确定的错（段名白名单/缩进段头/段专属行串段/begin-end 配对），
+# 不假装是 ISCC——但那几类恰好是"插错位置"的全部形态。
+tools/check_iss_structure.sh
 # 变异自测：证明上面那些自测**真的能咬住回归**（评审 B3 的教训——手工变异逃逸过两次）。
 # 它在临时副本里改代码、跑自测、销毁，主检出不受影响。
 tools/review-cadence/mutation-selftest.sh
