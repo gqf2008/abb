@@ -18,6 +18,7 @@
 | D4 | 卡 `abb-cadence-rounds-escalation-20261102` 的落地路径 | **另开落地线程 + 独立重新 approve** | A 1.0 / conf 1.0 | `gen-dec-1793612338-kZCJBNtNUCvvznZdRw79` |
 | D5 | 渠道配置入口形态（S3 要不要删界面三格） | **保留 GUI 三格**，S3 搁置；不做 auto-restart | 删界面 p=0.16 / 风险 `noul` **0.85**；保留界面 0.40 | `gen-dec-1793774253-ZSn01oFM5wPZoBBBtZMl` |
 | D6 | 「代填 config.json 后不生效」这半条腿怎么补 | **加 `agent-bridge restart` 子命令**（受限会话默认拒；服务没在跑时拒，退出码 2）；**不做** auto-restart | 子命令 **0.68 / conf 0.57**；auto-restart 0.11 / `noul` **0.79** | `gen-dec-1793786946-bpRsuC28O5E7ICVo3h3V` |
+| D7 | 要不要写适配器把 `agent-channel`（Zig，`claude/channel` 私有能力）接成 ABB 契约 | **不写**；也**不退役** `abb-channel` 换它 | 适配器价值 **0.09 / conf 0.82**（p(0)=0.91）；`build_now` p=**0.00**；`noul` **0.76**；「那该用什么办法」`alternative` 0.54 vs `defer` 0.45，**conf 仅 0.39 ⇒ 那半截 Jev 在猜** | `gen-dec-1793873735-1h2cSsyKofJytboYkIz3` |
 
 ### 口径的适用边界（写清楚，避免被套用过头）
 
@@ -31,6 +32,11 @@
 - **D6**：`restart` 只能管「已写入的配置生效」，**不能写配置**（所以不新增授权面）；
   对「服务没在跑」它必须拒——`svc_restart` 是停+起不看状态，会绕过 owner 的停止意图。
 - **D2**：只约束「本卡交付范围」，不约束「HTML 该不该做」——那是后续卡的事。
+- **D7**：只约束「现在不写适配器」。**特别说明**——`alternative`（改别的办法）与 `defer`
+  几乎并列且 `conf=0.39`，所以**不能**把这条读成「已决定该走 agent-channel 那条路」。
+  它的强结论只有两个：适配器价值近零（0.82 置信）、现在投入风险偏高（`noul` 0.76）。
+  真正没答的问题仍在：「两份渠道实现（Rust `abb-channel` / Zig `agent-channel`）长期怎么收」——
+  真要动那件事，按 T3 重问一次，别引用本条当授权。
 
 ## 判据：`decisions` 字段怎么查
 
