@@ -112,7 +112,10 @@ jobs:
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           # Info.plist 版本号与 Cargo.toml 保持一致
-          sed -i '' "s|<string>2\.[0-9]*\.[0-9]*</string>|<string>$VERSION</string>|g" app-assets/Info.plist
+          # 匹配**任意** semver，不要写死大版本：旧写法是 `2\.[0-9]*\.[0-9]*`，
+          # 一旦版本号进了 3.x 就再也匹配不到 ⇒ Info.plist 的版本号静默停在旧值
+          # （Finder「显示简介」与安装包版本对不上，且不会有任何报错）。
+          sed -i '' -E "s|<string>[0-9]+\.[0-9]+\.[0-9]+</string>|<string>$VERSION</string>|g" app-assets/Info.plist
           mkdir -p ABB.app/Contents/MacOS ABB.app/Contents/Resources
           cp target/aarch64-apple-darwin/release/agent-bridge ABB.app/Contents/MacOS/
           # 2026-10-04 去提权：abb-helper（#129 锁屏特权助手）已随 v2.23.95 删除 ——
