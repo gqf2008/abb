@@ -7,7 +7,7 @@
 //!
 //! | 方向 | 契约 | 本进程的实现 |
 //! |---|---|---|
-//! | 出站 | 工具 `send_text`（必需） | ✅ 走 `dingtalk::DingTalkClient::send_text`（超长自动分段） |
+//! | 出站 | 工具 `send_text`（必需） | ✅ 走 `client::DingTalkClient::send_text`（超长自动分段） |
 //! | 出站 | 工具 `send_thread_reply`（可选） | ❌ **不声明**：钉钉**没有话题概念** |
 //! | 出站 | 工具 `send_attachment`（可选） | ✅ base64 内联 → `media/upload` → 图片/文件消息 |
 //! | 出站 | 工具 `create_chat`（可选） | ✅ `topapi/im/chat/create`（`owner_user_id` 同时作群主与唯一成员） |
@@ -79,7 +79,7 @@
 //! `DT_ROBOT_CODE` 缺省回落到 `DT_APP_ID`（钉钉里两者通常同值，都是应用的 AppKey）；
 //! 两者都空 ⇒ 出站工具**明确报错**，而不是发一条注定被平台拒的请求。
 
-mod dingtalk;
+mod client;
 mod wsin;
 
 use std::collections::{HashMap, VecDeque};
@@ -88,7 +88,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use dingtalk::{DingTalkClient, DingtalkAttachment, DingtalkMessage};
+use client::{DingTalkClient, DingtalkAttachment, DingtalkMessage};
 use serde_json::{json, Value};
 
 /// 入站资源的 URI（契约 §3.2 的 A 方案，整渠道一个 inbox）。
@@ -337,7 +337,7 @@ impl Channel {
     }
 }
 
-fn main() {
+pub fn run() {
     // 凭证从环境变量拿（ABB 的 `mcp_channel.env` 下发）——渠道配置由提供方决定，
     // 本进程不认识 ABB 的 config.json。
     let app_id = std::env::var("DT_APP_ID").unwrap_or_default();
@@ -667,28 +667,28 @@ enum SendPlan {
 
 fn send_plan(kind: &str, name: &str) -> Result<SendPlan, String> {
     match kind {
-        "image" if dingtalk::dingtalk_image_uploadable(name) => Ok(SendPlan::Image),
+        "image" if client::dingtalk_image_uploadable(name) => Ok(SendPlan::Image),
         "image" => Err(format!(
             "钉钉机器人发送图片失败：仅支持 {}；当前图片={name}",
-            dingtalk::DINGTALK_IMAGE_EXTS.join("/")
+            client::DINGTALK_IMAGE_EXTS.join("/")
         )),
         "file" => {
-            if let Some(ft) = dingtalk::dingtalk_file_type(name) {
+            if let Some(ft) = client::dingtalk_file_type(name) {
                 return Ok(SendPlan::File(ft));
             }
             // kind 说文件、后缀却是图片：`sampleFile` 的 fileType 白名单里没有 png/jpg，
             // 硬发必被拒；按图片发能成（ABB 的 kind 由后缀推导，正常不会走到这里）。
-            if dingtalk::dingtalk_image_uploadable(name) {
+            if client::dingtalk_image_uploadable(name) {
                 return Ok(SendPlan::Image);
             }
             Err(format!(
                 "钉钉机器人发送文件失败：仅支持 {}；当前文件={name}",
-                dingtalk::DINGTALK_FILE_EXTS.join("/")
+                client::DINGTALK_FILE_EXTS.join("/")
             ))
         }
         _ => Err(format!(
             "钉钉机器人暂不支持该附件类型：kind={kind} 文件={name}；当前支持图片与 {}",
-            dingtalk::DINGTALK_FILE_EXTS.join("/")
+            client::DINGTALK_FILE_EXTS.join("/")
         )),
     }
 }
@@ -711,11 +711,11 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 );
             }
             let at = at_user_for(ch, chat_id);
-            let rt = rt();
+            let rt = crate::jsonrpc::rt();
             rt.block_on(async {
                 // 超长分段（与 ABB 的 `send_thread_reply` 同一套按字符贪心逻辑）：
                 // 不分段时钉钉会整条拒（文本上限约 2 万字节）。
-                for chunk in split_text(text, dingtalk::DINGTALK_MSG_LIMIT) {
+                for chunk in split_text(text, client::DINGTALK_MSG_LIMIT) {
                     ch.client
                         .send_text(chat_id, &ch.robot_code, &chunk, at.as_deref())
                         .await?;
@@ -758,7 +758,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                     cap / (1024 * 1024)
                 ));
             }
-            let rt = rt();
+            let rt = crate::jsonrpc::rt();
             rt.block_on(async {
                 match plan {
                     SendPlan::Image => {
@@ -797,7 +797,8 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             if name.trim().is_empty() {
                 return Err("update_chat 缺 name（群名）".into());
             }
-            rt().block_on(ch.client.update_chat(cid, name, desc))
+            crate::jsonrpc::rt()
+                .block_on(ch.client.update_chat(cid, name, desc))
                 .map_err(|e| format!("改群名失败：{e:#}"))?;
             // 本进程的群名缓存同步更新：`chat_brief`/`get_chat_info` 立即答新名，
             // 不必等下一帧入站消息把新标题带回来。
@@ -830,7 +831,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
 /// ——这是 ABB 原 `DingTalkMessenger::send_thread_reply` 的行为，本进程没有那个工具，
 /// 语义落在 `send_text` 上。
 fn at_user_for(ch: &Arc<Channel>, chat_id: &str) -> Option<String> {
-    if !dingtalk::is_group_chat(chat_id) {
+    if !client::is_group_chat(chat_id) {
         return None;
     }
     ch.last_sender_of(chat_id)
@@ -864,7 +865,7 @@ fn create_chat(ch: &Arc<Channel>, a: &Value) -> Result<Value, String> {
                 .into(),
         );
     }
-    let chat_id = rt()
+    let chat_id = crate::jsonrpc::rt()
         .block_on(ch.client.create_chat(name, description, owner))
         .map_err(|e| format!("create_chat 失败：{e:#}"))?;
     // 新群记下群名：`chat_brief`/`get_chat_info` 能立即答（此时还没有任何入站消息）。
@@ -927,7 +928,7 @@ fn download_attachment(ch: &Arc<Channel>, a: &Value) -> Result<Value, String> {
             "download_attachment 失败：未配置机器人码（DT_ROBOT_CODE / DT_APP_ID 都为空）".into(),
         );
     }
-    let bytes = rt()
+    let bytes = crate::jsonrpc::rt()
         .block_on(ch.client.download_msg_file(&att.download_code, rc))
         .map_err(|e| format!("download_attachment 失败（下载下载码对应的文件）：{e:#}"))?;
     let size = bytes.len();
@@ -1041,8 +1042,8 @@ fn get_chat_info(ch: &Arc<Channel>, a: &Value) -> Result<Value, String> {
     if chat_id.is_empty() {
         return Err("get_chat_info 缺 chat_id".into());
     }
-    if dingtalk::is_group_chat(chat_id) {
-        let (name, _) = rt()
+    if client::is_group_chat(chat_id) {
+        let (name, _) = crate::jsonrpc::rt()
             .block_on(ch.client.get_chat_info(chat_id))
             .map_err(|e| format!("get_chat_info 失败：{e:#}"))?;
         if !name.is_empty() {
@@ -1050,12 +1051,14 @@ fn get_chat_info(ch: &Arc<Channel>, a: &Value) -> Result<Value, String> {
         }
         Ok(json!({"name": name, "description": ""}))
     } else {
-        let name = rt().block_on(ch.client.user_name(chat_id)).ok_or_else(|| {
-            format!(
-                "get_chat_info：单聊会话 {chat_id} 查不到对方姓名\
+        let name = crate::jsonrpc::rt()
+            .block_on(ch.client.user_name(chat_id))
+            .ok_or_else(|| {
+                format!(
+                    "get_chat_info：单聊会话 {chat_id} 查不到对方姓名\
                      （通讯录权限不足/已离职/网络失败）"
-            )
-        })?;
+                )
+            })?;
         ch.note_chat_name(chat_id, &name);
         Ok(json!({"name": name, "description": ""}))
     }
@@ -1070,7 +1073,7 @@ fn chat_brief(ch: &Arc<Channel>, a: &Value) -> Result<Value, String> {
     if chat_id.is_empty() {
         return Err("chat_brief 缺 chat_id".into());
     }
-    let chat_type = if dingtalk::is_group_chat(chat_id) {
+    let chat_type = if client::is_group_chat(chat_id) {
         "group"
     } else {
         "p2p"
@@ -1093,9 +1096,11 @@ fn user_display_name(ch: &Arc<Channel>, a: &Value) -> Result<Value, String> {
     if user_id.is_empty() {
         return Err("user_display_name 缺 user_id".into());
     }
-    let name = rt().block_on(ch.client.user_name(user_id)).ok_or_else(|| {
-        format!("user_display_name：查不到 {user_id} 的姓名（通讯录权限不足/已离职/网络失败）")
-    })?;
+    let name = crate::jsonrpc::rt()
+        .block_on(ch.client.user_name(user_id))
+        .ok_or_else(|| {
+            format!("user_display_name：查不到 {user_id} 的姓名（通讯录权限不足/已离职/网络失败）")
+        })?;
     Ok(json!({"name": name}))
 }
 
@@ -1190,16 +1195,6 @@ fn split_text(text: &str, limit: usize) -> Vec<String> {
         return vec![text.chars().take(limit).collect()];
     }
     chunks
-}
-
-/// 只在需要时建 runtime（工具调用是同步入口，内部用 `block_on`）。
-///
-/// 单线程足够：每次调用都是「一到几次 HTTP 往返」，没有并发需求。
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("建 tokio runtime 失败")
 }
 
 #[cfg(test)]

@@ -41,7 +41,8 @@ if [ -z "$contract" ]; then
     exit 1
 fi
 
-crates="abb-channel-wechat abb-channel-feishu abb-channel-dingtalk"
+# 三个渠道合成了一个 crate（`--transport` 分派），工具声明各在自己的子模块里。
+crates="wechat feishu dingtalk"
 
 # 临时目录放「允许名单」——`comm` 只吃文件，不吃字符串（第一版拿变量当文件用，
 # 报 `comm: download_attachment ...: No such file or directory`）。
@@ -50,7 +51,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 fail=0
 for c in $crates; do
-    main="$repo/crates/$c/src/main.rs"
+    main="$repo/crates/abb-channel/src/$c/mod.rs"
     if [ ! -f "$main" ]; then
         echo "❌ 找不到 $main"
         fail=1

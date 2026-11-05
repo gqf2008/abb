@@ -136,11 +136,11 @@ mkdir -p "$chart_target"
 
 cd "$repo_root"
 
-# **微信 crate 必须先建**：root 组第 4 条（`check_test_isolation.sh`）会跑
-# `src/mcp_channel_dir_e2e_test.rs` 里那条 `abb_negotiates_real_wechat`，
-# 它要找微信 crate 的二进制。建在后面 ⇒ 那条 e2e 永远 skip。
+# **渠道 crate 必须先建**：root 组第 4 条（`check_test_isolation.sh`）会跑
+# `src/mcp_channel_dir_e2e_test.rs` 里那三条 `abb_negotiates_real_*`，
+# 它们要找渠道二进制。建在后面 ⇒ 那三条 e2e 永远 skip。
 # 评审 a4040fdf 抓到的就是这个：我把 export 放在了测试跑完之后。
-# crates/abb-channel-wechat 同样是独立包，root 的四条也碰不到它。
+# crates/abb-channel 同样是独立包，root 的四条也碰不到它。
 #
 # **为什么必须加这一组**（2026-11-03 实测）：那个包从建起来到功能做完，
 # 一直是「有测试、但没人跑」——`cargo test` 得显式带 `--manifest-path` 才会跑到它。
@@ -150,84 +150,43 @@ cd "$repo_root"
 # 不用 `check_test_isolation.sh`：那个守卫查「测试不得写 ~/.agent-bridge」，
 # 而这个包的测试只起子进程、不碰运行目录。
 # 目标目录另开 `-wechat` 子目录，理由同 chart（cargo 的锁粒度是整目录）。
-wechat_manifest="$repo_root/crates/abb-channel-wechat/Cargo.toml"
-wechat_target="$CARGO_TARGET_DIR-wechat"
-mkdir -p "$wechat_target"
+# ── 三个渠道合一个二进制（2026-11-04）────────────────────────────────
+#
+# 过去这里是三组同构的 `--manifest-path` 门禁（wechat / feishu / dingtalk），
+# 因为三个渠道各是一个独立包。现在它们合成 `crates/abb-channel` 一个包、
+# 一个二进制（`--transport` 分派），所以门禁也收成一组。
+#
+# **为什么合并**：三份二进制各自链一次 `rustls + ring + webpki-roots`，
+# 那约 4 MB 的 HTTPS 地板付了三遍（实测 5.5 + 5.1 + 4.7 = 15.3 MB 未 strip）。
+# 合起来链接一次 ⇒ 实测 6.9 MB（strip 后 5.5）。业务代码一行没改，契约没动。
+#
+# 独立包的理由不变：自带 manifest + lock，root 的四条碰不到它。
+# 目标目录另开 `-channel` 子目录，理由同 chart（cargo 的锁粒度是整目录）。
+channel_manifest="$repo_root/crates/abb-channel/Cargo.toml"
+channel_target="$CARGO_TARGET_DIR-channel"
+mkdir -p "$channel_target"
 
-echo "== ABB 门禁：crates/abb-channel-wechat（独立包，中间产物外置于 ${wechat_target}）=="
+echo "== ABB 门禁：crates/abb-channel（独立包，中间产物外置于 ${channel_target}）=="
 (
-  export CARGO_TARGET_DIR="$wechat_target"
-  cargo fmt --manifest-path "$wechat_manifest" --check
-  cargo clippy --manifest-path "$wechat_manifest" --locked --all-targets -- -D warnings
-  cargo build --manifest-path "$wechat_manifest" --locked
-  # 集成测试要起真子进程（`tests/contract.rs`），所以不能用 --offline 之外的额外限制；
-  # 但依赖已 lock，`--locked` 保证不临时拉新版本。
-  cargo test --manifest-path "$wechat_manifest" --locked
+  export CARGO_TARGET_DIR="$channel_target"
+  cargo fmt --manifest-path "$channel_manifest" --check
+  cargo clippy --manifest-path "$channel_manifest" --locked --all-targets -- -D warnings
+  cargo build --manifest-path "$channel_manifest" --locked
+  # 集成测试要起真子进程（tests/*_contract.rs、tests/transport_dispatch.rs），
+  # `--locked` 保证不临时拉新版本。
+  cargo test --manifest-path "$channel_manifest" --locked
 )
 
-# 把微信 crate 的构建产物路径告诉 root 的测试：`src/mcp_channel_dir_e2e_test.rs`
-# 里那条 `abb_negotiates_real_wechat` 要起真子进程验「ABB 的协商器能接上它」。
+# 把产物路径告诉 root 的测试：`src/mcp_channel_dir_e2e_test.rs` 里三条
+# `abb_negotiates_real_*` 要起真子进程验「ABB 的协商器能接上它」。
+# 三个渠道共用同一个 `abb-channel`，靠 `--transport` 分派 ⇒ 只传一个路径。
 #
-# **不传的话那条 e2e 永远走 `[skip]`**——而它看起来在门禁里。
-# 这正是评审 a0e0ff0 指出的问题：测试硬编码作者本机路径，别人机器与 CI 上必然跳过。
-# 现在 gates 先建好产物、再把路径传下去，那条 e2e 在门禁里**真的跑**。
-WECHAT_BIN="$wechat_target/debug/abb-channel-wechat"
-if [ -x "$WECHAT_BIN" ]; then
-  export ABB_WECHAT_BIN="$WECHAT_BIN"
+# 不传的话那三条 e2e 永远走 `[skip]`——而它们看起来在门禁里。
+CHANNEL_BIN="$channel_target/debug/abb-channel"
+if [ -x "$CHANNEL_BIN" ]; then
+  export ABB_CHANNEL_BIN="$CHANNEL_BIN"
 else
-  echo "⚠️  没构建出 $WECHAT_BIN ⇒ root 的微信 e2e 将跳过（不是失败）"
-fi
-
-
-# crates/abb-channel-feishu 同构（独立包，root 碰不到）。
-#
-# 2026-11-03 的教训：微信 crate 从建成到功能做完一直「有测试但没人跑」——
-# 加到门禁后立刻抓到「从未跑过 fmt」与一条 MSRV 违规。飞书这组从一开始就加。
-feishu_manifest="$repo_root/crates/abb-channel-feishu/Cargo.toml"
-feishu_target="$CARGO_TARGET_DIR-feishu"
-mkdir -p "$feishu_target"
-
-echo "== ABB 门禁：crates/abb-channel-feishu（独立包，中间产物外置于 ${feishu_target}）=="
-(
-  export CARGO_TARGET_DIR="$feishu_target"
-  cargo fmt --manifest-path "$feishu_manifest" --check
-  cargo clippy --manifest-path "$feishu_manifest" --locked --all-targets -- -D warnings
-  cargo build --manifest-path "$feishu_manifest" --locked
-  cargo test --manifest-path "$feishu_manifest" --locked
-)
-
-# 飞书 crate 的产物路径也传给 root 测试：`abb_negotiates_feishu_via_subscribe_not_poll`
-# 要起真子进程验「ABB 的生产协商器对飞书选 Subscribe 而不是 Poll」。
-#
-# **这是 ABB 订阅路径第一次在真渠道上被验证**（此前只有 `tools/channel-mcp-dir/` 的桩走过）。
-# 不传的话那条 e2e 永远 skip——而 skip 默认等于通过（第 8 种假绿形态）。
-FEISHU_BIN="$feishu_target/debug/abb-channel-feishu"
-if [ -x "$FEISHU_BIN" ]; then
-  export ABB_FEISHU_BIN="$FEISHU_BIN"
-else
-  echo "⚠️  没构建出 $FEISHU_BIN ⇒ root 的飞书 e2e 将跳过（不是失败）"
-fi
-
-# crates/abb-channel-dingtalk 同构（第三个渠道，也是最后一个）。
-dingtalk_manifest="$repo_root/crates/abb-channel-dingtalk/Cargo.toml"
-dingtalk_target="$CARGO_TARGET_DIR-dingtalk"
-mkdir -p "$dingtalk_target"
-
-echo "== ABB 门禁：crates/abb-channel-dingtalk（独立包，中间产物外置于 ${dingtalk_target}）=="
-(
-  export CARGO_TARGET_DIR="$dingtalk_target"
-  cargo fmt --manifest-path "$dingtalk_manifest" --check
-  cargo clippy --manifest-path "$dingtalk_manifest" --locked --all-targets -- -D warnings
-  cargo build --manifest-path "$dingtalk_manifest" --locked
-  cargo test --manifest-path "$dingtalk_manifest" --locked
-)
-
-# 钉钉的产物路径传给 root 测试（`abb_negotiates_dingtalk_via_subscribe`）。
-DINGTALK_BIN="$dingtalk_target/debug/abb-channel-dingtalk"
-if [ -x "$DINGTALK_BIN" ]; then
-  export ABB_DINGTALK_BIN="$DINGTALK_BIN"
-else
-  echo "⚠️  没构建出 $DINGTALK_BIN ⇒ root 的钉钉 e2e 将跳过（不是失败）"
+  echo "⚠️  没构建出 $CHANNEL_BIN ⇒ root 的三条渠道 e2e 将跳过（不是失败）"
 fi
 
 echo "== ABB 门禁：root 包（中间产物外置于 ${CARGO_TARGET_DIR}）=="
@@ -240,14 +199,14 @@ iso_log="${CARGO_TARGET_DIR}/iso-test.log"
 mkdir -p "$(dirname "$iso_log")"
 tools/check_test_isolation.sh 2>&1 | tee "$iso_log"
 
-# **断言微信跨包 e2e 真的跑了**（评审 902033a 的 non-blocking）。
+# **断言渠道跨包 e2e 真的跑了**（评审 902033a 的 non-blocking）。
 #
-# 为什么需要这一条：`src/mcp_channel_dir_e2e_test.rs` 里那条 e2e 只有在
-# 「拿到 `abb-channel-wechat` 二进制、真起了子进程、走完协商」之后才打印
-# `ABB_WECHAT_E2E_RAN`。而它**找不到产物时会静默 return（走 skip）**——
+# 为什么需要这一条：`src/mcp_channel_dir_e2e_test.rs` 里那三条 e2e 只有在
+# 「拿到 `abb-channel` 二进制、真起了子进程、走完协商」之后才打印
+# `ABB_*_E2E_RAN`。而它们**找不到产物时会静默 return（走 skip）**——
 # 测试照样 `ok`，门禁照样绿。
 #
-# 前面虽然把微信 crate 的构建前移到了 root 组之前、也 export 了 `ABB_WECHAT_BIN`，
+# 前面虽然把渠道 crate 的构建前移到了 root 组之前、也 export 了 `ABB_CHANNEL_BIN`，
 # 但**没有任何东西检查这个标记有没有真的出现**。export 哪天再退化（顺序改了、
 # 路径改了、产物没建），门禁会**静默变绿**——这正是
 # `docs/false-green-checklist.md` 第 8 种形态。
@@ -257,34 +216,34 @@ tools/check_test_isolation.sh 2>&1 | tee "$iso_log"
 # **判据看产物文件本身，不看 env 变量**：export 退化时 env 为空，
 # 若用 env 判就会误判成"环境没产物"而降级成警告——变异实测逃逸过。
 # 产物是否存在是客观事实，env 是否传是接线问题。
-if [ -x "$wechat_target/debug/abb-channel-wechat" ]; then
+if [ -x "$channel_target/debug/abb-channel" ]; then
     if grep -q 'ABB_WECHAT_E2E_RAN' "$iso_log"; then
         echo "✅ 微信跨包 e2e 真的跑了（找到 ABB_WECHAT_E2E_RAN 标记）"
     else
         echo "❌ 产物存在但微信 e2e 没跑：日志里没有 ABB_WECHAT_E2E_RAN" >&2
         echo "   这不是环境问题——${ABB_WECHAT_BIN} 是可执行的，测试却走了 skip。" >&2
-        echo "   查 gates.sh 里微信 crate 组与 export 的顺序（必须先构建再 export，再跑 root 测试）。" >&2
+        echo "   查 gates.sh 里渠道 crate 组与 export 的顺序（必须先构建再 export，再跑 root 测试）。" >&2
         exit 1
     fi
 else
-    echo "⚠️  没有微信 crate 产物（${wechat_target}/debug/abb-channel-wechat）⇒ 该 e2e 未跑"
+    echo "⚠️  没有微信 crate 产物（${channel_target}/debug/abb-channel）⇒ 该 e2e 未跑"
     echo "   这是环境问题，不是代码问题；但门禁对这条 e2e 的覆盖是**缺失**的。"
 fi
 
 # 飞书同理：判据看**产物文件本身**（不看 env——env 退化时看它会把接线问题误判成环境问题，
 # 微信那次变异实测逃逸过）。
-if [ -x "$feishu_target/debug/abb-channel-feishu" ]; then
+if [ -x "$channel_target/debug/abb-channel" ]; then
     if grep -q 'ABB_FEISHU_E2E_RAN' "$iso_log"; then
         echo "✅ 飞书跨包 e2e 真的跑了（订阅路径协商成功）"
     else
         echo "❌ 产物存在但飞书 e2e 没跑：日志里没有 ABB_FEISHU_E2E_RAN" >&2
-        echo "   查 gates.sh 里飞书 crate 组与 export 的顺序（必须先构建再 export，再跑 root 测试）。" >&2
+        echo "   查 gates.sh 里渠道 crate 组与 export 的顺序（必须先构建再 export，再跑 root 测试）。" >&2
         exit 1
     fi
 fi
 
 # 钉钉同理（判据看产物文件，不看 env）。
-if [ -x "$dingtalk_target/debug/abb-channel-dingtalk" ]; then
+if [ -x "$channel_target/debug/abb-channel" ]; then
     if grep -q 'ABB_DINGTALK_E2E_RAN' "$iso_log"; then
         echo "✅ 钉钉跨包 e2e 真的跑了（订阅路径协商成功）"
     else
@@ -342,8 +301,13 @@ tools/check_script_modes.sh
 # ⇒ 引用消息悄悄不进 prompt，日志里什么也看不到。
 # 双向查：crate 多出契约没有的名字（拼错/自造）、契约有名字但没人实现。
 tools/check_channel_tool_names.sh
+# 渠道二进制必须仍是**一个**（`--transport` 分派三渠道）。
+# 2026-11-04 把三个 crate 合成一个，动机是体积：三份二进制各自链一次
+# rustls+ring+webpki-roots，约 4 MB 的 HTTPS 地板付了三遍（15.3 MB → 6.9 MB）。
+# 拆回去在功能/测试里**都不会报错**，只在发版体积上悄悄变差 ⇒ 让脚本盯。
+tools/check_channel_layout.sh
 # 变异自测：证明上面那些自测**真的能咬住回归**（评审 B3 的教训——手工变异逃逸过两次）。
 # 它在临时副本里改代码、跑自测、销毁，主检出不受影响。
 tools/review-cadence/mutation-selftest.sh
 
-echo "✅ 八条门禁 + 协作闸门自测全绿（root 四条 + crates/abb-chart 四条 + review-cadence/parents 自测）；checkout 内未产生 target/（中间产物在 ${CARGO_TARGET_DIR} 与 ${chart_target}）；测试夹具残留已清扫"
+echo "✅ 八条门禁 + 渠道布局/工具名/文案断言 + 协作闸门自测全绿（root 四条 + crates/abb-channel 四条 + crates/abb-chart 四条 + review-cadence/parents 自测）；checkout 内未产生 target/（中间产物在 ${CARGO_TARGET_DIR} 与 ${chart_target}）；测试夹具残留已清扫"

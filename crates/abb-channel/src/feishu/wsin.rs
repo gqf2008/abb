@@ -26,8 +26,8 @@ use serde_json::{json, Value};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::proto::Frame;
-use crate::Channel;
+use super::proto::Frame;
+use super::Channel;
 
 const WS_ENDPOINT: &str = "https://open.feishu.cn/callback/ws/endpoint";
 
@@ -331,7 +331,7 @@ pub fn parse_event(payload: &[u8]) -> Option<Inbound> {
     } else {
         parent_id
     };
-    let parsed = crate::feishu::parse_content(content);
+    let parsed = super::client::parse_content(content);
     let mut text = parsed.text;
     // 富文本/文本消息里的 @ 是占位符（`@_user_1`），用 mentions 里的真名替换。
     if let Some(mentions) = msg["mentions"].as_array() {

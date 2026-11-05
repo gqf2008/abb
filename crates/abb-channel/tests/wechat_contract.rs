@@ -14,12 +14,15 @@ use std::process::{Command, Stdio};
 
 fn bin() -> String {
     // 集成测试里用同一次构建产出的二进制。
-    env!("CARGO_BIN_EXE_abb-channel-wechat").to_string()
+    env!("CARGO_BIN_EXE_abb-channel").to_string()
 }
 
 /// 起进程、发请求、收响应。
 fn roundtrip(reqs: &[&str]) -> Vec<serde_json::Value> {
     let mut child = Command::new(bin())
+        // 合并成一个二进制之后，渠道由 `--transport` 指定（原来是三个独立二进制）。
+        .arg("--transport")
+        .arg("wechat")
         .arg("--dir")
         .arg(std::env::temp_dir())
         .env("WX_TOKEN", "") // 不登录也能握手与列工具

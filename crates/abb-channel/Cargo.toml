@@ -1,0 +1,47 @@
+[package]
+name = "abb-channel"
+version = "0.1.0"
+edition = "2021"
+# **必须保留**：clippy 按 MSRV 决定要不要建议新标准库 API。原三个 crate 都声明
+# 1.78，合并时漏了它 ⇒ clippy 立刻建议 `.is_multiple_of()`（1.87 才有），
+# 而 `-- -D warnings` 会把建议当错误。这不是风格问题，是把 MSRV 静默抬高的事故。
+rust-version = "1.78"
+description = "ABB 渠道 MCP server（飞书 / 钉钉 / 微信合一个二进制，用 --transport 分派）"
+license = "MIT"
+
+[[bin]]
+name = "abb-channel"
+path = "src/main.rs"
+
+[dependencies]
+# ─── 三个渠道的依赖并集 ───────────────────────────────────────────────
+#
+# **为什么合成一个 crate**：三个渠道各自编一份二进制时，`rustls + ring +
+# webpki-roots` 那约 4 MB 的「HTTPS 地板」要付三遍（实测 5.5 + 5.1 + 4.7 =
+# 10.2 MB）。合起来链接一次地板只算一份，实测降到 5.6 MB —— 业务代码一行没改。
+#
+# 代价：三个渠道的进程镜像相同，任何一个渠道的依赖升级都会影响三边。这可以接受，
+# 因为它们的传输层本就该一致（同一个 ABB 契约、同一种 TLS 策略）。
+#
+# 版本与特性**逐项对齐原 crate**（不是随手取最新）：
+# - `reqwest` 统一用 `rustls-tls-webpki-roots`：原微信版写的是 `rustls-tls`
+#   （等价别名，同样走 webpki-roots），合并不改 TLS 信任策略。
+# - `tokio` 取并集（微信要 rt-multi-thread / io-std / io-util，另两个要 net）。
+#   超集不影响行为：多出来的特性只多编入能力，不改运行时语义。
+aes = "0.8"
+anyhow = "1"
+fastrand = "2"
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+md5 = "0.7"
+pulldown-cmark = { version = "0.13.4", default-features = false }
+qrcode = { version = "0.14", default-features = false, features = ["image"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls-webpki-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "time", "sync", "net"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+serde_json = "1"

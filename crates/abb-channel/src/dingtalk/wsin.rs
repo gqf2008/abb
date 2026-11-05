@@ -43,8 +43,8 @@ use serde_json::{json, Value};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::dingtalk::{self, DingTalkClient, DingtalkMessage};
-use crate::Channel;
+use super::client::{DingTalkClient, DingtalkMessage};
+use super::Channel;
 
 /// 半开连接看门狗阈值：超过该时长没收到任何入站帧（含 keepalive 的 Pong）即判定通道假死，主动重连。
 /// 平台空闲时不推帧（#19），健康判定依赖客户端 keepalive 的 Pong；180s ≈ 6 个 keepalive 周期，足够宽松。
@@ -121,7 +121,7 @@ async fn run_conn(app_id: &str, app_secret: &str, ch: &Arc<Channel>) -> Result<(
     let url = format!(
         "{}?ticket={}",
         endpoint,
-        dingtalk::percent_encode_query(&ticket)
+        super::client::percent_encode_query(&ticket)
     );
     eprintln!("[dingtalk-ws] 注册成功，连接 {endpoint}…");
     let (ws, _) = connect_async(&url).await.context("钉钉 ws connect 失败")?;
@@ -178,7 +178,7 @@ async fn run_conn(app_id: &str, app_secret: &str, ch: &Arc<Channel>) -> Result<(
                                     .and_then(|v| v["opaque"].as_str().map(|s| s.to_string()))
                                     .unwrap_or_default();
                                 let ack =
-                                    dingtalk::ack_json(mid, &json!({"opaque": opaque}).to_string());
+                                    super::client::ack_json(mid, &json!({"opaque": opaque}).to_string());
                                 send_with_timeout(&mut sink, Message::Text(ack.into()))
                                     .await
                                     .context("回 ping ack 失败")?;
@@ -193,7 +193,7 @@ async fn run_conn(app_id: &str, app_secret: &str, ch: &Arc<Channel>) -> Result<(
                             }
                             "CALLBACK" => {
                                 // 先 ack（fire-forget 消息也按协议回，防服务端诊断误判），再异步处理
-                                let ack = dingtalk::ack_json(mid, r#"{"response": null}"#);
+                                let ack = super::client::ack_json(mid, r#"{"response": null}"#);
                                 send_with_timeout(&mut sink, Message::Text(ack.into()))
                                     .await
                                     .context("回 callback ack 失败")?;
@@ -207,7 +207,7 @@ async fn run_conn(app_id: &str, app_secret: &str, ch: &Arc<Channel>) -> Result<(
                                 }
                             }
                             "EVENT" => {
-                                let ack = dingtalk::ack_json(
+                                let ack = super::client::ack_json(
                                     mid,
                                     r#"{"status":"SUCCESS","message":"success"}"#,
                                 );
@@ -235,7 +235,7 @@ async fn run_conn(app_id: &str, app_secret: &str, ch: &Arc<Channel>) -> Result<(
 
 /// 处理一个 CALLBACK 帧：解析 → （best-effort 查名字）→ 记「最近提问者」→ 入缓冲 + 推通知。
 async fn ingest(ch: &Arc<Channel>, frame: &Value) {
-    let Some(msg) = dingtalk::parse_message(frame) else {
+    let Some(msg) = super::client::parse_message(frame) else {
         return;
     };
     // 名字只用于显示：查不到（scope 不足 / 已离职 / 网络抖动）就留空，**绝不因此丢消息**。
@@ -371,7 +371,7 @@ mod tests {
     /// 契约 §3.3 的七个字段一个都不能少，且会话键按群/单聊规则落位。
     #[test]
     fn callback_becomes_channel_message() {
-        let msg = dingtalk::parse_message(&callback_frame()).expect("应当解出一条");
+        let msg = crate::dingtalk::client::parse_message(&callback_frame()).expect("应当解出一条");
         let m = to_channel_message(&msg, "张三");
         for k in [
             "chat_id",
@@ -402,7 +402,7 @@ mod tests {
         data["conversationId"] = json!("");
         data["conversationType"] = json!("1");
         frame["data"] = json!(data.to_string());
-        let msg = dingtalk::parse_message(&frame).expect("应当解出一条");
+        let msg = crate::dingtalk::client::parse_message(&frame).expect("应当解出一条");
         let m = to_channel_message(&msg, "");
         assert_eq!(m["chat_id"], "16650***698");
         assert_eq!(m["sender_name"], "", "查不到名字就留空，不编造");
@@ -431,7 +431,7 @@ mod tests {
             })
             .to_string(),
         });
-        let msg = dingtalk::parse_message(&frame).expect("应当解出一条");
+        let msg = crate::dingtalk::client::parse_message(&frame).expect("应当解出一条");
         let m = to_channel_message(&msg, "张三");
         // **行为在 2026-11-04 变了**：原来把引用拼进 `text`
         // （`[引用消息]\n…\n\n` + 正文），那是契约还没有引用字段时的变通。
@@ -448,7 +448,7 @@ mod tests {
     /// 空对象会让下游渲染出一个空的引用块。
     #[test]
     fn plain_text_has_no_quote() {
-        let msg = dingtalk::parse_message(&callback_frame()).unwrap();
+        let msg = crate::dingtalk::client::parse_message(&callback_frame()).unwrap();
         let m = to_channel_message(&msg, "");
         assert!(!m["text"].as_str().unwrap().contains("[引用消息]"));
         assert!(
@@ -473,7 +473,7 @@ mod tests {
             })
             .to_string(),
         });
-        let msg = dingtalk::parse_message(&frame).expect("纯图片消息也要收");
+        let msg = crate::dingtalk::client::parse_message(&frame).expect("纯图片消息也要收");
         let m = to_channel_message(&msg, "");
         assert_eq!(m["text"], "");
         let atts = m["attachments"].as_array().unwrap();
@@ -485,8 +485,8 @@ mod tests {
     /// 非 CALLBACK 帧 / 非法 data 一律 None（不猜）。
     #[test]
     fn non_callback_frames_are_ignored() {
-        assert!(dingtalk::parse_message(&json!({"type": "SYSTEM"})).is_none());
+        assert!(crate::dingtalk::client::parse_message(&json!({"type": "SYSTEM"})).is_none());
         let bad = json!({"type": "CALLBACK", "headers": {}, "data": "not json"});
-        assert!(dingtalk::parse_message(&bad).is_none());
+        assert!(crate::dingtalk::client::parse_message(&bad).is_none());
     }
 }

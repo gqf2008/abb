@@ -239,29 +239,41 @@ fn dir_channel_bad_message_does_not_block_later_ones() {
 ///
 /// 都找不到就 `[skip]` **并打印找过哪些路径**——"跳过"必须能看出是环境问题，
 /// 而不是静默当成通过。
-fn wechat_bin() -> Option<String> {
+/// 渠道自己的参数 + `--transport <name>`。
+///
+/// 合并成一个二进制之后，三条 e2e 起的是**同一个** `abb-channel`，靠这个参数分派。
+/// 顺序不重要（`src/main.rs` 会全参数扫描），但统一放在最前面更容易在日志里读出来。
+fn transport_args(transport: &str, dir: String) -> Vec<String> {
+    vec![
+        "--transport".to_string(),
+        transport.to_string(),
+        "--dir".to_string(),
+        dir,
+    ]
+}
+
+fn channel_bin(transport: &str) -> Option<String> {
     let mut tried: Vec<String> = Vec::new();
 
-    // ① 显式指定（CI / gates.sh 用这条）
-    if let Ok(p) = std::env::var("ABB_WECHAT_BIN") {
+    // ① 显式指定（CI / gates.sh 用这条）。三个渠道共用**同一个二进制**，
+    //    靠 `--transport` 分派，所以只有一个环境变量。
+    if let Ok(p) = std::env::var("ABB_CHANNEL_BIN") {
         if std::path::Path::new(&p).exists() {
             return Some(p);
         }
-        tried.push(format!("ABB_WECHAT_BIN={p}（不存在）"));
+        tried.push(format!("ABB_CHANNEL_BIN={p}（不存在）"));
     }
 
-    // ② 常规构建产物：root 的 target 目录下的 debug/abb-channel-wechat。
-    //    注意**不是** `-wx` 那种自定义目录：那只有作者本机的 gates 会建。
+    // ② 常规构建产物（用 `CARGO_TARGET_DIR` 或默认 `target`）
     if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
-        let p = format!("{td}/debug/abb-channel-wechat");
+        let p = format!("{td}/debug/abb-channel");
         if std::path::Path::new(&p).exists() {
             return Some(p);
         }
         tried.push(p);
     }
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        // 同仓库下的 `target/`（默认位置）
-        let p = format!("{manifest}/target/debug/abb-channel-wechat");
+        let p = format!("{manifest}/target/debug/abb-channel");
         if std::path::Path::new(&p).exists() {
             return Some(p);
         }
@@ -269,9 +281,9 @@ fn wechat_bin() -> Option<String> {
     }
 
     eprintln!(
-        "[skip] 没找到 abb-channel-wechat 构建产物 ⇒ 这条 e2e 没跑。找过：\n  {}\n\
-         构建方式：cargo build --manifest-path crates/abb-channel-wechat/Cargo.toml\n\
-         或显式指定：ABB_WECHAT_BIN=<path> cargo test …",
+        "[skip] 没找到 abb-channel 构建产物 ⇒ {transport} 这条 e2e 没跑。找过：\n  {}\n\
+         构建方式：cargo build --manifest-path crates/abb-channel/Cargo.toml\n\
+         或显式指定：ABB_CHANNEL_BIN=<path> cargo test …",
         tried.join("\n  ")
     );
     None
@@ -286,12 +298,12 @@ fn wechat_bin() -> Option<String> {
 /// 只过前者可能只是"server 自己自洽"；两者都过才说明这条渠道真能接。
 #[test]
 fn abb_negotiates_real_wechat_channel() {
-    let Some(bin) = wechat_bin() else {
+    let Some(bin) = channel_bin("wechat") else {
         return;
     };
     let dir = TempDir::new("wx");
     // 不提供 WX_TOKEN：握手与能力协商不需要网络（Tools/list 是纯本地应答）。
-    let args = vec!["--dir".to_string(), dir.path().display().to_string()];
+    let args = transport_args("wechat", dir.path().display().to_string());
     let mut source = crate::mcp_channel_loop::build_source_for_test("wechat", &bin, &args, &[])
         .unwrap_or_else(|e| panic!("ABB 的协商器接不上微信 server：{e}"));
 
@@ -324,29 +336,6 @@ fn abb_negotiates_real_wechat_channel() {
 // ── 真渠道：飞书 crate（crates/abb-channel-feishu）──────────────────
 
 /// 飞书 crate 的二进制路径（同一次 `cargo build` 的产物）。
-fn feishu_bin() -> Option<String> {
-    let mut tried: Vec<String> = Vec::new();
-    if let Ok(p) = std::env::var("ABB_FEISHU_BIN") {
-        if std::path::Path::new(&p).exists() {
-            return Some(p);
-        }
-        tried.push(format!("ABB_FEISHU_BIN={p}（不存在）"));
-    }
-    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
-        let p = format!("{td}/debug/abb-channel-feishu");
-        if std::path::Path::new(&p).exists() {
-            return Some(p);
-        }
-        tried.push(p);
-    }
-    eprintln!(
-        "[skip] 没找到 abb-channel-feishu 构建产物 ⇒ 这条 e2e 没跑。找过：\n  {}\n\
-         构建方式：cargo build --manifest-path crates/abb-channel-feishu/Cargo.toml",
-        tried.join("\n  ")
-    );
-    None
-}
-
 /// **ABB 的生产协商器必须对飞书选 `Subscribe`，不是 `Poll`**。
 ///
 /// 与微信那条正好相反：微信不暴露 `channel://` 资源（只能 poll），
@@ -357,11 +346,11 @@ fn feishu_bin() -> Option<String> {
 /// 并因凭证无效报错——所以「fetch 返回 Ok 的空批次」本身就证明走了订阅。
 #[test]
 fn abb_negotiates_feishu_via_subscribe_not_poll() {
-    let Some(bin) = feishu_bin() else {
+    let Some(bin) = channel_bin("feishu") else {
         return;
     };
     let dir = TempDir::new("fs");
-    let args = vec!["--dir".to_string(), dir.path().display().to_string()];
+    let args = transport_args("feishu", dir.path().display().to_string());
     let envs = vec![
         ("FS_APP_ID".to_string(), "test".to_string()),
         ("FS_APP_SECRET".to_string(), "test".to_string()),
@@ -383,40 +372,17 @@ fn abb_negotiates_feishu_via_subscribe_not_poll() {
 
 // ── 真渠道：钉钉 crate（crates/abb-channel-dingtalk）──────────────────
 
-fn dingtalk_bin() -> Option<String> {
-    let mut tried: Vec<String> = Vec::new();
-    if let Ok(p) = std::env::var("ABB_DINGTALK_BIN") {
-        if std::path::Path::new(&p).exists() {
-            return Some(p);
-        }
-        tried.push(format!("ABB_DINGTALK_BIN={p}（不存在）"));
-    }
-    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
-        let p = format!("{td}/debug/abb-channel-dingtalk");
-        if std::path::Path::new(&p).exists() {
-            return Some(p);
-        }
-        tried.push(p);
-    }
-    eprintln!(
-        "[skip] 没找到 abb-channel-dingtalk 构建产物 ⇒ 这条 e2e 没跑。找过：\n  {}\n\
-         构建方式：cargo build --manifest-path crates/abb-channel-dingtalk/Cargo.toml",
-        tried.join("\n  ")
-    );
-    None
-}
-
 /// **ABB 的生产协商器必须对钉钉选 `Subscribe`**（Stream 是推模型，没有 poll 工具）。
 ///
 /// 与飞书同构、与微信相反。三个渠道各有一条这样的 e2e，合起来证明
 /// `negotiate` 的选路在**三种真实能力组合**下都对。
 #[test]
 fn abb_negotiates_dingtalk_via_subscribe() {
-    let Some(bin) = dingtalk_bin() else {
+    let Some(bin) = channel_bin("dingtalk") else {
         return;
     };
     let dir = TempDir::new("dt");
-    let args = vec!["--dir".to_string(), dir.path().display().to_string()];
+    let args = transport_args("dingtalk", dir.path().display().to_string());
     let envs = vec![
         ("DT_APP_ID".to_string(), "test".to_string()),
         ("DT_APP_SECRET".to_string(), "test".to_string()),
@@ -455,12 +421,18 @@ fn abb_negotiates_dingtalk_via_subscribe() {
 /// `has_tool` 的比较写错（比如做了 `to_lowercase`）。
 #[tokio::test]
 async fn real_feishu_server_exposes_optional_capabilities() {
-    let Some(bin) = feishu_bin() else {
+    let Some(bin) = channel_bin("feishu") else {
         return;
     };
     // 空凭证也能握手（`connect` 只做 tools/list + resources/list，不发网络请求）。
-    let m = crate::mcp_channel::McpChannelMessenger::connect("feishu-e2e", &bin, &[], &[])
-        .unwrap_or_else(|e| panic!("连不上真飞书 server（{bin}）：{e:#}"));
+    let m = crate::mcp_channel::McpChannelMessenger::connect(
+        "feishu-e2e",
+        &bin,
+        // 合并成一个二进制后必须显式指定渠道（原来是靠二进制文件名区分）。
+        &["--transport".to_string(), "feishu".to_string()],
+        &[],
+    )
+    .unwrap_or_else(|e| panic!("连不上真飞书 server（{bin}）：{e:#}"));
 
     for tool in [
         crate::mcp_bus::TOOL_GET_QUOTED_MESSAGE,
@@ -506,11 +478,17 @@ async fn real_feishu_server_exposes_optional_capabilities() {
 /// 的锁在中途中毒后所有后续调用都失败。
 #[tokio::test]
 async fn real_feishu_server_optional_calls_fail_softly() {
-    let Some(bin) = feishu_bin() else {
+    let Some(bin) = channel_bin("feishu") else {
         return;
     };
-    let m = crate::mcp_channel::McpChannelMessenger::connect("feishu-e2e", &bin, &[], &[])
-        .unwrap_or_else(|e| panic!("连不上真飞书 server（{bin}）：{e:#}"));
+    let m = crate::mcp_channel::McpChannelMessenger::connect(
+        "feishu-e2e",
+        &bin,
+        // 合并成一个二进制后必须显式指定渠道（原来是靠二进制文件名区分）。
+        &["--transport".to_string(), "feishu".to_string()],
+        &[],
+    )
+    .unwrap_or_else(|e| panic!("连不上真飞书 server（{bin}）：{e:#}"));
 
     // 三个都要**在合理时间内**返回（真发 HTTP 会超时，所以这里给宽一点）。
     let out = tokio::time::timeout(std::time::Duration::from_secs(30), async {

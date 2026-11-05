@@ -141,7 +141,7 @@ struct Channel {
     qrcode: Mutex<Option<String>>,
 }
 
-fn main() {
+pub fn run() {
     let dir = parse_dir();
     eprintln!("[wechat-mcp] 启动 dir={}", dir.display());
 
@@ -405,7 +405,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             if ctx.is_empty() {
                 eprintln!("[wechat-mcp] 警告：chat_id={chat_id} 无 context_token，按新会话发送");
             }
-            let rt = rt();
+            let rt = crate::jsonrpc::rt();
             rt.block_on(ch.client.send_text(chat_id, &ctx, text))
                 .map_err(|e| format!("send_text 失败：{e}"))?;
             Ok(json!({"content": [{"type": "text", "text": "ok"}]}))
@@ -439,7 +439,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 "video" => weixin::OutboundMediaKind::Video,
                 _ => weixin::OutboundMediaKind::File,
             };
-            let rt = rt();
+            let rt = crate::jsonrpc::rt();
             rt.block_on(ch.client.send_media(chat_id, &ctx, kind, name, &data))
                 .map_err(|e| format!("send_attachment 失败：{e}"))?;
             Ok(json!({"content": [{"type": "text", "text": "ok"}]}))
@@ -489,7 +489,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                     )
                 }
             })?;
-            let rt = rt();
+            let rt = crate::jsonrpc::rt();
             let got = rt
                 .block_on(ch.client.download_media(&item))
                 .map_err(|e| format!("download_attachment 失败：{e}"))?;
@@ -540,7 +540,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| ch.cursor.lock().map(|c| c.clone()).unwrap_or_default());
-            let rt = rt();
+            let rt = crate::jsonrpc::rt();
             let got = rt
                 .block_on(ch.client.get_updates(&cursor, 20_000))
                 .map_err(|e| format!("poll 失败：{e}"))?;
@@ -561,7 +561,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             }).to_string()}]}))
         }
         "login" => {
-            let rt = rt();
+            let rt = crate::jsonrpc::rt();
             let (qc, _uuid) = rt
                 .block_on(weixin::fetch_qrcode())
                 .map_err(|e| format!("取二维码失败：{e}"))?;
@@ -585,7 +585,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 .map_err(|_| "qrcode 锁中毒".to_string())?
                 .clone()
                 .ok_or_else(|| "还没调 login 拿二维码".to_string())?;
-            let rt = rt();
+            let rt = crate::jsonrpc::rt();
             match rt.block_on(weixin::poll_qr_status(&qc)) {
                 // wait / scaned：还没确认。返回 pending 而不是错误——
                 // 「用户还没扫」是正常状态，不是失败。
@@ -790,16 +790,6 @@ fn to_channel_message(ch: &Arc<Channel>, m: &WeixinMessage) -> Option<Value> {
         "attachments": attachments,
         "quoted": quoted,
     }))
-}
-
-/// 只在需要时建 runtime（工具调用是同步入口，内部用 `block_on`）。
-///
-/// 单线程足够：每次调用都是「一次 HTTP 往返」，没有并发需求。
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("建 tokio runtime 失败")
 }
 
 #[cfg(test)]

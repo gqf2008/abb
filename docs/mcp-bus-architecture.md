@@ -141,8 +141,8 @@ ABB 侧会在**发送之前**做预检并给出「附件太大：X MB，上限 Y
   "enabled": true,
   "mcp_channel": {
     "name": "wechat",               // 日志/报错里显示的名字
-    "command": "/path/to/abb-channel-wechat",
-    "args": ["--dir", "/tmp/wx-channel"],
+    "command": "/path/to/abb-channel",
+    "args": ["--transport", "wechat", "--dir", "/tmp/wx-channel"],
     "env": [
       { "name": "WX_TOKEN",    "value": "…" },
       { "name": "WX_BASE_URL", "value": "https://ilinkai.weixin.qq.com" },
@@ -162,16 +162,27 @@ ABB 侧会在**发送之前**做预检并给出「附件太大：X MB，上限 Y
 
 每个渠道的 `env` 由它自己的 server 定义（ABB 只转发）。实测的完整清单：
 
+**三个渠道是同一个二进制**（`crates/abb-channel/`），靠 `--transport` 分派：
+
 | 渠道 | `command` | `args` | `env` |
 |---|---|---|---|
-| 微信 | `abb-channel-wechat` | `--dir <二维码/登录态目录>` | `WX_TOKEN`、`WX_BASE_URL`、`WX_USER_ID`（可选 `WX_CDN_BASE_URL`） |
-| 飞书 | `abb-channel-feishu` | 无 | `FS_APP_ID`、`FS_APP_SECRET` |
-| 钉钉 | `abb-channel-dingtalk` | 无 | `DT_APP_ID`、`DT_APP_SECRET`、`DT_ROBOT_CODE` |
+| 微信 | `abb-channel` | `--transport wechat --dir <二维码/登录态目录>` | `WX_TOKEN`、`WX_BASE_URL`、`WX_USER_ID`（可选 `WX_CDN_BASE_URL`） |
+| 飞书 | `abb-channel` | `--transport feishu` | `FS_APP_ID`、`FS_APP_SECRET` |
+| 钉钉 | `abb-channel` | `--transport dingtalk` | `DT_APP_ID`、`DT_APP_SECRET`、`DT_ROBOT_CODE` |
+
+`--transport` **必填**：缺值/未知值 ⇒ 打 usage 到 stderr、退出码 **2**（2 = 调用错了，
+1 = 渠道自己跑失败）。不按 env 猜渠道——猜错会表现成「连不上平台」，排障多绕一圈。
 
 **为什么只有微信用 `--dir`**：微信要扫码登录，二维码 PNG 需要一个落地目录
 （`login` 工具把图写到那里、路径打到 stderr）。飞书与钉钉用 `app_id`/`app_secret`
-换 `tenant_token` / Stream 凭证，不需要本地目录 ⇒ **它们忽略命令行参数**
+换 `tenant_token` / Stream 凭证，不需要本地目录 ⇒ **它们不读 `--dir`**
 （传了也不报错，但不起作用）。
+
+**为什么合成了一个二进制**（2026-11-04）：三个渠道各自编译时，`rustls + ring +
+webpki-roots` 那约 4 MB 的 HTTPS 地板被链了三遍。合并后实测 **15.3 MB → 6.9 MB
+（strip 后 12.6 → 5.5）**，业务代码一行没改、契约没动。合并用的是同一份 `Cargo.lock`
+的依赖并集，`reqwest` 统一 `rustls-tls-webpki-roots`（微信原写 `rustls-tls`，等价别名），
+TLS 信任策略不变。
 
 **微信的特殊之处：凭证不是一开始就有的。** 流程是：
 
@@ -193,7 +204,8 @@ MCP 渠道的 `sender_id` 是**渠道服务自报**的字符串，ABB 没有任�
 ```jsonc
 "mcp_channel": {
   "name": "feishu",
-  "command": "/path/to/abb-channel-feishu",
+  "command": "/path/to/abb-channel",
+  "args": ["--transport", "feishu"],
   "owner_ids": ["ou_abc123", "ou_def456"],   // ← 谁是管理员
   "env": [ … ]
 }
@@ -221,7 +233,7 @@ MCP 渠道的 `sender_id` 是**渠道服务自报**的字符串，ABB 没有任�
 
 1. 记下原 bot 的 `app_id` / `app_secret`（`config.json` 里那一项）
 2. 新建一个 bot，`kind` 填 `mcp`，`mcp_channel` 填：
-   - `command`: `abb-channel-feishu` 的绝对路径
+   - `command`: `abb-channel` 的绝对路径；`args`: `["--transport", "feishu"]`
    - `env`: `FS_APP_ID` / `FS_APP_SECRET`（就是第 1 步那两个）
    - `owner_ids`: 填你自己的 `sender_id`（否则管理功能不可用，见上）
 3. 停用原 bot（`enabled: false`），启用新 bot
@@ -247,20 +259,19 @@ git checkout pre-retire-builtin   # 退役前最后一个提交（tag 在仓库�
 | 实现 | 位置 | 状态 |
 |---|---|---|
 | 目录渠道（参考实现） | `tools/channel-mcp-dir/` | ✅ 可用；`sh tools/channel-mcp-dir/verify.sh` 一条命令自检 |
-| 微信 | `crates/abb-channel-wechat/` | ✅ 可用（`send_text` / `poll` / `send_attachment` / `login` / `login_status`） |
-| 飞书 / 钉钉 | 仍在 `src/feishu.rs` / `src/dingtalk.rs` | 未搬；照微信的路径搬（见 §5） |
+| `crates/abb-channel/` | 三渠道合一（`--transport` 分派） | ✅ 飞书 / 钉钉 / 微信全部可用 |
 
 微信渠道的用法：
 
 ```sh
 # 1. 起一个 bot，第一次先扫码
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"login","arguments":{}}}' \
-  | abb-channel-wechat --dir /tmp/wx
+  | abb-channel --transport wechat --dir /tmp/wx
 # 二维码在 /tmp/wx/wechat-qr.png，用微信扫
 
 # 2. 轮询状态，confirmed 后 token 会打到 stderr
 echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"login_status","arguments":{}}}' \
-  | abb-channel-wechat --dir /tmp/wx
+  | abb-channel --transport wechat --dir /tmp/wx
 
 # 3. 把拿到的三项写进上面 config.json 的 mcp_channel.env
 ```

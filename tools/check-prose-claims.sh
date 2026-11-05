@@ -141,7 +141,7 @@ check_only_one_channel_implements() {
         [ -n "$tool" ] || continue
         hit=""
         for c in feishu dingtalk wechat; do
-            f="crates/abb-channel-$c/src/main.rs"
+            f="crates/abb-channel/src/$c/mod.rs"
             [ -f "$f" ] || continue
             if grep -q "\"name\": \"$tool\"" "$f" 2>/dev/null; then
                 hit="$hit $c"

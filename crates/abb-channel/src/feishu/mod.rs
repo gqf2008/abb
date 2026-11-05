@@ -7,7 +7,7 @@
 //!
 //! | 方向 | 契约 | 本进程的实现 |
 //! |---|---|---|
-//! | 出站 | 工具 `send_text`（必需） | ✅ 走 `feishu::FeishuClient::send_text` |
+//! | 出站 | 工具 `send_text`（必需） | ✅ 走 `client::FeishuClient::send_text` |
 //! | 出站 | 工具 `send_thread_reply`（可选） | ✅ 飞书**有话题** ⇒ 声明并走 `reply_text` |
 //! | 出站 | 工具 `send_attachment`（可选） | ✅ base64 内联 → 上传 → 媒体消息 |
 //! | 出站 | 工具 `get_quoted_message` / `create_chat` / `typing` / `del_typing` / `done` / `chat_brief` / `get_chat_info` / `user_display_name` / `download_attachment`（均为可选） | ✅ 见「可选能力」一节 |
@@ -86,7 +86,7 @@
 //! 只从环境变量拿 `FS_APP_ID` / `FS_APP_SECRET`（ABB 的 `mcp_channel.env` 下发）。
 //! 本进程**不认识 ABB 的 config.json**——渠道配置由提供方决定。
 
-mod feishu;
+mod client;
 mod proto;
 mod wsin;
 
@@ -94,7 +94,7 @@ use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use feishu::FeishuClient;
+use client::FeishuClient;
 use serde_json::{json, Value};
 
 /// 「处理中」表情。与内置渠道同一个 emoji（`src/messenger.rs` 的 `typing`），
@@ -205,7 +205,7 @@ impl Channel {
     }
 }
 
-fn main() {
+pub fn run() {
     // 凭证从环境变量拿（ABB 的 `mcp_channel.env` 下发）——渠道配置由提供方决定，
     // 本进程不认识 ABB 的 config.json。
     let app_id = std::env::var("FS_APP_ID").unwrap_or_default();
@@ -619,7 +619,7 @@ async fn resolve_resource(
     ch: &Arc<Channel>,
     message_id: &str,
     seq: usize,
-) -> Result<(feishu::FeishuResource, String), String> {
+) -> Result<(client::FeishuResource, String), String> {
     let (owner_mid, parsed, idx) = if seq < QUOTED_SEQ_BASE {
         let m = ch
             .client
@@ -719,7 +719,7 @@ fn ext_from_mime(mime: &str) -> &'static str {
 }
 
 /// 附件的落盘文件名：优先用发送方给的名字（消毒过），没有就按 mime / `seq` 补。
-fn download_file_name(res: &feishu::FeishuResource, seq: usize, mime: &str) -> String {
+fn download_file_name(res: &client::FeishuResource, seq: usize, mime: &str) -> String {
     let given = sanitize_name(res.file_name.trim());
     if !given.is_empty() {
         return given;
@@ -753,7 +753,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             if chat_id.is_empty() {
                 return Err("send_text 缺 chat_id".into());
             }
-            let rt = rt();
+            let rt = crate::jsonrpc::rt();
             rt.block_on(ch.client.send_text(chat_id, text))
                 .map_err(|e| format!("send_text 失败：{e:#}"))?;
             Ok(json!({"content": [{"type": "text", "text": "ok"}]}))
@@ -771,7 +771,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 return Err("send_thread_reply 缺 text".into());
             }
             eprintln!("[feishu-mcp] 话题回复 chat_id={chat_id} message_id={message_id}");
-            let rt = rt();
+            let rt = crate::jsonrpc::rt();
             rt.block_on(ch.client.reply_text(message_id, text))
                 .map_err(|e| format!("send_thread_reply 失败：{e:#}"))?;
             Ok(json!({"content": [{"type": "text", "text": "ok"}]}))
@@ -790,7 +790,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             }
             let data = base64_decode(b64).ok_or_else(|| "data_b64 不是合法 base64".to_string())?;
             let fname = upload_name(name, mime, kind);
-            let as_image = kind == "image" && feishu::feishu_image_uploadable(&fname);
+            let as_image = kind == "image" && client::feishu_image_uploadable(&fname);
             let cap = if as_image {
                 FEISHU_IMAGE_MAX_BYTES
             } else {
@@ -803,13 +803,13 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                     cap / (1024 * 1024)
                 ));
             }
-            let rt = rt();
+            let rt = crate::jsonrpc::rt();
             rt.block_on(async {
                 if as_image {
                     let key = ch.client.upload_image(data, &fname).await?;
                     ch.client.send_media_message(chat_id, "image", &key).await
                 } else {
-                    let ft = feishu::feishu_file_type(&fname);
+                    let ft = client::feishu_file_type(&fname);
                     let key = ch.client.upload_file(ft, &fname, data).await?;
                     ch.client.send_media_message(chat_id, "file", &key).await
                 }
@@ -824,7 +824,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
         // （比如回空 path）反而会把一次下载失败变成一个读不到的假文件。
         "get_quoted_message" => {
             let message_id = need(&a, "get_quoted_message", "message_id")?;
-            let parsed = rt()
+            let parsed = crate::jsonrpc::rt()
                 .block_on(ch.client.get_quoted_message(message_id))
                 .map_err(|e| format!("get_quoted_message 失败：{e:#}"))?;
             // `msg_type` 是「为什么读不到内容」的唯一线索（merge_forward/sticker/卡片），
@@ -847,7 +847,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 "download_attachment 缺 `seq`（第几个附件，从 0 起；>=100 表示被引用消息）"
                     .to_string()
             })? as usize;
-            let rt = rt();
+            let rt = crate::jsonrpc::rt();
             let (res, owner_mid) = rt.block_on(resolve_resource(ch, message_id, seq))?;
             let (bytes, mime) = rt
                 .block_on(
@@ -881,7 +881,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             // owner 不能为空：群主是机器人，owner 靠 `user_id_list` 被拉进群
             // （不传的话用户在飞书里根本看不到这个群，实测踩过）。
             let owner = need(&a, "create_chat", "owner_user_id")?;
-            let chat_id = rt()
+            let chat_id = crate::jsonrpc::rt()
                 .block_on(ch.client.create_chat(name, &description, owner))
                 .map_err(|e| format!("create_chat 失败：{e:#}"))?;
             eprintln!("[feishu-mcp] 已建群 {chat_id} name={name} owner={owner}");
@@ -898,12 +898,13 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
                 // 空群名会被飞书拒（400）且报错含糊，这里先挡。
                 return Err("update_chat 需要非空 name".to_string());
             }
-            rt().block_on(ch.client.update_chat(cid, name, desc))
+            crate::jsonrpc::rt()
+                .block_on(ch.client.update_chat(cid, name, desc))
                 .map_err(|e| format!("改群资料失败：{e:#}"))?;
             Ok(json!({"content": [{"type": "text", "text": "{}"}]}))
         }
         "bot_info" => {
-            let (name, oid) = rt()
+            let (name, oid) = crate::jsonrpc::rt()
                 .block_on(ch.client.bot_info())
                 .map_err(|e| format!("查 bot 资料失败：{e:#}"))?;
             Ok(json!({"content": [{"type": "text",
@@ -914,23 +915,26 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             if cid.is_empty() {
                 return Err("delete_chat 需要 chat_id".to_string());
             }
-            rt().block_on(ch.client.delete_chat(cid))
+            crate::jsonrpc::rt()
+                .block_on(ch.client.delete_chat(cid))
                 .map_err(|e| format!("解散群失败：{e:#}"))?;
             Ok(json!({"content": [{"type": "text", "text": "{}"}]}))
         }
         "user_display_name" => {
             let user_id = need(&a, "user_display_name", "user_id")?;
-            let name = rt().block_on(ch.client.user_name(user_id)).ok_or_else(|| {
-                format!(
-                    "user_display_name 查不到 {user_id} 的姓名\
+            let name = crate::jsonrpc::rt()
+                .block_on(ch.client.user_name(user_id))
+                .ok_or_else(|| {
+                    format!(
+                        "user_display_name 查不到 {user_id} 的姓名\
                          （缺通讯录 scope、用户离职或机器人看不到该用户）"
-                )
-            })?;
+                    )
+                })?;
             Ok(json_text(json!({"name": name})))
         }
         "typing" => {
             let message_id = need(&a, "typing", "message_id")?;
-            let reaction_id = rt()
+            let reaction_id = crate::jsonrpc::rt()
                 .block_on(ch.client.add_reaction(message_id, EMOJI_TYPING))
                 .ok_or_else(|| {
                     format!(
@@ -945,12 +949,12 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
             // `reaction_id` 允许 null（ABB 的 `Option<String>`）：没加成功过就无事可撤，
             // 算成功——这跟「删不掉却报成功」不是一回事（真给了 id 才真去删）。
             let reaction_id = opt(&a, "reaction_id");
-            rt().block_on(ch.client.del_reaction(message_id, &reaction_id));
+            crate::jsonrpc::rt().block_on(ch.client.del_reaction(message_id, &reaction_id));
             Ok(json_text(json!({})))
         }
         "done" => {
             let message_id = need(&a, "done", "message_id")?;
-            if rt()
+            if crate::jsonrpc::rt()
                 .block_on(ch.client.add_reaction(message_id, EMOJI_DONE))
                 .is_none()
             {
@@ -962,7 +966,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
         }
         "chat_brief" => {
             let chat_id = need(&a, "chat_brief", "chat_id")?;
-            let (chat_type, chat_name) = rt()
+            let (chat_type, chat_name) = crate::jsonrpc::rt()
                 .block_on(ch.client.chat_brief(chat_id))
                 .map_err(|e| format!("chat_brief 失败：{e:#}"))?;
             Ok(json_text(json!({
@@ -972,7 +976,7 @@ fn call_tool(ch: &Arc<Channel>, params: &Value) -> Result<Value, String> {
         }
         "get_chat_info" => {
             let chat_id = need(&a, "get_chat_info", "chat_id")?;
-            let (name, description) = rt()
+            let (name, description) = crate::jsonrpc::rt()
                 .block_on(ch.client.get_chat_info(chat_id))
                 .map_err(|e| format!("get_chat_info 失败：{e:#}"))?;
             Ok(json_text(json!({
@@ -1020,16 +1024,6 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
-}
-
-/// 只在需要时建 runtime（工具调用是同步入口，内部用 `block_on`）。
-///
-/// 单线程足够：每次调用都是「一到几次 HTTP 往返」，没有并发需求。
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("建 tokio runtime 失败")
 }
 
 #[cfg(test)]
@@ -1195,7 +1189,7 @@ mod tests {
     /// ABB 拿 `file_name` 判图片/文件并抽扩展名，空名字会让它整份失真。
     #[test]
     fn download_file_name_falls_back_to_mime() {
-        let img = feishu::FeishuResource {
+        let img = client::FeishuResource {
             kind: "image".into(),
             file_key: "img_1".into(),
             file_name: String::new(),
@@ -1205,7 +1199,7 @@ mod tests {
             download_file_name(&img, 2, "application/octet-stream; charset=x"),
             "image_2.bin"
         );
-        let doc = feishu::FeishuResource {
+        let doc = client::FeishuResource {
             kind: "file".into(),
             file_key: "file_1".into(),
             file_name: "报表.xlsx".into(),
@@ -1442,11 +1436,11 @@ mod tests {
     /// 图片判定看扩展名（`kind=image` 但后缀是 heic 要走文件卡片）。
     #[test]
     fn image_upload_decides_on_extension() {
-        assert!(feishu::feishu_image_uploadable("a.PNG"), "大小写不敏感");
-        assert!(!feishu::feishu_image_uploadable("a.heic"));
-        assert!(!feishu::feishu_image_uploadable("a"));
-        assert_eq!(feishu::feishu_file_type("报表.XLSX"), "xls");
-        assert_eq!(feishu::feishu_file_type("a.mov"), "stream");
+        assert!(client::feishu_image_uploadable("a.PNG"), "大小写不敏感");
+        assert!(!client::feishu_image_uploadable("a.heic"));
+        assert!(!client::feishu_image_uploadable("a"));
+        assert_eq!(client::feishu_file_type("报表.XLSX"), "xls");
+        assert_eq!(client::feishu_file_type("a.mov"), "stream");
     }
 
     /// 未知方法要回 error（不是静默成功）。
