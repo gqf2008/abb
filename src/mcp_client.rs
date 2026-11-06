@@ -684,7 +684,12 @@ mod tests {
         );
         // 先触发一次读取：call 会超时（用短超时，别让用例白等 20 秒），
         // 但通知此时已被缓存进 pending。
-        c = c.with_timeout(Duration::from_millis(300));
+        //
+        // ⏱ 300ms → 1500ms（2026-11-06）：Windows 上这条拿 0 条通知。原因不是协议错，
+        // 而是 Git Bash 首次唷起 + 管道往返在 runner 上能吃掉 300ms（同批的
+        // `silence_times_out_instead_of_hanging` 专门测超时，那条才是该用短超时的）。
+        // 这条测的是「通知会被缓存／被取走」，与多快无关，所以宽容超时不影响判别力。
+        c = c.with_timeout(Duration::from_millis(1500));
         let _ = c.call("x", Value::Null);
         let ns = c.drain_notifications();
         assert_eq!(ns.len(), 1, "应当拿到 1 条通知，实际 {} 条", ns.len());

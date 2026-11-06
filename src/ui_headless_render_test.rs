@@ -4322,6 +4322,28 @@ fn crop(f: &Frame, x: u32, y: u32, w: u32, h: u32) -> Frame {
 ///
 /// ⚠️ 这条是**近似判据**，不是字形归属证明：headless 帮我们排除「整块空/明显是空框」，
 /// 真机确认仍列在卡的验收 1（写进本注释是为了不让后人误以为它替代了真机）。
+///
+/// ## 为什么 `#[ignore]`（2026-11-06 实测后改）
+///
+/// 本用例原来靠 `strict_no_skip()` 在 CI 上 panic——设计意图是「宁可红，也不许悄悄
+/// 弱化判据」。发布 v3.3.0 后两个 CI job 都在这里红，实测后才发现**不是**注释里
+/// 设想的那个原因：
+///
+/// - 不是「CI 镜像字体变化」：本机带 `CI=1` 复现了同样的 panic，说明**本地与 CI 的
+///   字体环境完全一样**，差别只是环境变量；
+/// - 这台 headless 台（Slint `MinimalSoftwareWindow` 软件渲染）**结构性地画不出
+///   彩色 emoji**：ASCII `A` 有 49 个墨点，而 `📋`/`📤`/私用区码点全是 0。系统里
+///   确实有 `Apple Color Emoji.ttc`（192 MB），但 fontique + 软件渲染器没把它的
+///   彩色位图字形画出来（Windows 侧自带 Segoe UI Emoji，同样画不出）。
+///
+/// 也就是说：这条判据在 CI 里**永远不可能绿**，继续让它红只会训练人忽略 CI。
+/// 所以改成 `#[ignore]`——不是放宽判据，是**承认这台仪器测不了这个物**，
+/// 把验证责任明确交回真机（卡的验收 1）。函数体与严格语义**一点没动**：
+/// 手动 `cargo test -- --ignored` 或在有 emoji 字形的地方跑，它仍然按原判据判。
+///
+/// 见 `share_glyph_probe_keeps_strict_semantics_and_honest_notice`：那条守卫断言
+/// 本函数的严格语义与本条 ignore 理由都写着，防止哪天被默默删掉。
+#[ignore = "headless 软件渲染画不出彩色 emoji（本地与 CI 同一事实）⇒ 本判据在 CI 里永远不可能绿；真机目视见卡验收 1"]
 #[test]
 fn share_icon_renders_actual_glyphs_not_tofu() {
     // **不能复用 `glyph_ink_probe`**：它用 `is_dark`（RGB 和 < 300）判墨迹，
@@ -5223,6 +5245,10 @@ fn strict_no_skip_reads_the_switches_from_the_environment() {
 ///
 /// 为什么用源码守卫而不是跑两次测试：`strict_no_skip` 读的是**进程级 env**，
 /// 同一进程里改 env 会串到其它用例（`abb-glyph-probe-env-leak-20261029` 的教训）。
+///
+/// 2026-11-06 追加第三条：探针变成 `#[ignore]` 后，**ignore 本身与它的理由**也成了契约。
+/// 没有这条的话，删掉 `#[ignore]` ⇒ CI 重新永久变红（背离本次处置）；删掉理由 ⇒
+/// 后人只看到一条“被忽略的测试”，不知道是仪器测不了还是有人偷懒。两种退化都要咬住。
 #[test]
 fn share_glyph_probe_keeps_strict_semantics_and_honest_notice() {
     let src = include_str!("ui_headless_render_test.rs");
@@ -5260,6 +5286,23 @@ fn share_glyph_probe_keeps_strict_semantics_and_honest_notice() {
         !body.contains("glyph_skip_notice"),
         "不得复用 `glyph_skip_notice`：它的 `[skip]` 文案会印 `ABB_TEST_ASSUME_MISSING_GLYPH`，\
          而本用例缺的是整台机器没有 emoji 字体，那个开关解决不了（会变成坏指引）"
+    );
+
+    // 第三条契约：`#[ignore]` 必须存在，且理由里带着「这台仪器为何测不了」的事实。
+    // 取函数名前面的 1200 字符（属性与文档注释都在那里）。
+    let head = &src[start.saturating_sub(1200)..start];
+    assert!(
+        head.contains("#[ignore"),
+        "分享字形探针必须是 `#[ignore]`：headless 软件渲染画不出彩色 emoji，\
+         不 ignore 就会让 CI 在两个平台上永久红（而红的原因与代码无关）"
+    );
+    assert!(
+        head.contains("真机"),
+        "`#[ignore]` 的理由必须指向真机验收（否则这条验证就真的没了）"
+    );
+    assert!(
+        head.contains("emoji"),
+        "`#[ignore]` 的理由要写清是 emoji 字形画不出，不是「随便忽略」"
     );
 }
 

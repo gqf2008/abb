@@ -265,7 +265,9 @@ mod tests {
     }
 
     fn fake(body: &str) -> StdioChannelClient {
-        StdioChannelClient::spawn("fake", "/bin/sh", &["-c".into(), body.into()], &[])
+        let sh = crate::mcp_client::posix_shell()
+            .expect("测试环境没有可用的 POSIX shell（/bin/sh 或 Git Bash）");
+        StdioChannelClient::spawn("fake", sh, &["-c".into(), body.into()], &[])
             .unwrap_or_else(|e| panic!("起不来脚本：{e}"))
     }
 
