@@ -211,23 +211,30 @@ jobs:
       # 被 ignore（#317），把那份全量清单拄进 YAML 会很快腐化（每加一条测试就要改
       # 两处，而且是容易忘的一处）。这里只钉「本次专门为了 Windows 让步的两条」，
       # 它们对应 `channel_full_chain_test`，跨平台覆盖全押在 test-macos 上。
-      - name: 断言这两条 ignore 真的生效（不能变回静默通过）
+      - name: 断言这些 ignore 真的生效（不能变回静默通过）
         shell: bash
         run: |
           cargo test -- --list --ignored 2>/dev/null \
             | grep ': test$' | sed 's/: test$//' | sort > /tmp/ignored.txt
           echo "── Windows 上被 ignore 的全部用例（$(wc -l < /tmp/ignored.txt) 条）──"
           cat /tmp/ignored.txt
+          # 这份名单对应「靠 python 假渠道跑真 MCP 协议」的那批：Windows 上脚本起得来，
+          # 但非 tty 的 stdin 行迭代拿不到首行，请求等到 EOF。改不了就得看得见。
           for want in \
             channel_full_chain_test::build_for_mcp_bot_produces_working_messenger \
             channel_full_chain_test::build_source_and_tick_deliver_from_real_channel \
+            mcp_bus_e2e_test::subscribe_end_to_end_reaches_ev \
+            mcp_bus_e2e_test::send_text_end_to_end_reaches_the_server \
+            mcp_channel_dir_e2e_test::dir_channel_receives_and_translates \
+            mcp_channel_dir_e2e_test::dir_channel_sends_to_outbox \
+            mcp_channel_dir_e2e_test::dir_channel_bad_message_does_not_block_later_ones \
           ; do
             if ! grep -qx "$want" /tmp/ignored.txt; then
               echo "❌ $want 不在 ignore 清单里——它要么被删了，要么 ignore 属性失效了"
               exit 1
             fi
           done
-          echo "✅ 两条 channel_full_chain 用例已显式 ignore（由 test-macos 真实执行）"
+          echo "✅ 7 条 MCP 假渠道用例已显式 ignore（由 test-macos 真实执行）"
 
   # macOS 特有代码（configure_backend 的 cfg(target_os="macos") 分支、SLINT_BACKEND
   # 经 BackendSelector 的选择路径、透明标题栏钩子）只在本平台编译；windows job 覆盖

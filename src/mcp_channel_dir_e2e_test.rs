@@ -101,6 +101,17 @@ fn write_msg(dir: &std::path::Path, name: &str, body: &str) {
 }
 
 /// 真渠道能接收：写进 inbox 的消息被取出来，且能翻译成 `Ev`。
+// Windows：本用例靠 python 假渠道脚本（`tests/fake_mcp_channel.py`）跑真 MCP 协议，
+// 而那条链在 Windows 上**已知不通**——脚本起得来，但非 tty 的 stdin 行迭代拿不到首行，
+// 请求等到 EOF。同根因见 `channel_full_chain_test`。
+//
+// 用 `ignore` 而非在 `spawn()` 里 `return`：后者算 passed，把「Windows 上没跑」
+// 伪装成「Windows 上通过」（#317 批评的假绿）。真实跨平台覆盖由 `test-macos`
+// job 提供（它跑全量 cargo test，不忽略任何用例）。
+#[cfg_attr(
+    windows,
+    ignore = "Windows 上 python 假渠道的 stdin 行迭代不通；跨平台覆盖由 test-macos job 提供"
+)]
 #[test]
 fn dir_channel_receives_and_translates() {
     let dir = TempDir::new("recv");
@@ -145,6 +156,17 @@ fn dir_channel_receives_and_translates() {
 }
 
 /// 真渠道能发送：`send_text` 之后 outbox 里有文件，内容逐字相同。
+// Windows：本用例靠 python 假渠道脚本（`tests/fake_mcp_channel.py`）跑真 MCP 协议，
+// 而那条链在 Windows 上**已知不通**——脚本起得来，但非 tty 的 stdin 行迭代拿不到首行，
+// 请求等到 EOF。同根因见 `channel_full_chain_test`。
+//
+// 用 `ignore` 而非在 `spawn()` 里 `return`：后者算 passed，把「Windows 上没跑」
+// 伪装成「Windows 上通过」（#317 批评的假绿）。真实跨平台覆盖由 `test-macos`
+// job 提供（它跑全量 cargo test，不忽略任何用例）。
+#[cfg_attr(
+    windows,
+    ignore = "Windows 上 python 假渠道的 stdin 行迭代不通；跨平台覆盖由 test-macos job 提供"
+)]
 #[test]
 fn dir_channel_sends_to_outbox() {
     let dir = TempDir::new("send");
@@ -187,6 +209,17 @@ fn dir_channel_sends_to_outbox() {
 
 /// **坏消息不阻塞后面的**：渠道实现常见故障是「一条坏消息让整个渠道卡住」，
 /// 表现是「在线但没反应」，很难查。这条钉住它。
+// Windows：本用例靠 python 假渠道脚本（`tests/fake_mcp_channel.py`）跑真 MCP 协议，
+// 而那条链在 Windows 上**已知不通**——脚本起得来，但非 tty 的 stdin 行迭代拿不到首行，
+// 请求等到 EOF。同根因见 `channel_full_chain_test`。
+//
+// 用 `ignore` 而非在 `spawn()` 里 `return`：后者算 passed，把「Windows 上没跑」
+// 伪装成「Windows 上通过」（#317 批评的假绿）。真实跨平台覆盖由 `test-macos`
+// job 提供（它跑全量 cargo test，不忽略任何用例）。
+#[cfg_attr(
+    windows,
+    ignore = "Windows 上 python 假渠道的 stdin 行迭代不通；跨平台覆盖由 test-macos job 提供"
+)]
 #[test]
 fn dir_channel_bad_message_does_not_block_later_ones() {
     let dir = TempDir::new("bad");

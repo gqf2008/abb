@@ -3726,8 +3726,18 @@ mod tests {
 
     #[tokio::test]
     async fn keepalive_resets_idle_past_deadline() {
-        // Keepalive session/update lines every 50ms against a 100ms idle deadline.
-        // The turn should survive well past the 100ms deadline (proves the fix).
+        // Keepalive session/update lines every 50ms against a 250ms idle deadline.
+        // The turn should survive well past the deadline (proves keepalives reset idle).
+        //
+        // ⏱ 100ms → 250ms（2026-11-06，CI 实测）。原值是 50ms 间隔 / 100ms 截止，
+        // 只留 **2 倍** 余量。在满载的 CI runner 上（1443 条用例并行跑）tokio 定时器
+        // 抖动轻松超过 50ms，于是一发 keepalive 来得晚了一点 ⇒ idle 在 290ms 就开了 ⇒
+        // `elapsed >= 500ms` 假红（断言文案：`elapsed only 290.681209ms`）。
+        // 同一次运行上一轮它是绿的、本轮换了一条测试红，属噪声而非代码回归。
+        //
+        // 5 倍余量不削弱判据：要证的仍是「keepalive 会把 idle 顶掉」——20 发 × 50ms
+        // 持续 1s，远长于 250ms 截止，idle 必须被持续重置才能活到 1s 之后。
+        // ⚠️ 别把它“调紧回去”：余量越小时这条测试就越在测 runner 的调度噪声。
         let mut client = spawn_script(vec![
             Flood(r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"keepalive"}}}"#.to_string(), 50, 20),
             SleepMs(10_000),
@@ -3740,14 +3750,14 @@ mod tests {
             .read_until_response_with_idle_timeout(
                 "test",
                 999,
-                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(250),
                 hard_deadline,
                 max_dur,
             )
             .await;
         let elapsed = start.elapsed();
-        // 20 keepalives × 50ms = ~1000ms of activity, then idle fires after 100ms more.
-        // Must survive well past the 100ms deadline.
+        // 20 keepalives × 50ms = ~1000ms of activity, then idle fires after 250ms more.
+        // Must survive well past the 250ms deadline (and long enough to prove the reset).
         assert!(
             elapsed >= std::time::Duration::from_millis(500),
             "keepalive should reset idle past the deadline; elapsed only {elapsed:?}"

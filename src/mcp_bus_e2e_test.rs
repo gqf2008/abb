@@ -81,6 +81,17 @@ fn call_stats(client: &mut crate::mcp_client::StdioChannelClient) -> serde_json:
 }
 
 /// A 方案端到端：订阅 → 收通知 → read → 翻译成 `Ev`。
+// Windows：本用例靠 python 假渠道脚本（`tests/fake_mcp_channel.py`）跑真 MCP 协议，
+// 而那条链在 Windows 上**已知不通**——脚本起得来，但非 tty 的 stdin 行迭代拿不到首行，
+// 请求等到 EOF。同根因见 `channel_full_chain_test`。
+//
+// 用 `ignore` 而非在 `spawn()` 里 `return`：后者算 passed，把「Windows 上没跑」
+// 伪装成「Windows 上通过」（#317 批评的假绿）。真实跨平台覆盖由 `test-macos`
+// job 提供（它跑全量 cargo test，不忽略任何用例）。
+#[cfg_attr(
+    windows,
+    ignore = "Windows 上 python 假渠道的 stdin 行迭代不通；跨平台覆盖由 test-macos job 提供"
+)]
 #[test]
 fn subscribe_end_to_end_reaches_ev() {
     let Some(mut client) = spawn("subscribe") else {
@@ -206,6 +217,17 @@ fn poll_end_to_end_falls_back_and_advances_cursor() {
 ///
 /// 校验方式：让假 server 把收到的 `send_text` 内容**回显在 `tools/call` 的返回文本里**
 /// （它现在还只打 stderr），这样不用外部日志也能断言「送达的就是发出的」。
+// Windows：本用例靠 python 假渠道脚本（`tests/fake_mcp_channel.py`）跑真 MCP 协议，
+// 而那条链在 Windows 上**已知不通**——脚本起得来，但非 tty 的 stdin 行迭代拿不到首行，
+// 请求等到 EOF。同根因见 `channel_full_chain_test`。
+//
+// 用 `ignore` 而非在 `spawn()` 里 `return`：后者算 passed，把「Windows 上没跑」
+// 伪装成「Windows 上通过」（#317 批评的假绿）。真实跨平台覆盖由 `test-macos`
+// job 提供（它跑全量 cargo test，不忽略任何用例）。
+#[cfg_attr(
+    windows,
+    ignore = "Windows 上 python 假渠道的 stdin 行迭代不通；跨平台覆盖由 test-macos job 提供"
+)]
 #[test]
 fn send_text_end_to_end_reaches_the_server() {
     let Some(mut client) = spawn("subscribe") else {
