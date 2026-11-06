@@ -643,7 +643,9 @@ mod tests {
 
     /// 用 shell 脚本冒充一个**能力齐备**的渠道服务。
     fn spawn_fake(body: &str) -> std::result::Result<McpChannelMessenger, String> {
-        McpChannelMessenger::connect("fake", "/bin/sh", &["-c".into(), body.into()], &[])
+        let sh = crate::mcp_client::posix_shell()
+            .expect("测试环境没有可用的 POSIX shell（/bin/sh 或 Git Bash）");
+        McpChannelMessenger::connect("fake", sh, &["-c".into(), body.into()], &[])
     }
 
     #[test]
@@ -900,7 +902,9 @@ mod tests {
 
     fn messenger_with(tools: &str, break_all: bool) -> McpChannelMessenger {
         let body = fake_server(tools, break_all);
-        McpChannelMessenger::connect("fake", "/bin/sh", &["-c".to_string(), body], &[])
+        let sh = crate::mcp_client::posix_shell()
+            .expect("测试环境没有可用的 POSIX shell（/bin/sh 或 Git Bash）");
+        McpChannelMessenger::connect("fake", sh, &["-c".to_string(), body], &[])
             .unwrap_or_else(|e| panic!("应当连上（tools={tools}）：{e}"))
     }
 

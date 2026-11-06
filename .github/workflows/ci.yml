@@ -203,6 +203,32 @@ jobs:
         if: always()
         run: cargo test -- --list --ignored
 
+      # 同一件事的反向断言：这次修 CI 时新增的两条 `ignore` **必须真的在清单里**。
+      # 只「打印」不「断言」的话，某天有人把 `cfg_attr(windows, ignore)` 写成
+      # `cfg_attr(unix, ignore)` 之类，签名静静消失而 CI 依旧全绿。
+      #
+      # 为什么不做「白名单全量比对」：Windows 上本来就有 20+ 条依赖 python3 的用例
+      # 被 ignore（#317），把那份全量清单拄进 YAML 会很快腐化（每加一条测试就要改
+      # 两处，而且是容易忘的一处）。这里只钉「本次专门为了 Windows 让步的两条」，
+      # 它们对应 `channel_full_chain_test`，跨平台覆盖全押在 test-macos 上。
+      - name: 断言这两条 ignore 真的生效（不能变回静默通过）
+        shell: bash
+        run: |
+          cargo test -- --list --ignored 2>/dev/null \
+            | grep ': test$' | sed 's/: test$//' | sort > /tmp/ignored.txt
+          echo "── Windows 上被 ignore 的全部用例（$(wc -l < /tmp/ignored.txt) 条）──"
+          cat /tmp/ignored.txt
+          for want in \
+            channel_full_chain_test::build_for_mcp_bot_produces_working_messenger \
+            channel_full_chain_test::build_source_and_tick_deliver_from_real_channel \
+          ; do
+            if ! grep -qx "$want" /tmp/ignored.txt; then
+              echo "❌ $want 不在 ignore 清单里——它要么被删了，要么 ignore 属性失效了"
+              exit 1
+            fi
+          done
+          echo "✅ 两条 channel_full_chain 用例已显式 ignore（由 test-macos 真实执行）"
+
   # macOS 特有代码（configure_backend 的 cfg(target_os="macos") 分支、SLINT_BACKEND
   # 经 BackendSelector 的选择路径、透明标题栏钩子）只在本平台编译；windows job 覆盖
   # 不到，这里补**编译**验证。渲染器去 skia 后 macOS 冷构建无需外部 C++ 工具链。
@@ -255,3 +281,19 @@ jobs:
       - name: cargo test（macOS：含依赖 mock agent 的端到端用例）
         # 同 windows job：带 `--show-output` 才能看见被跳过的用例给出的 `[skip]` 理由。
         run: cargo test -- --show-output
+
+      # 诊断（只在失败时跑，不参与判绿）：`share_icon_renders_actual_glyphs_not_tofu`
+      # 在 macos-latest 上红。那条用例的注释已经把口径写死了：「严格模式下不得跳过——
+      # 若确属 CI 镜像字体变化，请当成环境变更处理」，所以**不能**放宽判据，得先弄清
+      # 这个环境到底看得见哪些字体（fontique 集合里有没有 emoji 族），才能决定怎么补。
+      - name: 诊断（emoji 字体环境）
+        if: failure()
+        shell: bash
+        run: |
+          echo "── 系统里的 emoji 字体文件 ──"
+          ls -la /System/Library/Fonts/ 2>/dev/null | grep -i emoji || echo "(系统目录无 emoji 字体)"
+          ls -la ~/Library/Fonts/ 2>/dev/null | grep -i emoji || echo "(用户目录无 emoji 字体)"
+          echo "── 旁证：fc-list 能看到的 emoji ──"
+          fc-list 2>/dev/null | grep -i emoji || echo "(无 fc-list 或无 emoji)"
+          echo "── CI 镜像版本 ──"
+          sw_vers

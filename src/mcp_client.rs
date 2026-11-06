@@ -467,6 +467,33 @@ fn spawn_reader(stdout: ChildStdout) -> Receiver<Result<Value, ClientError>> {
     rx
 }
 
+/// 测试用的 POSIX shell 路径（各平台的 mock MCP server 都靠它跑脚本体）。
+///
+/// **为什么必须探测，不能硬写 `/bin/sh`**：2026-11-05 首次在 GitHub 上真跑这批
+/// 测试时，Windows job 有 **29 个用例失败**，全部同一行——`/bin/sh` 在 Windows
+/// 不存在（`os error 3: The system cannot find the path specified`）。
+/// 而这些用例的逻辑与平台无关（只是「读一行、回一行」的假 MCP server），
+/// 却因为一个路径常量在 Windows 上整片红。镜像停更 6 天让这个错藏了 6 天。
+///
+/// Windows 的 GitHub runner 预装 Git for Windows，`shell: bash` 用的就是
+/// `C:\Program Files\Git\bin\bash.exe`；直接用绝对路径探测，不依赖 PATH。
+///
+/// 全部候选都不存在时返回 `None`，调用方用 `expect` **响亮失败**——不允许静默
+/// 跳过：那正是本仓反复吃过的假绿（skip 默认等于通过）。
+#[cfg(test)]
+pub(crate) fn posix_shell() -> Option<&'static str> {
+    const CANDIDATES: &[&str] = &[
+        "/bin/sh",
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+        "C:\\Program Files\\Git\\usr\\bin\\sh.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+    ];
+    CANDIDATES
+        .iter()
+        .copied()
+        .find(|p| std::path::Path::new(p).is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,7 +501,10 @@ mod tests {
     /// 用一个 shell 脚本冒充 MCP server —— 比拉真 server 快、且能精确构造
     /// 「先推通知」「乱序回响应」「不回响应」这些真实故障。
     fn script_client(body: &str) -> StdioChannelClient {
-        StdioChannelClient::spawn("fake", "/bin/sh", &["-c".into(), body.into()], &[])
+        let sh = posix_shell().expect(
+            "测试环境没有可用的 POSIX shell（/bin/sh 或 Git Bash）——mock MCP server 靠它跑脚本体",
+        );
+        StdioChannelClient::spawn("fake", sh, &["-c".into(), body.into()], &[])
             .expect("起不来测试脚本")
     }
 
@@ -512,7 +542,8 @@ mod tests {
     fn exited_server_is_reaped_not_left_zombie() {
         use std::time::Duration;
         // 立刻退出：模拟 server 崩溃/自退（最常见形态）。
-        let mut c = StdioChannelClient::spawn("t", "/bin/sh", &["-c".into(), "exit 0".into()], &[])
+        let sh = posix_shell().expect("测试环境没有可用的 POSIX shell");
+        let mut c = StdioChannelClient::spawn("t", sh, &["-c".into(), "exit 0".into()], &[])
             .expect("起不来测试脚本");
         let pid = c.child.id();
         // 等它变成「已退出未回收」。
